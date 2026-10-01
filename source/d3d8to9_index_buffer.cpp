@@ -12,6 +12,8 @@ Direct3DIndexBuffer8::Direct3DIndexBuffer8(Direct3DDevice8 *Device, IDirect3DInd
 }
 Direct3DIndexBuffer8::~Direct3DIndexBuffer8()
 {
+	if (Device->U2Indices == this)
+		Device->U2Indices = nullptr;
 }
 
 HRESULT STDMETHODCALLTYPE Direct3DIndexBuffer8::QueryInterface(REFIID riid, void **ppvObj)
@@ -97,10 +99,25 @@ HRESULT STDMETHODCALLTYPE Direct3DIndexBuffer8::Lock(UINT OffsetToLock, UINT Siz
 		}
 	}
 
-	return ProxyInterface->Lock(OffsetToLock, SizeToLock, reinterpret_cast<void **>(ppbData), Flags);
+	const HRESULT hr = ProxyInterface->Lock(OffsetToLock, SizeToLock, reinterpret_cast<void **>(ppbData), Flags);
+	if (SUCCEEDED(hr) && U2WantsBuffers())
+	{
+		D3DINDEXBUFFER_DESC desc;
+		ProxyInterface->GetDesc(&desc);
+		U2Locked = *ppbData;
+		U2LockOff = OffsetToLock;
+		U2LockSize = (SizeToLock != 0 ? SizeToLock : desc.Size - OffsetToLock);
+		if (U2Shadow.size() != desc.Size)
+			U2Shadow.resize(desc.Size);
+	}
+	return hr;
 }
 HRESULT STDMETHODCALLTYPE Direct3DIndexBuffer8::Unlock()
 {
+	// lmcapture=: keep what the game wrote (the buffer itself may not be readable later)
+	if (U2Locked != nullptr && U2LockOff + U2LockSize <= U2Shadow.size())
+		memcpy(U2Shadow.data() + U2LockOff, U2Locked, U2LockSize);
+	U2Locked = nullptr;
 	return ProxyInterface->Unlock();
 }
 HRESULT STDMETHODCALLTYPE Direct3DIndexBuffer8::GetDesc(D3DINDEXBUFFER_DESC *pDesc)
