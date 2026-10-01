@@ -12,6 +12,8 @@ Direct3DTexture8::Direct3DTexture8(Direct3DDevice8 *Device, IDirect3DTexture9 *P
 }
 Direct3DTexture8::~Direct3DTexture8()
 {
+	if (Device->U2Stage0 == this)
+		Device->U2Stage0 = nullptr;
 }
 
 HRESULT STDMETHODCALLTYPE Direct3DTexture8::QueryInterface(REFIID riid, void **ppvObj)

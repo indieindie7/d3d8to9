@@ -48,6 +48,7 @@ private:
 	std::vector<D3DDISPLAYMODE> CurrentAdapterModes[MAX_ADAPTERS];
 };
 
+class Direct3DTexture8;
 class Direct3DDevice8 : public IDirect3DDevice8
 {
 	Direct3DDevice8(const Direct3DDevice8 &) = delete;
@@ -160,7 +161,10 @@ public:
 
 	AddressLookupTable *ProxyAddressLookupTable;
 
+	Direct3DTexture8 *U2Stage0 = nullptr; // U2Shaders: the 2D texture on stage 0, if any
+
 private:
+	bool U2Begin();
 	void ApplyClipPlanes();
 	void ReleaseShadersAndStateBlocks();
 
@@ -219,6 +223,8 @@ public:
 	~Direct3DTexture8();
 
 	IDirect3DTexture9 *GetProxyInterface() const { return ProxyInterface; }
+
+	DWORD U2Hash = 0; // U2Shaders: hash of the top mip, 0 until first drawn with
 
 	virtual HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObj) override;
 	virtual ULONG STDMETHODCALLTYPE AddRef() override;
