@@ -7,6 +7,15 @@
 #include "d3d8to9.hpp"
 #include <regex>
 #include <assert.h>
+#include "u2shaders.hpp"
+
+static U2Shaders U2;
+bool U2WantsBuffers()
+{
+	if (!U2.Loaded)
+		U2.Load();
+	return U2.Capture;
+}
 
 struct VertexShaderInfo
 {
@@ -37,6 +46,7 @@ Direct3DDevice8::Direct3DDevice8(Direct3D8 *d3d, IDirect3DDevice9 *ProxyInterfac
 }
 Direct3DDevice8::~Direct3DDevice8()
 {
+	U2.OnDestroy();
 	delete ProxyAddressLookupTable;
 }
 
@@ -199,6 +209,7 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::Reset(D3DPRESENT_PARAMETERS8 *pPresen
 		return D3DERR_INVALIDCALL;
 
 	CurrentZBiasRenderState = 0;
+	U2.OnLost();
 
 	const HRESULT deviceState = ProxyInterface->TestCooperativeLevel();
 
@@ -232,6 +243,7 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::Present(const RECT *pSourceRect, cons
 {
 	UNREFERENCED_PARAMETER(pDirtyRegion);
 
+	U2.OnPresent();
 	return ProxyInterface->Present(pSourceRect, pDestRect, hDestWindowOverride, nullptr);
 }
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::GetBackBuffer(UINT iBackBuffer, D3DBACKBUFFER_TYPE Type, IDirect3DSurface8 **ppBackBuffer)
@@ -451,6 +463,7 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::CopyRects(IDirect3DSurface8 *pSourceS
 
 	auto pSourceSurfaceImpl = static_cast<Direct3DSurface8 *>(pSourceSurface);
 	auto pDestinationSurfaceImpl = static_cast<Direct3DSurface8 *>(pDestinationSurface);
+	U2.OnCopy(pSourceSurfaceImpl->GetProxyInterface(), pDestinationSurfaceImpl->GetProxyInterface());   // shadow maps get copied into their textures
 
 	D3DSURFACE_DESC SourceDesc, DestinationDesc;
 	pSourceSurfaceImpl->GetProxyInterface()->GetDesc(&SourceDesc);
@@ -938,6 +951,11 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::GetTexture(DWORD Stage, IDirect3DBase
 }
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::SetTexture(DWORD Stage, IDirect3DBaseTexture8 *pTexture)
 {
+	if (Stage == 0)
+		U2Stage0 = (pTexture != nullptr && pTexture->GetType() == D3DRTYPE_TEXTURE) ? static_cast<Direct3DTexture8 *>(pTexture) : nullptr;
+	if (Stage < 4)
+		U2Stages[Stage] = (pTexture != nullptr && pTexture->GetType() == D3DRTYPE_TEXTURE) ? static_cast<Direct3DTexture8 *>(pTexture) : nullptr;
+
 	if (pTexture == nullptr)
 		return ProxyInterface->SetTexture(Stage, nullptr);
 
@@ -1119,28 +1137,94 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::GetCurrentTexturePalette(UINT *pPalet
 
 	return ProxyInterface->GetCurrentTexturePalette(pPaletteNumber);
 }
+bool Direct3DDevice8::U2Begin()
+{
+	// a D3D8 "vertex shader" without code is just a vertex layout: still fixed function
+	bool FixedFunction = CurrentVertexShaderHandle == 0;
+	if (!FixedFunction)
+		FixedFunction = reinterpret_cast<VertexShaderInfo *>(CurrentVertexShaderHandle << 1)->Shader == nullptr;
+	// replace=: our textures in place of the game's for this draw (U2After puts them back)
+	U2Swapped = 0;
+	for (DWORD s = 0; s < 4; s++)
+		if (U2Stages[s] != nullptr)
+			if (IDirect3DTexture9 *R = U2.Replacement(ProxyInterface, U2Stages[s]->GetProxyInterface(), U2Stages[s]->U2Hash))
+			{
+				ProxyInterface->SetTexture(s, R);
+				U2Swapped |= 1u << s;
+			}
+	U2.LogTargetDraw(ProxyInterface, FixedFunction, U2Stage0 != nullptr);
+	if (U2.PcssBegin(ProxyInterface, U2Stage0 ? U2Stage0->GetProxyInterface() : nullptr, FixedFunction))
+		return true;
+	if (U2Stage0 == nullptr)
+		return false;
+	return U2.Begin(ProxyInterface, U2Stage0->GetProxyInterface(), U2Stage0->U2Hash, FixedFunction);
+}
+// lmcapture=: hands a draw's vertices (from the buffers' copies) to U2Shaders::CaptureDraw
+void Direct3DDevice8::U2CaptureDraw(D3DPRIMITIVETYPE Type, UINT PrimCount, const BYTE *Verts, size_t VertBytes, UINT Stride, INT BaseVertex,
+	const BYTE *Indices, size_t IndexBytes, bool Index32, UINT StartIndex)
+{
+	if (U2Stages[1] == nullptr || Verts == nullptr)
+		return;
+	U2.CaptureDraw(ProxyInterface, Type, PrimCount, Verts, VertBytes, Stride, BaseVertex, Indices, IndexBytes, Index32, StartIndex,
+		U2Stages[0] ? U2Stages[0]->GetProxyInterface() : nullptr, U2Stages[0] ? &U2Stages[0]->U2Hash : nullptr,
+		U2Stages[1]->GetProxyInterface(), U2Stages[1]->U2Hash);
+}
+void Direct3DDevice8::U2After(bool Shaded)
+{
+	if (Shaded)
+		U2.End(ProxyInterface);
+	for (DWORD s = 0; s < 4; s++)
+		if ((U2Swapped & (1u << s)) && U2Stages[s] != nullptr)
+			ProxyInterface->SetTexture(s, U2Stages[s]->GetProxyInterface());
+	U2Swapped = 0;
+}
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawPrimitive(D3DPRIMITIVETYPE PrimitiveType, UINT StartVertex, UINT PrimitiveCount)
 {
 	ApplyClipPlanes();
+	if (U2.Capture && U2Stream0 != nullptr && !U2Stream0->U2Shadow.empty() && (size_t)StartVertex * U2Stride0 < U2Stream0->U2Shadow.size())
+		U2CaptureDraw(PrimitiveType, PrimitiveCount, U2Stream0->U2Shadow.data() + (size_t)StartVertex * U2Stride0,
+			U2Stream0->U2Shadow.size() - (size_t)StartVertex * U2Stride0, U2Stride0, 0, nullptr, 0, false, 0);
+	const bool Shaded = U2Begin();
 	ProxyInterface->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
+	U2After(Shaded);
 	return D3D_OK;
 }
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawIndexedPrimitive(D3DPRIMITIVETYPE PrimitiveType, UINT MinIndex, UINT NumVertices, UINT StartIndex, UINT PrimitiveCount)
 {
 	ApplyClipPlanes();
+	if (U2.Capture && U2Stream0 != nullptr && U2Indices != nullptr && !U2Stream0->U2Shadow.empty() && !U2Indices->U2Shadow.empty())
+	{
+		D3DINDEXBUFFER_DESC IbDesc;
+		U2Indices->GetProxyInterface()->GetDesc(&IbDesc);
+		U2CaptureDraw(PrimitiveType, PrimitiveCount, U2Stream0->U2Shadow.data(), U2Stream0->U2Shadow.size(), U2Stride0, CurrentBaseVertexIndex,
+			U2Indices->U2Shadow.data(), U2Indices->U2Shadow.size(), IbDesc.Format == D3DFMT_INDEX32, StartIndex);
+	}
+	const bool Shaded = U2Begin();
 	ProxyInterface->DrawIndexedPrimitive(PrimitiveType, CurrentBaseVertexIndex, MinIndex, NumVertices, StartIndex, PrimitiveCount);
+	U2After(Shaded);
 	return D3D_OK;
 }
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawPrimitiveUP(D3DPRIMITIVETYPE PrimitiveType, UINT PrimitiveCount, const void *pVertexStreamZeroData, UINT VertexStreamZeroStride)
 {
 	ApplyClipPlanes();
+	if (U2.Capture)
+		U2CaptureDraw(PrimitiveType, PrimitiveCount, static_cast<const BYTE *>(pVertexStreamZeroData), (size_t)(PrimitiveType == D3DPT_TRIANGLELIST ? PrimitiveCount * 3 : PrimitiveCount + 2) * VertexStreamZeroStride,
+			VertexStreamZeroStride, 0, nullptr, 0, false, 0);
+	const bool Shaded = U2Begin();
 	ProxyInterface->DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride);
+	U2After(Shaded);
 	return D3D_OK;
 }
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawIndexedPrimitiveUP(D3DPRIMITIVETYPE PrimitiveType, UINT MinVertexIndex, UINT NumVertexIndices, UINT PrimitiveCount, const void *pIndexData, D3DFORMAT IndexDataFormat, const void *pVertexStreamZeroData, UINT VertexStreamZeroStride)
 {
 	ApplyClipPlanes();
+	if (U2.Capture)
+		U2CaptureDraw(PrimitiveType, PrimitiveCount, static_cast<const BYTE *>(pVertexStreamZeroData), (size_t)(MinVertexIndex + NumVertexIndices) * VertexStreamZeroStride,
+			VertexStreamZeroStride, 0, static_cast<const BYTE *>(pIndexData), (size_t)(PrimitiveType == D3DPT_TRIANGLELIST ? PrimitiveCount * 3 : PrimitiveCount + 2) * (IndexDataFormat == D3DFMT_INDEX32 ? 4 : 2),
+			IndexDataFormat == D3DFMT_INDEX32, 0);
+	const bool Shaded = U2Begin();
 	ProxyInterface->DrawIndexedPrimitiveUP(PrimitiveType, MinVertexIndex, NumVertexIndices, PrimitiveCount, pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride);
+	U2After(Shaded);
 	return D3D_OK;
 }
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::ProcessVertices(UINT SrcStartIndex, UINT DestIndex, UINT VertexCount, IDirect3DVertexBuffer8 *pDestBuffer, DWORD Flags)
@@ -1754,6 +1838,11 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::SetStreamSource(UINT StreamNumber, ID
 	IDirect3DVertexBuffer9 *pStreamDataImpl = nullptr;
 	if (pStreamData != nullptr)
 		pStreamDataImpl = static_cast<Direct3DVertexBuffer8 *>(pStreamData)->GetProxyInterface();
+	if (StreamNumber == 0)
+	{
+		U2Stream0 = static_cast<Direct3DVertexBuffer8 *>(pStreamData);
+		U2Stride0 = Stride;
+	}
 
 	return ProxyInterface->SetStreamSource(StreamNumber, pStreamDataImpl, 0, Stride);
 }
@@ -1788,6 +1877,7 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::SetIndices(IDirect3DIndexBuffer8 *pIn
 	const HRESULT hr = ProxyInterface->SetIndices(pIndexDataImpl);
 	if (FAILED(hr))
 		return hr;
+	U2Indices = static_cast<Direct3DIndexBuffer8 *>(pIndexData);
 
 	CurrentBaseVertexIndex = static_cast<INT>(BaseVertexIndex);
 

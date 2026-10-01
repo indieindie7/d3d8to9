@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <cstring>
 #include <vector>
 #include <unordered_set>
 #include "d3d8.hpp"
@@ -48,6 +49,7 @@ private:
 	std::vector<D3DDISPLAYMODE> CurrentAdapterModes[MAX_ADAPTERS];
 };
 
+class Direct3DTexture8;
 class Direct3DDevice8 : public IDirect3DDevice8
 {
 	Direct3DDevice8(const Direct3DDevice8 &) = delete;
@@ -160,7 +162,18 @@ public:
 
 	AddressLookupTable *ProxyAddressLookupTable;
 
+	Direct3DTexture8 *U2Stage0 = nullptr; // U2Shaders: the 2D texture on stage 0, if any
+	Direct3DTexture8 *U2Stages[4] = {};   // U2Shaders: the 2D textures on stages 0-3 (replace=)
+	Direct3DVertexBuffer8 *U2Stream0 = nullptr; // U2Shaders lmcapture=: stream 0 and its stride
+	UINT U2Stride0 = 0;
+	Direct3DIndexBuffer8 *U2Indices = nullptr;
+
 private:
+	bool U2Begin();
+	void U2After(bool Shaded);
+	DWORD U2Swapped = 0;                  // stages whose texture replace= swapped for this draw
+	void U2CaptureDraw(D3DPRIMITIVETYPE Type, UINT PrimCount, const BYTE *Verts, size_t VertBytes, UINT Stride, INT BaseVertex,
+		const BYTE *Indices, size_t IndexBytes, bool Index32, UINT StartIndex);
 	void ApplyClipPlanes();
 	void ReleaseShadersAndStateBlocks();
 
@@ -219,6 +232,8 @@ public:
 	~Direct3DTexture8();
 
 	IDirect3DTexture9 *GetProxyInterface() const { return ProxyInterface; }
+
+	DWORD U2Hash = 0; // U2Shaders: hash of the top mip, 0 until first drawn with
 
 	virtual HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObj) override;
 	virtual ULONG STDMETHODCALLTYPE AddRef() override;
@@ -382,6 +397,8 @@ private:
 	IDirect3DVolume9 *const ProxyInterface;
 };
 
+bool U2WantsBuffers(); // U2Shaders: lmcapture= is on (buffers keep a copy of what is written)
+
 class Direct3DVertexBuffer8 : public IDirect3DVertexBuffer8, public AddressLookupTableObject
 {
 	Direct3DVertexBuffer8(const Direct3DVertexBuffer8 &) = delete;
@@ -392,6 +409,11 @@ public:
 	~Direct3DVertexBuffer8();
 
 	IDirect3DVertexBuffer9 *GetProxyInterface() const { return ProxyInterface; }
+
+	// U2Shaders lmcapture=: a copy of what the game wrote, kept only while capturing
+	std::vector<BYTE> U2Shadow;
+	BYTE *U2Locked = nullptr;
+	UINT U2LockOff = 0, U2LockSize = 0;
 
 	virtual HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObj) override;
 	virtual ULONG STDMETHODCALLTYPE AddRef() override;
@@ -425,6 +447,11 @@ public:
 	~Direct3DIndexBuffer8();
 
 	IDirect3DIndexBuffer9 *GetProxyInterface() const { return ProxyInterface; }
+
+	// U2Shaders lmcapture=: a copy of what the game wrote, kept only while capturing
+	std::vector<BYTE> U2Shadow;
+	BYTE *U2Locked = nullptr;
+	UINT U2LockOff = 0, U2LockSize = 0;
 
 	virtual HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObj) override;
 	virtual ULONG STDMETHODCALLTYPE AddRef() override;
