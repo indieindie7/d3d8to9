@@ -5,6 +5,7 @@
 
 #include "d3dx9.hpp"
 #include "d3d8to9.hpp"
+#include "borderless.hpp"
 #include <regex>
 #include <assert.h>
 #include "u2shaders.hpp"

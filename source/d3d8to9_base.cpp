@@ -4,6 +4,7 @@
  */
 
 #include "d3d8to9.hpp"
+#include "borderless.hpp"
 
 static const D3DFORMAT AdapterFormats[] = {
 	D3DFMT_A8R8G8B8,
@@ -190,6 +191,10 @@ HRESULT STDMETHODCALLTYPE Direct3D8::CreateDevice(UINT Adapter, D3DDEVTYPE Devic
 
 	// Set default vertex declaration
 	DeviceInterface->SetFVF(D3DFVF_XYZ);
+
+	// windowed: borderless, covering the monitor (U2Shaders.ini borderless=0 turns it off)
+	if (PresentParams.Windowed)
+		U2Borderless::Remember(PresentParams.hDeviceWindow != nullptr ? PresentParams.hDeviceWindow : hFocusWindow);
 
 	return D3D_OK;
 }
