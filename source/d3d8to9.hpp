@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cstring>
+#include <map>
 #include <vector>
 #include <unordered_set>
 #include "d3d8.hpp"
@@ -189,6 +190,7 @@ private:
 	DWORD CurrentZBiasRenderState = 0;
 	INT   CurrentBaseVertexIndex = 0;
 	DWORD CurrentVertexShaderHandle = 0, CurrentPixelShaderHandle = 0;
+	std::map<DWORD, DWORD> U2PsHash;   // game pixel shader handle -> hash of its D3D8 tokens (psreplace=)
 
 	static constexpr size_t MAX_CLIP_PLANES = 6;
 	float StoredClipPlanes[MAX_CLIP_PLANES][4] = {};
