@@ -168,6 +168,8 @@ public:
 				PostBlur.File = "post_blur.hlsl";
 				PostFinal.File = "post_final.hlsl";
 			}
+			else if (_strnicmp(Line + strspn(Line, " \t"), "posthud=z0", 10) == 0)
+				PostHudZ0 = true;
 			else if (sscanf_s(Line, " posttrace=%u", &Hash) == 1)
 				PostTrace = (int)Hash;
 			else if (sscanf_s(Line, " postdebug=%u", &Hash) == 1)
@@ -1671,6 +1673,8 @@ public:
 	IDirect3DVertexBuffer9 *PostQuadVB = nullptr;
 	IDirect3DDevice9 *LastDev = nullptr;
 	bool Saw3D = false, PostDone = false;
+	bool PostHudZ0 = false;    // posthud=z0: only orthographic draws without depth testing start the HUD (Advent:
+	                           // a fullscreen z-tested ortho draw comes right after the sky, before the level)
 	int PostTrace = 0;                                   // posttrace=N: log the draw order of N frames
 	std::string PostTraceLine;
 
@@ -1719,6 +1723,8 @@ public:
 		}
 		if (PostTrace > 0)
 			return;                           // tracing: just record the frame
+		if (PostHudZ0 && zenable)
+			return;                           // posthud=z0: z-tested 2D draws are still the scene
 		if (!Saw3D)
 			return;
 		static int told = 0;
