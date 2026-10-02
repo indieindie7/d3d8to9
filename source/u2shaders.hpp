@@ -806,6 +806,97 @@ public:
 		if (ProbeRT) { ProbeRT->Release(); ProbeRT = nullptr; }
 	}
 
+	// lightprobe: when U2Shaders\lightprobe.req appears, log the next two frames event by event
+	// (lights set / enabled, draws with their target and active lights) to dump\lightprobe.txt.
+	// For "a character loses its lamp while one of our shadows uses that lamp".
+	int LightProbeFrames = 0;
+	FILE *LightProbeFile = nullptr;
+	void LightProbeCheck()
+	{
+		if (LightProbeFrames > 0 && --LightProbeFrames == 0 && LightProbeFile)
+		{
+			fclose(LightProbeFile);
+			LightProbeFile = nullptr;
+			Message("lightprobe: written");
+		}
+		if (Frame % 30 != 0 || LightProbeFrames > 0 || Dir.empty())
+			return;
+		std::string Req = Dir + "U2Shaders\\lightprobe.req";
+		if (GetFileAttributesA(Req.c_str()) == INVALID_FILE_ATTRIBUTES)
+			return;
+		DeleteFileA(Req.c_str());
+		if (!fopen_s(&LightProbeFile, (Dir + "U2Shaders\\dump\\lightprobe.txt").c_str(), "w") && LightProbeFile)
+			LightProbeFrames = 3;          // the rest of this frame, then two whole frames
+	}
+	void LightProbeLight(IDirect3DDevice9 *Dev, DWORD Index, const D3DLIGHT9 &L)
+	{
+		if (LightProbeFile)
+			fprintf(LightProbeFile, "setlight %u %s type %u dif %.2f %.2f %.2f pos %.0f %.0f %.0f range %.0f\n", Index,
+				Offscreen(Dev) ? "OFF" : "main", (unsigned)L.Type, L.Diffuse.r, L.Diffuse.g, L.Diffuse.b,
+				L.Position.x, L.Position.y, L.Position.z, L.Range);
+	}
+	void LightProbeEnable(DWORD Index, BOOL On)
+	{
+		if (LightProbeFile)
+			fprintf(LightProbeFile, "enable %u %d\n", Index, (int)On);
+	}
+	void LightProbeDraw(IDirect3DDevice9 *Dev, DWORD Hash, bool HasTex, bool FixedFunction)
+	{
+		if (!LightProbeFile)
+			return;
+		DWORD lighting = 0, op0 = 0, arg1 = 0, blend = 0;
+		Dev->GetRenderState(D3DRS_LIGHTING, &lighting);
+		Dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &blend);
+		Dev->GetTextureStageState(0, D3DTSS_COLOROP, &op0);
+		Dev->GetTextureStageState(0, D3DTSS_COLORARG1, &arg1);
+		bool off = Offscreen(Dev);
+		bool map = off && !HasTex && !blend && op0 == D3DTOP_SELECTARG1 && (arg1 & 0xF) == D3DTA_TFACTOR;
+		if (!lighting && !map && FixedFunction)
+			return;                         // unlit draws (world with lightmaps, HUD) don't matter here
+		fprintf(LightProbeFile, "draw %s %08x%s lighting %u %s", off ? "OFF" : "main", HasTex ? Hash : 0, map ? " SILHOUETTE" : "", lighting, FixedFunction ? "ff" : "VS");
+		{
+			DWORD amb = 0, cv = 0, dsrc = 0, asrc = 0, norm = 0, spec = 0, op[2] = {}, a1[2] = {}, a2[2] = {};
+			Dev->GetRenderState(D3DRS_AMBIENT, &amb);
+			Dev->GetRenderState(D3DRS_COLORVERTEX, &cv);
+			Dev->GetRenderState(D3DRS_DIFFUSEMATERIALSOURCE, &dsrc);
+			Dev->GetRenderState(D3DRS_AMBIENTMATERIALSOURCE, &asrc);
+			Dev->GetRenderState(D3DRS_NORMALIZENORMALS, &norm);
+			Dev->GetRenderState(D3DRS_SPECULARENABLE, &spec);
+			for (DWORD st = 0; st < 2; st++)
+			{
+				Dev->GetTextureStageState(st, D3DTSS_COLOROP, &op[st]);
+				Dev->GetTextureStageState(st, D3DTSS_COLORARG1, &a1[st]);
+				Dev->GetTextureStageState(st, D3DTSS_COLORARG2, &a2[st]);
+			}
+			D3DMATERIAL9 M = {};
+			Dev->GetMaterial(&M);
+			D3DMATRIX W = {};
+			Dev->GetTransform(D3DTS_WORLD, &W);
+			DWORD fvf = 0;
+			Dev->GetFVF(&fvf);
+			fprintf(LightProbeFile, " | amb %08x cv %u dsrc %u asrc %u norm %u spec %u st0 %u %x %x st1 %u %x %x mat d %.2f a %.2f e %.2f | W %.2f %.2f %.2f t %.0f %.0f %.0f fvf %x",
+				amb, cv, dsrc, asrc, norm, spec, op[0], a1[0], a2[0], op[1], a1[1], a2[1], M.Diffuse.r, M.Ambient.r, M.Emissive.r,
+				W._11, W._22, W._33, W._41, W._42, W._43, fvf);
+		}
+		if (!FixedFunction)
+		{
+			// a vertex shader lights it: its constants carry the lights
+			float C[24][4] = {};
+			Dev->GetVertexShaderConstantF(0, C[0], 24);
+			fprintf(LightProbeFile, " | vsc");
+			for (int i = 0; i < 24; i++)
+				fprintf(LightProbeFile, " c%d(%.2f %.2f %.2f %.2f)", i, C[i][0], C[i][1], C[i][2], C[i][3]);
+		}
+		for (DWORD i = 0; i < 8; i++)
+		{
+			BOOL on = FALSE;
+			D3DLIGHT9 L = {};
+			if (SUCCEEDED(Dev->GetLightEnable(i, &on)) && on && SUCCEEDED(Dev->GetLight(i, &L)))
+				fprintf(LightProbeFile, " | L%u %.2f %.2f %.2f r%.0f", i, L.Diffuse.r, L.Diffuse.g, L.Diffuse.b, L.Range);
+		}
+		fprintf(LightProbeFile, "\n");
+	}
+
 	void ClearBlurSources() { for (auto &It : BlurSource) if (It.second) It.second->Release(); BlurSource.clear(); }
 	DWORD OldTCI3 = 0, OldTTF3 = 0, OldSrc = 0, OldDst = 0;
 	bool RawDebug = false;
@@ -2392,7 +2483,10 @@ public:
 		}
 		PostTraceLine.clear();
 		Saw3D = PostDone = false;
+		if (LightProbeFile)
+			fprintf(LightProbeFile, "--- present, frame %u\n", Frame);
 		Frame++;
+		LightProbeCheck();
 		if (Capture && CaptureDirty && Frame % 300 == 0)
 			WriteCapture();
 		if (CharProbe)

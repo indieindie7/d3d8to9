@@ -14,7 +14,7 @@ bool U2WantsBuffers()
 {
 	if (!U2.Loaded)
 		U2.Load();
-	return U2.Capture;
+	return U2.Capture || U2.LightProbeFrames > 0;
 }
 
 struct VertexShaderInfo
@@ -716,6 +716,12 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::SetLight(DWORD Index, const D3DLIGHT8
 		}
 	}
 
+	if (U2.LightProbeFile)
+	{
+		D3DLIGHT9 L9;
+		memcpy(&L9, &Light, sizeof(L9));
+		U2.LightProbeLight(ProxyInterface, Index, L9);
+	}
 	return ProxyInterface->SetLight(Index, &Light);
 }
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::GetLight(DWORD Index, D3DLIGHT8 *pLight)
@@ -724,6 +730,7 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::GetLight(DWORD Index, D3DLIGHT8 *pLig
 }
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::LightEnable(DWORD Index, BOOL Enable)
 {
+	U2.LightProbeEnable(Index, Enable);
 	return ProxyInterface->LightEnable(Index, Enable);
 }
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::GetLightEnable(DWORD Index, BOOL *pEnable)
@@ -1153,6 +1160,7 @@ bool Direct3DDevice8::U2Begin()
 				U2Swapped |= 1u << s;
 			}
 	U2.LogTargetDraw(ProxyInterface, FixedFunction, U2Stage0 != nullptr);
+	U2.LightProbeDraw(ProxyInterface, U2Stage0 ? U2Stage0->U2Hash : 0, U2Stage0 != nullptr, FixedFunction);
 	if (U2.PcssBegin(ProxyInterface, U2Stage0 ? U2Stage0->GetProxyInterface() : nullptr, FixedFunction))
 		return true;
 	if (U2Stage0 == nullptr)
@@ -1178,6 +1186,36 @@ void Direct3DDevice8::U2After(bool Shaded)
 			ProxyInterface->SetTexture(s, U2Stages[s]->GetProxyInterface());
 	U2Swapped = 0;
 }
+// lightprobe: a draw's vertex layout and the average length of its normals (0 = no lighting possible)
+static void U2ProbeVB(IDirect3DDevice9 *Dev, const BYTE *Data, size_t Size, UINT Stride, size_t First, UINT Count)
+{
+	if (!U2.LightProbeFile || Data == nullptr || Stride == 0)
+		return;
+	int NormOff = -1;
+	char Decl[200] = "";
+	IDirect3DVertexDeclaration9 *VD = nullptr;
+	if (SUCCEEDED(Dev->GetVertexDeclaration(&VD)) && VD)
+	{
+		D3DVERTEXELEMENT9 E[MAXD3DDECLLENGTH]; UINT N = MAXD3DDECLLENGTH;
+		if (SUCCEEDED(VD->GetDeclaration(E, &N)))
+			for (UINT e = 0; e + 1 < N && strlen(Decl) < 170; e++)
+			{
+				char b[24]; sprintf_s(b, " s%u@%u:t%u/u%u", E[e].Stream, E[e].Offset, E[e].Type, E[e].Usage); strcat_s(Decl, b);
+				if (E[e].Stream == 0 && E[e].Usage == D3DDECLUSAGE_NORMAL && E[e].Type == D3DDECLTYPE_FLOAT3) NormOff = E[e].Offset;
+			}
+		VD->Release();
+	}
+	double Sum = 0; UINT Cnt = 0;
+	if (NormOff >= 0)
+		for (UINT i = 0; i < Count; i++)
+		{
+			const size_t At = (First + i) * Stride + NormOff;
+			if (At + 12 > Size) break;
+			const float *Nf = (const float *)(Data + At);
+			Sum += sqrt((double)Nf[0] * Nf[0] + (double)Nf[1] * Nf[1] + (double)Nf[2] * Nf[2]); Cnt++;
+		}
+	fprintf(U2.LightProbeFile, "  (prev) decl%s | normal at %d, avg |n| %.3f over %u verts, stride %u\n", Decl, NormOff, Cnt ? Sum / Cnt : -1.0, Cnt, Stride);
+}
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawPrimitive(D3DPRIMITIVETYPE PrimitiveType, UINT StartVertex, UINT PrimitiveCount)
 {
 	ApplyClipPlanes();
@@ -1186,6 +1224,9 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawPrimitive(D3DPRIMITIVETYPE Primit
 			U2Stream0->U2Shadow.size() - (size_t)StartVertex * U2Stride0, U2Stride0, 0, nullptr, 0, false, 0);
 	const bool Shaded = U2Begin();
 	U2.LastDrawHR = ProxyInterface->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
+	if (U2.LightProbeFile && U2Stream0 != nullptr && !U2Stream0->U2Shadow.empty())
+		U2ProbeVB(ProxyInterface, U2Stream0->U2Shadow.data(), U2Stream0->U2Shadow.size(), U2Stride0, StartVertex,
+			PrimitiveType == D3DPT_TRIANGLELIST ? PrimitiveCount * 3 : PrimitiveCount + 2);
 	U2After(Shaded);
 	return D3D_OK;
 }
@@ -1199,10 +1240,64 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawIndexedPrimitive(D3DPRIMITIVETYPE
 		U2CaptureDraw(PrimitiveType, PrimitiveCount, U2Stream0->U2Shadow.data(), U2Stream0->U2Shadow.size(), U2Stride0, CurrentBaseVertexIndex,
 			U2Indices->U2Shadow.data(), U2Indices->U2Shadow.size(), IbDesc.Format == D3DFMT_INDEX32, StartIndex);
 	}
+	if (U2.LightProbeFile && U2Stream0 != nullptr && U2Indices != nullptr && !U2Stream0->U2Shadow.empty() && !U2Indices->U2Shadow.empty())
+	{
+		// lightprobe: the first vertex this draw uses, raw (to compare normals between the shadow pass and the view)
+		D3DINDEXBUFFER_DESC IbDesc;
+		U2Indices->GetProxyInterface()->GetDesc(&IbDesc);
+		const bool I32 = IbDesc.Format == D3DFMT_INDEX32;
+		const size_t Off = (size_t)StartIndex * (I32 ? 4 : 2);
+		if (Off + 4 <= U2Indices->U2Shadow.size())
+		{
+			const UINT Idx = I32 ? *(const UINT *)(U2Indices->U2Shadow.data() + Off) : *(const WORD *)(U2Indices->U2Shadow.data() + Off);
+			const size_t V = ((size_t)CurrentBaseVertexIndex + Idx) * U2Stride0;
+			// the vertex layout (declaration): where the normal is, then its average length over the draw
+			int NormOff = -1;
+			char Decl[200] = "";
+			IDirect3DVertexDeclaration9 *VD = nullptr;
+			if (SUCCEEDED(ProxyInterface->GetVertexDeclaration(&VD)) && VD)
+			{
+				D3DVERTEXELEMENT9 E[MAXD3DDECLLENGTH]; UINT N = MAXD3DDECLLENGTH;
+				if (SUCCEEDED(VD->GetDeclaration(E, &N)))
+					for (UINT e = 0; e + 1 < N && strlen(Decl) < 170; e++)
+					{
+						char b[24]; sprintf_s(b, " s%u@%u:t%u/u%u", E[e].Stream, E[e].Offset, E[e].Type, E[e].Usage); strcat_s(Decl, b);
+						if (E[e].Stream == 0 && E[e].Usage == D3DDECLUSAGE_NORMAL && E[e].Type == D3DDECLTYPE_FLOAT3) NormOff = E[e].Offset;
+					}
+				VD->Release();
+			}
+			double Sum = 0; UINT Cnt = 0;
+			if (NormOff >= 0)
+				for (UINT i = 0; i < NumVertices; i++)
+				{
+					const size_t At = ((size_t)CurrentBaseVertexIndex + MinIndex + i) * U2Stride0 + NormOff;
+					if (At + 12 > U2Stream0->U2Shadow.size()) break;
+					const float *Nf = (const float *)(U2Stream0->U2Shadow.data() + At);
+					Sum += sqrt((double)Nf[0] * Nf[0] + (double)Nf[1] * Nf[1] + (double)Nf[2] * Nf[2]); Cnt++;
+				}
+			fprintf(U2.LightProbeFile, "  decl%s | normal at %d, avg |n| %.3f over %u verts, stride %u\n", Decl, NormOff, Cnt ? Sum / Cnt : -1.0, Cnt, U2Stride0);
+		}
+	}
 	const bool Shaded = U2Begin();
 	U2.LastDrawHR = ProxyInterface->DrawIndexedPrimitive(PrimitiveType, CurrentBaseVertexIndex, MinIndex, NumVertices, StartIndex, PrimitiveCount);
 	U2After(Shaded);
 	return D3D_OK;
+}
+// lightprobe: a user-pointer draw's vertices: the first one raw, and the average length of floats 3-5
+// (the normal, in the usual position + normal + uv layout) over the vertices it uses
+static void U2ProbeVerts(const void *Data, UINT Stride, UINT First, UINT Count)
+{
+	if (!U2.LightProbeFile || Data == nullptr || Stride < 32 || Count == 0)
+		return;
+	double Sum = 0;
+	for (UINT i = 0; i < Count; i++)
+	{
+		const float *F = (const float *)((const BYTE *)Data + (size_t)(First + i) * Stride);
+		Sum += sqrt((double)F[3] * F[3] + (double)F[4] * F[4] + (double)F[5] * F[5]);
+	}
+	const float *F = (const float *)((const BYTE *)Data + (size_t)First * Stride);
+	fprintf(U2.LightProbeFile, "  UP stride %u verts %u v0 %.1f %.1f %.1f | n %.3f %.3f %.3f | %.3f %.3f | avg |n| %.3f\n", Stride, Count,
+		F[0], F[1], F[2], F[3], F[4], F[5], F[6], F[7], Sum / Count);
 }
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawPrimitiveUP(D3DPRIMITIVETYPE PrimitiveType, UINT PrimitiveCount, const void *pVertexStreamZeroData, UINT VertexStreamZeroStride)
 {
@@ -1212,6 +1307,7 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawPrimitiveUP(D3DPRIMITIVETYPE Prim
 			VertexStreamZeroStride, 0, nullptr, 0, false, 0);
 	const bool Shaded = U2Begin();
 	U2.LastDrawHR = ProxyInterface->DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride);
+	U2ProbeVerts(pVertexStreamZeroData, VertexStreamZeroStride, 0, PrimitiveType == D3DPT_TRIANGLELIST ? PrimitiveCount * 3 : PrimitiveCount + 2);
 	U2After(Shaded);
 	return D3D_OK;
 }
@@ -1224,6 +1320,7 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawIndexedPrimitiveUP(D3DPRIMITIVETY
 			IndexDataFormat == D3DFMT_INDEX32, 0);
 	const bool Shaded = U2Begin();
 	U2.LastDrawHR = ProxyInterface->DrawIndexedPrimitiveUP(PrimitiveType, MinVertexIndex, NumVertexIndices, PrimitiveCount, pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride);
+	U2ProbeVerts(pVertexStreamZeroData, VertexStreamZeroStride, MinVertexIndex, NumVertexIndices);
 	U2After(Shaded);
 	return D3D_OK;
 }
