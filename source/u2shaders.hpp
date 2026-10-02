@@ -2355,6 +2355,7 @@ public:
 				ProjRule.File = "pcss_proj.hlsl";
 				if (!Pcss)
 				{
+					MapViews.clear();
 					ClearBlurSources();
 					MapTarget = nullptr;
 					MapDirty = false;
