@@ -2346,6 +2346,22 @@ public:
 				;
 			else if (sscanf_s(Line, " sharpen=%f", &PostBalance[3]) == 1)
 				;
+			else if (sscanf_s(Line, " pcss=%u", &V) == 1 && (V != 0) != Pcss)
+			{
+				// live switch (Advent: contact hardening indoors only). Off: forget the maps
+				// and snapshots, as after a lost device, so nothing stale is used when it's back
+				Pcss = V != 0;
+				MapRule.File = "pcss_map.hlsl";
+				ProjRule.File = "pcss_proj.hlsl";
+				if (!Pcss)
+				{
+					ClearBlurSources();
+					MapTarget = nullptr;
+					MapDirty = false;
+					CopiedFor = nullptr;
+				}
+				Message("pcss: switched %s", Pcss ? "on" : "off");
+			}
 		}
 		fclose(F);
 		if (!Force)
