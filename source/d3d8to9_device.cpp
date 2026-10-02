@@ -1185,7 +1185,7 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawPrimitive(D3DPRIMITIVETYPE Primit
 		U2CaptureDraw(PrimitiveType, PrimitiveCount, U2Stream0->U2Shadow.data() + (size_t)StartVertex * U2Stride0,
 			U2Stream0->U2Shadow.size() - (size_t)StartVertex * U2Stride0, U2Stride0, 0, nullptr, 0, false, 0);
 	const bool Shaded = U2Begin();
-	ProxyInterface->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
+	U2.LastDrawHR = ProxyInterface->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
 	U2After(Shaded);
 	return D3D_OK;
 }
@@ -1200,7 +1200,7 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawIndexedPrimitive(D3DPRIMITIVETYPE
 			U2Indices->U2Shadow.data(), U2Indices->U2Shadow.size(), IbDesc.Format == D3DFMT_INDEX32, StartIndex);
 	}
 	const bool Shaded = U2Begin();
-	ProxyInterface->DrawIndexedPrimitive(PrimitiveType, CurrentBaseVertexIndex, MinIndex, NumVertices, StartIndex, PrimitiveCount);
+	U2.LastDrawHR = ProxyInterface->DrawIndexedPrimitive(PrimitiveType, CurrentBaseVertexIndex, MinIndex, NumVertices, StartIndex, PrimitiveCount);
 	U2After(Shaded);
 	return D3D_OK;
 }
@@ -1211,7 +1211,7 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawPrimitiveUP(D3DPRIMITIVETYPE Prim
 		U2CaptureDraw(PrimitiveType, PrimitiveCount, static_cast<const BYTE *>(pVertexStreamZeroData), (size_t)(PrimitiveType == D3DPT_TRIANGLELIST ? PrimitiveCount * 3 : PrimitiveCount + 2) * VertexStreamZeroStride,
 			VertexStreamZeroStride, 0, nullptr, 0, false, 0);
 	const bool Shaded = U2Begin();
-	ProxyInterface->DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride);
+	U2.LastDrawHR = ProxyInterface->DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride);
 	U2After(Shaded);
 	return D3D_OK;
 }
@@ -1223,7 +1223,7 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawIndexedPrimitiveUP(D3DPRIMITIVETY
 			VertexStreamZeroStride, 0, static_cast<const BYTE *>(pIndexData), (size_t)(PrimitiveType == D3DPT_TRIANGLELIST ? PrimitiveCount * 3 : PrimitiveCount + 2) * (IndexDataFormat == D3DFMT_INDEX32 ? 4 : 2),
 			IndexDataFormat == D3DFMT_INDEX32, 0);
 	const bool Shaded = U2Begin();
-	ProxyInterface->DrawIndexedPrimitiveUP(PrimitiveType, MinVertexIndex, NumVertexIndices, PrimitiveCount, pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride);
+	U2.LastDrawHR = ProxyInterface->DrawIndexedPrimitiveUP(PrimitiveType, MinVertexIndex, NumVertexIndices, PrimitiveCount, pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride);
 	U2After(Shaded);
 	return D3D_OK;
 }
