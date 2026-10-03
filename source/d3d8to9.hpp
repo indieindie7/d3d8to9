@@ -190,6 +190,7 @@ private:
 	DWORD CurrentZBiasRenderState = 0;
 	INT   CurrentBaseVertexIndex = 0;
 	DWORD CurrentVertexShaderHandle = 0, CurrentPixelShaderHandle = 0;
+	ULONG U2GameRefs = 1;              // the game's own references (U2Shaders' objects hold more on the d3d9 device)
 	std::map<DWORD, DWORD> U2PsHash;   // game pixel shader handle -> hash of its D3D8 tokens (psreplace=)
 
 	static constexpr size_t MAX_CLIP_PLANES = 6;

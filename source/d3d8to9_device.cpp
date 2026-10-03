@@ -73,6 +73,7 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::QueryInterface(REFIID riid, void **pp
 }
 ULONG STDMETHODCALLTYPE Direct3DDevice8::AddRef()
 {
+	U2GameRefs++;
 	ULONG LastRefCount = ProxyInterface->AddRef();
 
 	// Shaders and state blocks increase ref counter in d3d9 but not in d3d8
@@ -87,6 +88,13 @@ ULONG STDMETHODCALLTYPE Direct3DDevice8::AddRef()
 
 ULONG STDMETHODCALLTYPE Direct3DDevice8::Release()
 {
+	// the game lets go of the device: U2Shaders' own textures, targets and shaders each hold a
+	// reference to the d3d9 device, so release them first, or the device never reaches zero, is
+	// never destroyed, and every fullscreen/windowed switch leaks one (the game then loops making
+	// new devices until Direct3D refuses) while the old objects get bound to the new device
+	if (U2GameRefs > 0 && --U2GameRefs == 0)
+		U2.OnDestroy();
+
 	// Get current value before releasing the device reference
 	ULONG LastRefCount = ProxyInterface->AddRef();
 	LastRefCount = ProxyInterface->Release();
