@@ -785,7 +785,7 @@ public:
 	// the HRESULTs of SetPixelShader and of the draw, stages 2/3 texgen before / during / after,
 	// and A read back right after the draw (pixels with alpha < 255 = silhouette). For finding
 	// why a map draw with our pixel shader can write nothing (Advent Rising, sun on terrain).
-	int PcssProbe = 0, ProbeCount = 0;
+	int PcssProbe = 0, ProbeCount = 0, SnapProbes = 0;
 	bool ProbePending = false;
 	HRESULT LastDrawHR = S_OK, ProbePSHR = S_OK;
 	DWORD ProbeBefore[4] = {};              // stage 2 TCI/TTF, stage 3 TCI/TTF before the draw
@@ -1188,7 +1188,16 @@ public:
 					IDirect3DSurface9 *Dst = nullptr;
 					if (Snap != nullptr && SUCCEEDED(Snap->GetSurfaceLevel(0, &Dst)) && Dst)
 					{
-						Dev->StretchRect(S0, nullptr, Dst, nullptr, D3DTEXF_NONE);
+						const HRESULT SR = Dev->StretchRect(S0, nullptr, Dst, nullptr, D3DTEXF_NONE);
+						if (PcssProbe > 0 && SnapProbes < PcssProbe)
+						{
+							// pcssprobe=N: does the snapshot get the silhouette? (shadowed pixels in A and the copy)
+							SnapProbes++;
+							int TA = 0, TS = 0;
+							const int NA = CountShadowed(Dev, S0, TA), NS = CountShadowed(Dev, Dst, TS);
+							Message("pcss snapshot %d: StretchRect hr %08x, A shadowed %d, snapshot shadowed %d (of %d), for target %p\n",
+								SnapProbes, (unsigned)SR, NA, NS, TA, T);
+						}
 						Dst->Release();
 					}
 					MapDirty = false;
