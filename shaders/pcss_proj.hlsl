@@ -12,11 +12,13 @@
 // into a second map as 0.502 * alpha, and projects that. Here the sharp map comes in on
 // sampler 3 and the blur is done per pixel, its radius set by how far above this ground the
 // shadowing part is. Stages 1 and 2 of the original draw fade the result to neutral by
-// their gradient textures' alpha; that is repeated here.
+// their textures' alpha (stage 1 a gradient, stage 2 a cube map by facing); that is repeated
+// here. Stage 2 must be read as a cube: read as a 2D texture it gave 1 under dgVoodoo but 0 on
+// Windows' own Direct3D 9, which faded every shadow away.
 
 sampler2D Blurred : register(s0);   // the engine's blurred map (unused but for debugging)
 sampler2D Fade1   : register(s1);
-sampler2D Fade2   : register(s2);
+samplerCUBE Fade2 : register(s2);  // facing fade: a cube map looked up by the camera-space normal
 sampler2D Sharp   : register(s3);
 float4 Info  : register(c0);    // x: time, y: debug view (1: gap as colour, 2: raw values)
 float4 TF    : register(c1);    // neutral colour (the draw's texture factor): no darkening
@@ -87,6 +89,6 @@ float4 main(float3 t0 : TEXCOORD0, float3 t1 : TEXCOORD1, float3 t2 : TEXCOORD2,
 
 	// the original draw's fades (stages 1 and 2: blend to neutral by the gradient alpha)
 	col = lerp(TF.rgb, col, tex2D(Fade1, t1.xy).a);
-	col = lerp(TF.rgb, col, tex2D(Fade2, t2.xy).a);
+	col = lerp(TF.rgb, col, texCUBE(Fade2, t2).a);
 	return float4(col, 1);
 }

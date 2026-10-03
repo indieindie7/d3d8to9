@@ -1124,14 +1124,39 @@ public:
 			Dev->GetRenderState(D3DRS_ZENABLE, &zen);
 			Dev->GetRenderState(D3DRS_DESTBLEND, &dst);
 			Dev->GetFVF(&fvf);
-			IDirect3DSurface9 *T = nullptr; D3DSURFACE_DESC D = {};
+			IDirect3DSurface9 *T = nullptr, *Z = nullptr; D3DSURFACE_DESC D = {}, ZD = {};
 			if (SUCCEEDED(Dev->GetRenderTarget(0, &T)) && T) { T->GetDesc(&D); T->Release(); }
-			char k[300];
-			sprintf_s(k, "rt %u tex %d ff %d blend %u %u/%u cop %u a1 %x aop %u aa1 %x st1 %u cwe %x z %u fvf %x tf %08x",
-				D.Width, Tex != nullptr, FixedFunction, blend, src, dst, op0, arg1, aop, aa1, op1, cwe, zen, fvf, tf);
+			const bool HasZ = SUCCEEDED(Dev->GetDepthStencilSurface(&Z)) && Z;
+			if (HasZ) { Z->GetDesc(&ZD); Z->Release(); }
+			DWORD zfunc = 0, zwrite = 0;
+			Dev->GetRenderState(D3DRS_ZFUNC, &zfunc);
+			Dev->GetRenderState(D3DRS_ZWRITEENABLE, &zwrite);
+			DWORD tci0 = 0, addu = 0, minf = 0;
+			Dev->GetTextureStageState(0, D3DTSS_TEXCOORDINDEX, &tci0);
+			Dev->GetSamplerState(0, D3DSAMP_ADDRESSU, &addu);
+			Dev->GetSamplerState(0, D3DSAMP_MINFILTER, &minf);
+			bool Self = false;
+			if (Tex != nullptr)
+			{
+				IDirect3DSurface9 *S0 = nullptr, *RT = nullptr;
+				if (SUCCEEDED(Tex->GetSurfaceLevel(0, &S0)) && S0)
+				{
+					if (SUCCEEDED(Dev->GetRenderTarget(0, &RT)) && RT) { Self = RT == S0; RT->Release(); }
+					S0->Release();
+				}
+			}
+			char k[400];
+			sprintf_s(k, "rt %u tex %d%s ff %d blend %u %u/%u cop %u a1 %x aop %u aa1 %x st1 %u cwe %x z %u (func %u write %u, depth %ux%u%s) fvf %x tci0 %x ttf0 %x addr %u min %u tf %08x",
+				D.Width, Tex != nullptr, Self ? " (self)" : "", FixedFunction, blend, src, dst, op0, arg1, aop, aa1, op1, cwe, zen, zfunc, zwrite, ZD.Width, ZD.Height, HasZ ? "" : " none", fvf, tci0, ttf0, addu, minf, tf);
 			if (!told[k]) { told[k] = true; Message("offscreen draw: %s\n", k); }
 		}
 		bool map = Tex == nullptr && !blend && op0 == D3DTOP_SELECTARG1 && (arg1 & 0xF) == D3DTA_TFACTOR && Offscreen(Dev);
+		if (map)
+			PassMap++;
+		else if (Tex != nullptr && blend && src == D3DBLEND_SRCALPHA && Offscreen(Dev))
+			PassBlur++;
+		else if (Tex != nullptr && blend && src == D3DBLEND_DESTCOLOR && (ttf0 & D3DTTFF_PROJECTED))
+			PassProj++;
 		if (map)
 		{
 			IDirect3DSurface9 *T = nullptr;
@@ -1175,6 +1200,69 @@ public:
 			return false;
 		}
 		bool proj = Tex != nullptr && blend && src == D3DBLEND_DESTCOLOR && (ttf0 & D3DTTFF_PROJECTED);
+		if (proj && PcssDebug > 5.5)
+		{
+			// stages 1 and 2 of the projector draw (the gradient fades), once per distinct setup
+			static std::map<std::string, bool> told;
+			for (DWORD st = 1; st <= 2; st++)
+			{
+				DWORD tci = 0, ttf = 0, op = 0, a1 = 0, a2 = 0, aop = 0, aa1 = 0, aa2 = 0, au = 0, av = 0, bc = 0;
+				Dev->GetTextureStageState(st, D3DTSS_TEXCOORDINDEX, &tci);
+				Dev->GetTextureStageState(st, D3DTSS_TEXTURETRANSFORMFLAGS, &ttf);
+				Dev->GetTextureStageState(st, D3DTSS_COLOROP, &op);
+				Dev->GetTextureStageState(st, D3DTSS_COLORARG1, &a1);
+				Dev->GetTextureStageState(st, D3DTSS_COLORARG2, &a2);
+				Dev->GetTextureStageState(st, D3DTSS_ALPHAOP, &aop);
+				Dev->GetTextureStageState(st, D3DTSS_ALPHAARG1, &aa1);
+				Dev->GetTextureStageState(st, D3DTSS_ALPHAARG2, &aa2);
+				Dev->GetSamplerState(st, D3DSAMP_ADDRESSU, &au);
+				Dev->GetSamplerState(st, D3DSAMP_ADDRESSV, &av);
+				Dev->GetSamplerState(st, D3DSAMP_BORDERCOLOR, &bc);
+				D3DMATRIX M = {};
+				Dev->GetTransform((D3DTRANSFORMSTATETYPE)(D3DTS_TEXTURE0 + st), &M);
+				IDirect3DBaseTexture9 *B = nullptr;
+				D3DSURFACE_DESC D = {};
+				char cube[200] = "";
+				if (SUCCEEDED(Dev->GetTexture(st, &B)) && B)
+				{
+					if (B->GetType() == D3DRTYPE_TEXTURE) static_cast<IDirect3DTexture9 *>(B)->GetLevelDesc(0, &D);
+					else if (B->GetType() == D3DRTYPE_CUBETEXTURE)
+					{
+						auto *C = static_cast<IDirect3DCubeTexture9 *>(B);
+						C->GetLevelDesc(0, &D);
+						// alpha range of each face's top level (managed/system textures can be locked)
+						int n = sprintf_s(cube, " cube levels %u pool %u usage %x alpha", C->GetLevelCount(), (unsigned)D.Pool, (unsigned)D.Usage);
+						for (int f = 0; f < 6 && D.Format == D3DFMT_A8R8G8B8; f++)
+						{
+							D3DLOCKED_RECT L;
+							if (SUCCEEDED(C->LockRect((D3DCUBEMAP_FACES)f, 0, &L, nullptr, D3DLOCK_READONLY)))
+							{
+								int lo = 255, hi = 0;
+								for (UINT y = 0; y < D.Height; y++)
+									for (UINT x = 0; x < D.Width; x++)
+									{
+										int a = ((const BYTE *)L.pBits)[y * L.Pitch + x * 4 + 3];
+										lo = a < lo ? a : lo; hi = a > hi ? a : hi;
+									}
+								C->UnlockRect((D3DCUBEMAP_FACES)f, 0);
+								n += sprintf_s(cube + n, sizeof(cube) - n, " %d-%d", lo, hi);
+							}
+							else
+								n += sprintf_s(cube + n, sizeof(cube) - n, " nolock");
+						}
+					}
+					B->Release();
+				}
+				char k[900];
+				sprintf_s(k, "proj stage %u: tex %ux%u fmt %u%s, tci %x ttf %x, cop %u %x %x, aop %u %x %x, addr %u %u border %08x, "
+					"m [%.4g %.4g %.4g %.4g | %.4g %.4g %.4g %.4g | %.4g %.4g %.4g %.4g | %.4g %.4g %.4g %.4g]",
+					st, D.Width, D.Height, (unsigned)D.Format, cube, tci, ttf, op, a1, a2, aop, aa1, aa2, au, av, bc,
+					M._11, M._12, M._13, M._14, M._21, M._22, M._23, M._24, M._31, M._32, M._33, M._34, M._41, M._42, M._43, M._44);
+				const char *e = strstr(k, ", m [");
+				std::string key(k, e ? e - k : strlen(k));
+				if (!told[key] && told.size() < 12) { told[key] = true; Message("%s\n", k); }
+			}
+		}
 		if ((!map && !proj) || !FixedFunction)
 			return false;
 		IDirect3DPixelShader9 *PS = Compile(Dev, map ? MapRule : ProjRule);
@@ -1219,6 +1307,19 @@ public:
 				static int told = 0;
 				if (told++ < 4)
 					Message("pcss: projector without a known sharp map, left stock\n");
+				return false;
+			}
+			// stage 2 fades the shadow by the receiver's facing: a cube map looked up by the
+			// camera-space normal. pcss_proj.hlsl samples it as a cube (texCUBE); a projector
+			// with anything else there is left to the engine
+			IDirect3DBaseTexture9 *F2 = nullptr;
+			const bool Cube = SUCCEEDED(Dev->GetTexture(2, &F2)) && F2 && F2->GetType() == D3DRTYPE_CUBETEXTURE;
+			if (F2) F2->Release();
+			if (!Cube)
+			{
+				static int toldCube = 0;
+				if (toldCube++ < 4)
+					Message("pcss: projector whose stage 2 isn't a cube map, left stock\n");
 				return false;
 			}
 		}
@@ -2940,6 +3041,7 @@ public:
 	DWORD OldCharTCI[4] = {}, OldCharTTF[4] = {};
 	D3DMATRIX OldCharTexMat[4] = {};
 	unsigned MapsThisFrame = 0, ProbeFrames = 0, FramesWithMaps = 0;
+	unsigned PassMap = 0, PassBlur = 0, PassProj = 0;   // pcssdebug>=5: shadow passes per 300 frames
 	struct U2Probe { unsigned Draws = 0, AfterMaps = 0, FirstFrame = 0; std::string Sample; };
 	std::map<std::string, U2Probe> Probes;
 	std::map<DWORD, bool> ProbeDumped;
@@ -3268,6 +3370,11 @@ public:
 		if (LightProbeFile)
 			fprintf(LightProbeFile, "--- present, frame %u\n", Frame);
 		Frame++;
+		if (PcssDebug > 4.5 && Frame % 300 == 0)
+		{
+			Message("pcss passes, frames %u-%u: map %u blur %u projector %u\n", Frame - 300, Frame, PassMap, PassBlur, PassProj);
+			PassMap = PassBlur = PassProj = 0;
+		}
 		RelightFrame();
 		LightProbeCheck();
 		if (Capture && CaptureDirty && Frame % 300 == 0)
