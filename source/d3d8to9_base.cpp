@@ -4,6 +4,7 @@
  */
 
 #include "d3d8to9.hpp"
+#include "fakefull.hpp"
 
 static const D3DFORMAT AdapterFormats[] = {
 	D3DFMT_A8R8G8B8,
@@ -179,6 +180,7 @@ HRESULT STDMETHODCALLTYPE Direct3D8::CreateDevice(UINT Adapter, D3DDEVTYPE Devic
 
 	D3DPRESENT_PARAMETERS PresentParams;
 	ConvertPresentParameters(*pPresentationParameters, PresentParams);
+	U2FakeFull::Adjust(PresentParams, hFocusWindow);
 
 	IDirect3DDevice9 *DeviceInterface = nullptr;
 

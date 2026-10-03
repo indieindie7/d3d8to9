@@ -53,6 +53,7 @@
 #pragma once
 
 #include <d3dcompiler.h>
+#include "fakefull.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdarg>
@@ -127,6 +128,8 @@ public:
 		Dir = Path;
 		Dir.erase(Dir.find_last_of("\\/") + 1);
 		DeleteFileA((Dir + "U2Shaders.log").c_str());
+		if (!U2FakeFull::Pending().empty())
+			Message("%s", U2FakeFull::Pending().substr(0, U2FakeFull::Pending().size() - 1).c_str());
 
 		FILE *F = nullptr;
 		if (fopen_s(&F, (Dir + "U2Shaders.ini").c_str(), "r") || F == nullptr)
@@ -148,6 +151,8 @@ public:
 				;
 			else if (sscanf_s(Line, " pcssdebug=%f", &PcssDebug) == 1)
 				;
+			else if (sscanf_s(Line, " relight=%u", &Hash) == 1)
+				Relight = Hash != 0;
 			else if (sscanf_s(Line, " pcssprobe=%u", &Hash) == 1)
 				PcssProbe = (int)Hash;
 			else if (sscanf_s(Line, " shadowtint=%f %f %f", &ShadowTint[0], &ShadowTint[1], &ShadowTint[2]) == 3)
@@ -910,6 +915,115 @@ public:
 				fprintf(LightProbeFile, " | L%u %.2f %.2f %.2f r%.0f", i, L.Diffuse.r, L.Diffuse.g, L.Diffuse.b, L.Range);
 		}
 		fprintf(LightProbeFile, "\n");
+	}
+
+	// relight (on unless relight=0): when an actor casts a shadow from a real light, Unreal II leaves that
+	// light out when it draws the actor (it lights it with the next lights instead, or none), so a character
+	// under one lamp turns black. Each shadow silhouette (drawn offscreen with the actor's own world matrix)
+	// remembers the lights that were on; a lit draw in the main view with the same world matrix gets any of
+	// them that is missing turned on in a free slot, for that draw only.
+	bool Relight = true;
+	struct RelightSeen { D3DMATRIX W; D3DLIGHT9 L[8]; DWORD Mask; unsigned Frame; };
+	std::vector<RelightSeen> RelightList;
+	DWORD RelightOn = 0;                  // lights turned on for the current draw (RelightEnd turns them off)
+	unsigned RelightCount = 0;
+	static bool SameWorld(const D3DMATRIX &A, const D3DMATRIX &B)
+	{
+		for (int r = 0; r < 4; r++)
+			for (int c = 0; c < 3; c++)
+				if (fabsf(A.m[r][c] - B.m[r][c]) > (r == 3 ? 0.5f : 0.01f))
+					return false;
+		return true;
+	}
+	void RelightBegin(IDirect3DDevice9 *Dev, bool HasTex, bool FixedFunction)
+	{
+		RelightOn = 0;
+		if (!Relight || !FixedFunction)
+			return;
+		DWORD lighting = 0;
+		Dev->GetRenderState(D3DRS_LIGHTING, &lighting);
+		if (!lighting)
+		{
+			DWORD op0 = 0, arg1 = 0, blend = 0;
+			if (HasTex)
+				return;
+			Dev->GetTextureStageState(0, D3DTSS_COLOROP, &op0);
+			Dev->GetTextureStageState(0, D3DTSS_COLORARG1, &arg1);
+			if (op0 != D3DTOP_SELECTARG1 || (arg1 & 0xF) != D3DTA_TFACTOR)
+				return;
+			Dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &blend);
+			if (blend || !Offscreen(Dev))
+				return;
+			RelightSeen S = {};
+			Dev->GetTransform(D3DTS_WORLD, &S.W);
+			for (DWORD i = 0; i < 8; i++)
+			{
+				BOOL on = FALSE;
+				if (SUCCEEDED(Dev->GetLightEnable(i, &on)) && on && SUCCEEDED(Dev->GetLight(i, &S.L[i])))
+					S.Mask |= 1u << i;
+			}
+			if (!S.Mask)
+				return;
+			S.Frame = Frame;
+			for (auto &E : RelightList)
+				if (SameWorld(E.W, S.W)) { E = S; return; }
+			if (RelightList.size() < 64)
+				RelightList.push_back(S);
+			return;
+		}
+		if (RelightList.empty())
+			return;
+		D3DMATRIX W;
+		Dev->GetTransform(D3DTS_WORLD, &W);
+		for (auto &E : RelightList)
+		{
+			if (Frame - E.Frame > 1 || !SameWorld(E.W, W))
+				continue;
+			if (Offscreen(Dev))
+				return;
+			// which of the silhouette's lights is missing now (the engine may light it with others instead)
+			D3DLIGHT9 On[8] = {};
+			DWORD OnMask = 0;
+			for (DWORD i = 0; i < 8; i++)
+			{
+				BOOL on = FALSE;
+				if (SUCCEEDED(Dev->GetLightEnable(i, &on)) && on && SUCCEEDED(Dev->GetLight(i, &On[i])))
+					OnMask |= 1u << i;
+			}
+			for (DWORD k = 0; k < 8; k++)
+			{
+				if (!(E.Mask & (1u << k)))
+					continue;
+				bool have = false;
+				for (DWORD i = 0; i < 8 && !have; i++)
+					have = (OnMask & (1u << i)) && fabsf(On[i].Position.x - E.L[k].Position.x) + fabsf(On[i].Position.y - E.L[k].Position.y)
+						+ fabsf(On[i].Position.z - E.L[k].Position.z) < 1.0f && fabsf(On[i].Diffuse.r - E.L[k].Diffuse.r) < 0.01f;
+				if (have)
+					continue;
+				DWORD slot = 0;
+				while (slot < 8 && ((OnMask | RelightOn) & (1u << slot)))
+					slot++;
+				if (slot == 8)
+					break;
+				Dev->SetLight(slot, &E.L[k]);
+				Dev->LightEnable(slot, TRUE);
+				RelightOn |= 1u << slot;
+			}
+			if (RelightOn && RelightCount++ == 0)
+				Message("relight: gave an actor back the light its shadow is cast from");
+			return;
+		}
+	}
+	void RelightEnd(IDirect3DDevice9 *Dev)
+	{
+		for (DWORD i = 0; i < 8; i++)
+			if (RelightOn & (1u << i))
+				Dev->LightEnable(i, FALSE);
+		RelightOn = 0;
+	}
+	void RelightFrame()
+	{
+		RelightList.erase(std::remove_if(RelightList.begin(), RelightList.end(), [&](const RelightSeen &E) { return Frame - E.Frame > 2; }), RelightList.end());
 	}
 
 	void ClearBlurSources() { for (auto &It : BlurSource) if (It.second) It.second->Release(); BlurSource.clear(); }
@@ -2615,6 +2729,7 @@ public:
 		if (LightProbeFile)
 			fprintf(LightProbeFile, "--- present, frame %u\n", Frame);
 		Frame++;
+		RelightFrame();
 		LightProbeCheck();
 		if (Capture && CaptureDirty && Frame % 300 == 0)
 			WriteCapture();

@@ -5,6 +5,7 @@
 
 #include "d3dx9.hpp"
 #include "d3d8to9.hpp"
+#include "fakefull.hpp"
 #include <regex>
 #include <assert.h>
 #include "u2shaders.hpp"
@@ -223,6 +224,11 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::Reset(D3DPRESENT_PARAMETERS8 *pPresen
 
 	D3DPRESENT_PARAMETERS PresentParams;
 	ConvertPresentParameters(*pPresentationParameters, PresentParams);
+	{
+		D3DDEVICE_CREATION_PARAMETERS CP = {};
+		ProxyInterface->GetCreationParameters(&CP);
+		U2FakeFull::Adjust(PresentParams, CP.hFocusWindow);
+	}
 
 	const HRESULT hr = ProxyInterface->Reset(&PresentParams);
 
@@ -1160,6 +1166,7 @@ bool Direct3DDevice8::U2Begin()
 				U2Swapped |= 1u << s;
 			}
 	U2.LogTargetDraw(ProxyInterface, FixedFunction, U2Stage0 != nullptr);
+	U2.RelightBegin(ProxyInterface, U2Stage0 != nullptr, FixedFunction);
 	U2.LightProbeDraw(ProxyInterface, U2Stage0 ? U2Stage0->U2Hash : 0, U2Stage0 != nullptr, FixedFunction);
 	if (U2.PcssBegin(ProxyInterface, U2Stage0 ? U2Stage0->GetProxyInterface() : nullptr, FixedFunction))
 		return true;
@@ -1179,6 +1186,7 @@ void Direct3DDevice8::U2CaptureDraw(D3DPRIMITIVETYPE Type, UINT PrimCount, const
 }
 void Direct3DDevice8::U2After(bool Shaded)
 {
+	U2.RelightEnd(ProxyInterface);
 	if (Shaded)
 		U2.End(ProxyInterface);
 	for (DWORD s = 0; s < 4; s++)
