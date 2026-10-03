@@ -4,6 +4,7 @@
  * A surface is chosen by the texture bound to stage 0 when it is drawn (a hash of the top
  * mip level). Settings come from U2Shaders.ini next to the game executable:
  *
+ *     glass=HASH file.hlsl        like shader=, but also for solid draws (refractive goo)
  *     log=1                       list alpha-blended textures in U2Shaders.log and
  *                                 save each one to U2Shaders\dump\<hash>_<w>x<h>.dds
  *     tint=1a2b3c4d               draw everything using that texture in flat magenta
@@ -80,6 +81,7 @@ struct U2Rule
 	std::string File;          // empty = the built-in tint
 	bool KeepBlend = false;    // decal=: the draw keeps its own blending, no frame copy
 	bool Surface = false;      // surface=: solid draws only, see SurfaceBegin
+	bool Solid = false;        // glass=: a shader= rule that also takes solid (unblended) draws
 	bool Refused = false;      // surface=: an unsupported stage setup was logged once
 	float Levels[4] = {};      // surface=: the texture's brightness levels (see TextureLevels)
 	IDirect3DPixelShader9 *PS = nullptr;
@@ -89,7 +91,7 @@ struct U2Rule
 class U2Shaders
 {
 public:
-	bool Loaded = false, Log = false;
+	bool Loaded = false, Log = false, LogSolid = false;
 	std::string Dir;           // "<exe dir>\"
 	std::map<DWORD, U2TexInfo> Seen;
 	std::vector<U2Rule> Rules;
@@ -140,7 +142,10 @@ public:
 			char Name[256] = {};
 			unsigned Hash = 0;
 			if (sscanf_s(Line, " log=%u", &Hash) == 1)
+			{
 				Log = Hash != 0;
+				LogSolid = Hash >= 2;      // log=2: solid textures too (to find a glass= hash)
+			}
 			else if (sscanf_s(Line, " pcss=%u", &Hash) == 1)
 			{
 				Pcss = Hash != 0;
@@ -228,6 +233,16 @@ public:
 				U2Rule R;
 				R.Hash = Hash;
 				R.File = Name;
+				Rules.push_back(R);
+			}
+			else if (sscanf_s(Line, " glass=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
+			{
+				// like shader=, for things the game draws solid (the Bio Rifle's goo): the
+				// shader gets the frame behind in s1 and draws the whole surface itself
+				U2Rule R;
+				R.Hash = Hash;
+				R.File = Name;
+				R.Solid = true;
 				Rules.push_back(R);
 			}
 			else if (sscanf_s(Line, " decal=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
@@ -636,7 +651,7 @@ public:
 		{
 			DWORD Blend = 0;
 			Dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &Blend);
-			if (Blend)
+			if (Blend || LogSolid)
 			{
 				U2TexInfo &Info = Seen[Hash];
 				if (Info.Draws++ == 0)
@@ -658,7 +673,7 @@ public:
 		// only the see-through parts: an atlas is often shared with solid ones
 		DWORD Blending = 0;
 		Dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &Blending);
-		if (!Blending)
+		if (!Blending && !Rule->Solid)
 			return false;
 		IDirect3DPixelShader9 *PS = Compile(Dev, *Rule);
 		if (PS == nullptr)
