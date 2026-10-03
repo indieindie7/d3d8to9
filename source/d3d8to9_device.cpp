@@ -249,7 +249,7 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::Present(const RECT *pSourceRect, cons
 {
 	UNREFERENCED_PARAMETER(pDirtyRegion);
 
-	U2.OnPresent();
+	U2.OnPresent(ProxyInterface);
 	return ProxyInterface->Present(pSourceRect, pDestRect, hDestWindowOverride, nullptr);
 }
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::GetBackBuffer(UINT iBackBuffer, D3DBACKBUFFER_TYPE Type, IDirect3DSurface8 **ppBackBuffer)
