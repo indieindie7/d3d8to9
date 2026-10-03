@@ -1168,6 +1168,12 @@ bool Direct3DDevice8::U2Begin()
 	U2.LogTargetDraw(ProxyInterface, FixedFunction, U2Stage0 != nullptr);
 	U2.RelightBegin(ProxyInterface, U2Stage0 != nullptr, FixedFunction);
 	U2.LightProbeDraw(ProxyInterface, U2Stage0 ? U2Stage0->U2Hash : 0, U2Stage0 != nullptr, FixedFunction);
+	if (CurrentPixelShaderHandle != 0 && !U2.PsReplace.empty())
+	{
+		auto It = U2PsHash.find(CurrentPixelShaderHandle);
+		if (It != U2PsHash.end() && U2.PsReplaceBegin(ProxyInterface, It->second))
+			return true;
+	}
 	if (U2.PcssBegin(ProxyInterface, U2Stage0 ? U2Stage0->GetProxyInterface() : nullptr, FixedFunction))
 		return true;
 	if (U2Stage0 == nullptr)
@@ -2482,6 +2488,16 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::CreatePixelShader(const DWORD *pFunct
 	else
 	{
 		PixelShaderHandles.insert(*pHandle);
+		// psreplace=: remember which game shader this is (FNV-1a over the D3D8 tokens)
+		DWORD Hash = 2166136261u, n = 0;
+		for (const DWORD *t = pFunction; n < 4096; t++, n++)
+		{
+			Hash = (Hash ^ *t) * 16777619u;
+			if (*t == 0x0000FFFF)
+				break;
+		}
+		U2PsHash[*pHandle] = Hash;
+		U2.LogGamePS(Hash, n + 1, pFunction[0]);
 	}
 
 	return hr;
