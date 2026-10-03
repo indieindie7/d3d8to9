@@ -196,6 +196,8 @@ public:
 				PostSplit = Hash != 0 ? 1.0f : 0.0f;
 			else if (sscanf_s(Line, " bloom=%f %f", &PostBloom[0], &PostBloom[1]) == 2)
 				;
+			else if (sscanf_s(Line, " colorblind=%f %f", &PostBloom[2], &PostBloom[3]) >= 1)
+				;  // post_final: c1.z = 1 protanopia, 2 deuteranopia, 3 tritanopia; c1.w = strength
 			else if (sscanf_s(Line, " grade=%f %f %f %f", &PostGrade[0], &PostGrade[1], &PostGrade[2], &PostGrade[3]) == 4)
 				;
 			else if (sscanf_s(Line, " colour=%f %f %f", &PostBalance[0], &PostBalance[1], &PostBalance[2]) == 3)
@@ -1925,7 +1927,7 @@ public:
 	// fullscreen quad with the HUD's texture. The quad comes from our own vertex buffer.
 	bool Post = false;
 	float PostSplit = 0;                                 // postsplit=1: right half untouched
-	float PostBloom[4] = { 0.75f, 0.5f, 0, 0 };          // threshold, intensity
+	float PostBloom[4] = { 0.75f, 0.5f, 0, 1 };          // threshold, intensity, colorblind type (0 off), its strength
 	float PostGrade[4] = { 1.05f, 1.05f, 1.0f, 0.25f };  // saturation, contrast, exposure, vignette
 	float PostBalance[4] = { 1, 1, 1, 0.25f };           // colour balance r g b, sharpen
 	float PostFx[4] = { 0, 0, 0, 0 };                    // postfx=a b c d: free per-game knobs (c4 in post_final.hlsl)
@@ -3293,6 +3295,8 @@ public:
 				PostSplit = V != 0 ? 1.0f : 0.0f;
 			else if (sscanf_s(Line, " bloom=%f %f", &PostBloom[0], &PostBloom[1]) == 2)
 				;
+			else if (sscanf_s(Line, " colorblind=%f %f", &PostBloom[2], &PostBloom[3]) >= 1)
+				;  // post_final: c1.z = 1 protanopia, 2 deuteranopia, 3 tritanopia; c1.w = strength
 			else if (sscanf_s(Line, " grade=%f %f %f %f", &PostGrade[0], &PostGrade[1], &PostGrade[2], &PostGrade[3]) == 4)
 				;
 			else if (sscanf_s(Line, " colour=%f %f %f", &PostBalance[0], &PostBalance[1], &PostBalance[2]) == 3)
