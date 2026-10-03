@@ -33,6 +33,9 @@ float4 main(float2 uv : TEXCOORD0, float3 normal : TEXCOORD1, float3 pos : TEXCO
 	float2 nq = uv * 5.0 + float2(t * 0.5, -t * 0.3);
 	float3 n = normalize(normal + 0.45 * float3(noise(nq) - 0.5, noise(nq + 7.3) - 0.5, 0.0));
 	float3 v = normalize(-pos);
+	// stuck splats are turned upside down (UTBioGel.HitWall), so their normals point away
+	// from the eye: face them back, or the whole splat reads as rim light (solid lime)
+	n = dot(n, v) < 0 ? -n : n;
 	float facing = saturate(dot(n, v));
 	float rim = pow(1.0 - facing, 3.0);
 
@@ -46,15 +49,26 @@ float4 main(float2 uv : TEXCOORD0, float3 normal : TEXCOORD1, float3 pos : TEXCO
 	float2 bend = n.xy * float2(1.0, -1.0) * 0.045 + wobble;
 	float3 behind = tex2D(Scene, screen + bend).rgb;
 
+	// clear tinted liquid: what's behind shows through the same way in flight and stuck to a
+	// wall (a flat splat faces the eye, which made the old thickness term near-opaque)
 	float3 goo   = tex2D(Tex, uv).rgb;                 // keeps the texture's own mottling
-	float3 tint  = float3(0.35, 1.0, 0.25);
-	float3 deep  = float3(0.05, 0.35, 0.02);
-	float thick = 0.35 + 0.45 * facing;                // looking straight in: more liquid
-	float3 colour = behind * tint * (1.0 - thick * 0.6) + lerp(deep, goo * tint, 0.6) * thick * 0.7;
+	float3 tint  = float3(0.45, 1.0, 0.35);
+	float3 colour = behind * tint * 0.85 + goo * tint * 0.18;
+
+	// glitter suspended in the goo, like a squishy glitter ball: a grid of tiny flakes that
+	// drift slowly, each catching the light only when its own tilt lines up with the eye
+	float2 g = uv * 40.0 + float2(t * 0.15, -t * 0.1);
+	float2 cell = floor(g);
+	float2 f = frac(g) - 0.5;
+	float pick = hash(cell);
+	float2 at = float2(hash(cell + 3.1), hash(cell + 7.7)) - 0.5;
+	float flake = smoothstep(0.12, 0.0, length(f - at * 0.6)) * step(0.55, pick);
+	float twinkle = pow(saturate(sin(t * 3.0 + pick * 40.0 + dot(n, float3(9, 7, 5)))), 8.0);
+	colour += flake * twinkle * float3(0.85, 1.0, 0.8) * 1.4;
 
 	// rim light and a sharp highlight from up and to the left of the eye
 	float3 l = normalize(float3(-0.4, 0.6, -0.7));
 	float spec = pow(saturate(dot(reflect(-l, n), v)), 40.0);
-	colour += float3(0.55, 1.0, 0.45) * rim * 0.7 + spec * 0.9;
+	colour += float3(0.55, 1.0, 0.45) * rim * 0.6 + spec * 0.9;
 	return float4(colour, 1.0);
 }
