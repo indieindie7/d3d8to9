@@ -75,6 +75,8 @@ struct U2TexInfo
 	unsigned Draws = 0;
 };
 
+static const DWORD CubeOnlyHash = 0xC0BE0001;   // glass=c0be0001: draws with only a cube map on stage 0
+
 struct U2Rule
 {
 	DWORD Hash = 0;
@@ -91,7 +93,7 @@ struct U2Rule
 class U2Shaders
 {
 public:
-	bool Loaded = false, Log = false, LogSolid = false;
+	bool Loaded = false, Log = false, LogSolid = false, StageLog = false;
 	std::string Dir;           // "<exe dir>\"
 	std::map<DWORD, U2TexInfo> Seen;
 	std::vector<U2Rule> Rules;
@@ -234,6 +236,13 @@ public:
 				R.Hash = Hash;
 				R.File = Name;
 				Rules.push_back(R);
+			}
+			else if (sscanf_s(Line, " stagelog=%u", &Hash) == 1)
+				StageLog = Hash != 0;
+			else if (sscanf_s(Line, " stagetrace=%u", &Hash) == 1)
+			{
+				StageLog = Hash != 0;          // stagetrace=N: every draw of N frames (from frame 600)
+				StageTrace = (int)Hash;
 			}
 			else if (sscanf_s(Line, " glass=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
 			{
@@ -452,6 +461,21 @@ public:
 
 	// Draws that render into something other than the back buffer (shadow maps are built this way)
 	// called before every draw (despite the name: it is the per-draw hook)
+	std::map<std::string, bool> StageSeen;
+	int StageTrace = 0;
+	void StageLogDraw(IDirect3DDevice9 *Dev, const char *Key)
+	{
+		if (StageTrace > 0 && Frame >= 600 && Frame < 600 + (unsigned)StageTrace)
+		{
+			Message("stagetrace f%u: %s", Frame, Key);   // every draw, in order, for a few frames
+			return;
+		}
+		if (StageTrace > 0 || Offscreen(Dev) || StageSeen.size() > 400 || StageSeen[Key])
+			return;
+		StageSeen[Key] = true;
+		Message("stagelog: %s", Key);
+	}
+
 	void LogTargetDraw(IDirect3DDevice9 *Dev, bool FixedFunction, bool HasTex0)
 	{
 		if (!Loaded)
@@ -634,8 +658,20 @@ public:
 	{
 		if (!Loaded)
 			Load();
-		if (Tex == nullptr || (!Log && Rules.empty() && !CharProbe && !CharLight))
+		// Tex == nullptr with Hash already set: a draw without a 2D texture that a rule can still
+		// name (CubeOnlyHash: a cube map alone on stage 0, see the device's U2Begin)
+		if ((Tex == nullptr && Hash == 0) || (!Log && Rules.empty() && !CharProbe && !CharLight))
 			return false;
+		if (Tex == nullptr)
+		{
+			U2Rule *Cube = nullptr;
+			for (U2Rule &R : Rules)
+				if (R.Hash == Hash)
+					Cube = &R;
+			if (Cube == nullptr)
+				return false;
+		}
+		else
 
 		Known(Tex, Hash);
 		if (Hash == 0xFFFFFFFF)
@@ -644,10 +680,10 @@ public:
 				LogUnreadableDraw(Dev, Tex);   // render targets (e.g. shadow maps): note how they're drawn
 			return false;
 		}
-		if (CharProbe)
+		if (CharProbe && Tex != nullptr)
 			ProbeDraw(Dev, Tex, Hash, FixedFunction);
 
-		if (Log)
+		if (Log && Tex != nullptr)
 		{
 			DWORD Blend = 0;
 			Dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &Blend);

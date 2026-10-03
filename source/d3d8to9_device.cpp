@@ -1174,6 +1174,44 @@ bool Direct3DDevice8::U2Begin()
 				U2Swapped |= 1u << s;
 			}
 	U2.LogTargetDraw(ProxyInterface, FixedFunction, U2Stage0 != nullptr);
+	if (U2.StageLog)
+	{
+		// stagelog=1: each distinct on-screen draw setup once: what sits on stages 0-3 (2D texture
+		// hash, "cube", "none") with the colour ops, to find draws the texture rules can't see
+		char Key[400];
+		int n = 0;
+		for (DWORD s = 0; s < 4; s++)
+		{
+			IDirect3DBaseTexture9 *T = nullptr;
+			ProxyInterface->GetTexture(s, &T);
+			DWORD Op = 0;
+			ProxyInterface->GetTextureStageState(s, D3DTSS_COLOROP, &Op);
+			if (T == nullptr)
+				n += sprintf_s(Key + n, sizeof(Key) - n, "st%u none op%u | ", s, Op);
+			else
+			{
+				if (T->GetType() == D3DRTYPE_CUBETEXTURE)
+					n += sprintf_s(Key + n, sizeof(Key) - n, "st%u cube op%u | ", s, Op);
+				else
+				{
+					if (U2Stages[s] != nullptr)
+						U2.Known(U2Stages[s]->GetProxyInterface(), U2Stages[s]->U2Hash);
+					n += sprintf_s(Key + n, sizeof(Key) - n, "st%u %08x op%u | ", s, U2Stages[s] ? U2Stages[s]->U2Hash : 0, Op);
+				}
+				T->Release();
+			}
+			if (Op == D3DTOP_DISABLE)
+				break;
+		}
+		DWORD Blend = 0, Src = 0, Dst = 0;
+		ProxyInterface->GetRenderState(D3DRS_ALPHABLENDENABLE, &Blend);
+		ProxyInterface->GetRenderState(D3DRS_SRCBLEND, &Src);
+		ProxyInterface->GetRenderState(D3DRS_DESTBLEND, &Dst);
+		D3DVIEWPORT9 VP = {};
+		ProxyInterface->GetViewport(&VP);
+		sprintf_s(Key + n, sizeof(Key) - n, "blend %u %u/%u ff %d z %.2f-%.2f", Blend, Src, Dst, FixedFunction, VP.MinZ, VP.MaxZ);
+		U2.StageLogDraw(ProxyInterface, Key);
+	}
 	U2.RelightBegin(ProxyInterface, U2Stage0 != nullptr, FixedFunction);
 	U2.LightProbeDraw(ProxyInterface, U2Stage0 ? U2Stage0->U2Hash : 0, U2Stage0 != nullptr, FixedFunction);
 	if (CurrentPixelShaderHandle != 0 && !U2.PsReplace.empty())
@@ -1185,7 +1223,36 @@ bool Direct3DDevice8::U2Begin()
 	if (U2.PcssBegin(ProxyInterface, U2Stage0 ? U2Stage0->GetProxyInterface() : nullptr, FixedFunction))
 		return true;
 	if (U2Stage0 == nullptr)
+	{
+		// an environment-mapped surface (a cube map on stage 0, its texture on stage 1, e.g. the
+		// Bio Rifle's glass canister): a rule on the stage-1 texture takes it. The shader reads
+		// its texture from s0, so that texture is put there for the draw (U2After restores the cube)
+		IDirect3DBaseTexture9 *T0 = nullptr;
+		ProxyInterface->GetTexture(0, &T0);
+		const bool Cube = T0 && T0->GetType() == D3DRTYPE_CUBETEXTURE;
+		if (Cube && U2Stages[1] == nullptr)
+		{
+			// a cube map alone (an environment-mapped surface with no texture of its own)
+			DWORD H = CubeOnlyHash;
+			const bool Taken = U2.Begin(ProxyInterface, nullptr, H, FixedFunction);
+			T0->Release();
+			return Taken;
+		}
+		if (!Cube || U2Stages[1] == nullptr)
+		{
+			if (T0) T0->Release();
+			return false;
+		}
+		ProxyInterface->SetTexture(0, U2Stages[1]->GetProxyInterface());
+		if (U2.Begin(ProxyInterface, U2Stages[1]->GetProxyInterface(), U2Stages[1]->U2Hash, FixedFunction))
+		{
+			U2Cube0 = T0;                    // keeps the reference until U2After
+			return true;
+		}
+		ProxyInterface->SetTexture(0, T0);
+		T0->Release();
 		return false;
+	}
 	return U2.Begin(ProxyInterface, U2Stage0->GetProxyInterface(), U2Stage0->U2Hash, FixedFunction);
 }
 // lmcapture=: hands a draw's vertices (from the buffers' copies) to U2Shaders::CaptureDraw
@@ -1207,6 +1274,12 @@ void Direct3DDevice8::U2After(bool Shaded)
 		if ((U2Swapped & (1u << s)) && U2Stages[s] != nullptr)
 			ProxyInterface->SetTexture(s, U2Stages[s]->GetProxyInterface());
 	U2Swapped = 0;
+	if (U2Cube0 != nullptr)
+	{
+		ProxyInterface->SetTexture(0, U2Cube0);
+		U2Cube0->Release();
+		U2Cube0 = nullptr;
+	}
 }
 // lightprobe: a draw's vertex layout and the average length of its normals (0 = no lighting possible)
 static void U2ProbeVB(IDirect3DDevice9 *Dev, const BYTE *Data, size_t Size, UINT Stride, size_t First, UINT Count)
