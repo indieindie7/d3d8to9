@@ -613,7 +613,8 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::SetRenderTarget(IDirect3DSurface8 *pR
 	if (pNewZStencil != nullptr)
 	{
 		auto pNewZStencilImpl = static_cast<Direct3DSurface8 *>(pNewZStencil);
-		hr = ProxyInterface->SetDepthStencilSurface(pNewZStencilImpl->GetProxyInterface());
+		// gi=1: a readable depth texture's surface in place of the game's (U2Shaders::DepthFor)
+		hr = ProxyInterface->SetDepthStencilSurface(U2.DepthFor(ProxyInterface, pNewZStencilImpl->GetProxyInterface()));
 		if (FAILED(hr))
 			return hr;
 
@@ -656,6 +657,13 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::GetDepthStencilSurface(IDirect3DSurfa
 	const HRESULT hr = ProxyInterface->GetDepthStencilSurface(&SurfaceInterface);
 	if (FAILED(hr))
 		return hr;
+	// gi=1 swapped the game's depth surface for ours: the game gets its own back
+	if (IDirect3DSurface9 *Game = U2.GameDepthOf(SurfaceInterface))
+	{
+		Game->AddRef();
+		SurfaceInterface->Release();
+		SurfaceInterface = Game;
+	}
 
 	*ppZStencilSurface = ProxyAddressLookupTable->FindAddress<Direct3DSurface8>(SurfaceInterface);
 

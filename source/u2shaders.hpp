@@ -2171,6 +2171,13 @@ public:
 		Dev->GetTransform(D3DTS_PROJECTION, &P);
 		const bool rhw = (fvf & D3DFVF_POSITION_MASK) == D3DFVF_XYZRHW;
 		const bool ortho = !programmable && !rhw && P._34 == 0.0f && P._44 == 1.0f;
+		if (Gi && DepthDirty)
+			DepthLazySwap(Dev);
+		if (Gi && !programmable && !rhw && P._34 == 1.0f && P._44 == 0.0f)
+		{
+			SceneProj = P;                    // gi.hlsl rebuilds positions from depth with it
+			SceneProjOk = true;
+		}
 		// the HUD draws without depth testing; orthographic draws that still test depth are part
 		// of the scene (in third person one came mid-frame: the post ran too early and covered
 		// the rest of the frame with a half-drawn copy)
@@ -2443,6 +2450,7 @@ public:
 				Dev->SetTextureStageState(s, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
 			}
 			Dev->SetTexture(1, nullptr);
+			RunGi(Dev, Saved.DS);
 			IDirect3DTexture9 *AAFrame = RunSmaa(Dev);
 
 			float c[6][4] = {};
@@ -2520,6 +2528,273 @@ public:
 			if (VB) VB->Release();
 			if (D) D->Release();
 		}
+	}
+
+	// ---- screen-space global illumination by radiance cascades (gi=1) ----------------------
+	// gi.hlsl on the frame copy, before SMAA and the final pass: bounce light gathered from
+	// what the screen shows around each pixel, and darkening where surfaces meet. It needs the
+	// scene's depth as a texture: the game's depth surface is swapped for an INTZ depth texture
+	// of the same size (DepthFor, from the device's SetRenderTarget and lazily for the
+	// automatic depth buffer), and the game is handed its own surface back when it asks.
+	// gifx=strength corners reach debug (debug 1 light alone, 2 darkening alone, 3 normals,
+	// 4 depth bands); gibase=the nearest cascade's stretch in pixels.
+	bool Gi = false, GiBroken = false, DepthBroken = false, DepthDirty = true;
+	float GiFx[4] = { 0.35f, 0.6f, 300.0f, 0.0f };
+	float GiBase = 6.0f;
+	static const int GiCascades = 4;
+	struct DepthPair { IDirect3DTexture9 *Tex; IDirect3DSurface9 *Surf; UINT W, H; };
+	std::map<IDirect3DSurface9 *, DepthPair> DepthSwap;     // the game's depth surface -> ours
+	D3DMATRIX SceneProj = {};
+	bool SceneProjOk = false;
+	IDirect3DVertexShader9 *GiVS = nullptr;
+	IDirect3DPixelShader9 *GiPS[3] = {};
+	IDirect3DVertexBuffer9 *GiVB = nullptr;
+	IDirect3DTexture9 *GiGBuf = nullptr, *GiCasc[GiCascades] = {}, *GiScene = nullptr;
+	UINT GiW = 0, GiH = 0;
+
+	// the depth surface to bind in place of the game's: an INTZ texture's, or the game's own
+	// when it can't be swapped (multisampled, an unknown format, or the card has no INTZ)
+	IDirect3DSurface9 *DepthFor(IDirect3DDevice9 *Dev, IDirect3DSurface9 *Game)
+	{
+		if (!Gi || DepthBroken || Game == nullptr)
+			return Game;
+		auto It = DepthSwap.find(Game);
+		if (It != DepthSwap.end())
+			return It->second.Surf;
+		for (auto &Other : DepthSwap)
+			if (Other.second.Surf == Game)
+				return Game;                        // already one of ours
+		D3DSURFACE_DESC D = {};
+		Game->GetDesc(&D);
+		if (D.MultiSampleType != D3DMULTISAMPLE_NONE || (D.Format != D3DFMT_D24S8 && D.Format != D3DFMT_D24X8 && D.Format != D3DFMT_D16))
+		{
+			static int Told = 0;
+			if (Told++ < 3)
+				Message("gi: a depth surface %ux%u format %u multisample %u can't be read as a texture, left alone",
+					D.Width, D.Height, (unsigned)D.Format, (unsigned)D.MultiSampleType);
+			return Game;
+		}
+		DepthPair P = { nullptr, nullptr, D.Width, D.Height };
+		if (FAILED(Dev->CreateTexture(D.Width, D.Height, 1, D3DUSAGE_DEPTHSTENCIL, (D3DFORMAT)MAKEFOURCC('I', 'N', 'T', 'Z'), D3DPOOL_DEFAULT, &P.Tex, nullptr))
+			|| P.Tex == nullptr || FAILED(P.Tex->GetSurfaceLevel(0, &P.Surf)) || P.Surf == nullptr)
+		{
+			if (P.Tex) P.Tex->Release();
+			Message("gi: no INTZ depth texture on this card (%ux%u), global illumination off", D.Width, D.Height);
+			DepthBroken = true;
+			return Game;
+		}
+		P.Surf->Release();                          // the texture keeps it alive
+		DepthSwap[Game] = P;
+		Message("gi: depth surface %ux%u (format %u) swapped for a readable one", D.Width, D.Height, (unsigned)D.Format);
+		return P.Surf;
+	}
+
+	// the game's own surface for one of ours (nullptr: not ours)
+	IDirect3DSurface9 *GameDepthOf(IDirect3DSurface9 *Ours)
+	{
+		for (auto &It : DepthSwap)
+			if (It.second.Surf == Ours)
+				return It.first;
+		return nullptr;
+	}
+
+	IDirect3DTexture9 *DepthTexOf(IDirect3DSurface9 *Ours)
+	{
+		for (auto &It : DepthSwap)
+			if (It.second.Surf == Ours)
+				return It.second.Tex;
+		return nullptr;
+	}
+
+	// the automatic depth buffer is bound without a SetRenderTarget call: swap it the first
+	// time a frame draws with it (that one frame loses the depth drawn so far)
+	void DepthLazySwap(IDirect3DDevice9 *Dev)
+	{
+		DepthDirty = false;
+		IDirect3DSurface9 *DS = nullptr;
+		if (FAILED(Dev->GetDepthStencilSurface(&DS)) || DS == nullptr)
+			return;
+		IDirect3DSurface9 *Ours = DepthFor(Dev, DS);
+		if (Ours != DS && SUCCEEDED(Dev->SetDepthStencilSurface(Ours)))
+			Dev->Clear(0, nullptr, D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL, 0, 1.0f, 0);
+		DS->Release();
+	}
+
+	void GiReleaseTargets()
+	{
+		if (GiGBuf) { GiGBuf->Release(); GiGBuf = nullptr; }
+		if (GiScene) { GiScene->Release(); GiScene = nullptr; }
+		for (int i = 0; i < GiCascades; i++)
+			if (GiCasc[i]) { GiCasc[i]->Release(); GiCasc[i] = nullptr; }
+		GiW = GiH = 0;
+	}
+
+	void GiReleaseAll()
+	{
+		GiReleaseTargets();
+		for (auto &It : DepthSwap)
+			if (It.second.Tex) It.second.Tex->Release();
+		DepthSwap.clear();
+		DepthDirty = true;
+		if (GiVS) { GiVS->Release(); GiVS = nullptr; }
+		for (int i = 0; i < 3; i++)
+			if (GiPS[i]) { GiPS[i]->Release(); GiPS[i] = nullptr; }
+		if (GiVB) { GiVB->Release(); GiVB = nullptr; }
+	}
+
+	bool GiBuild(IDirect3DDevice9 *Dev)
+	{
+		if (GiBroken)
+			return false;
+		if (GiPS[2] != nullptr && GiVB != nullptr)
+			return true;
+		const std::string Lib = ReadShaderFile("gi.hlsl");
+		if (Lib.empty())
+		{
+			Message("gi: gi.hlsl missing in U2Shaders, global illumination off");
+			GiBroken = true;
+			return false;
+		}
+		static const char *Names[4] = { "GiVS", "GBufPS", "CascadePS", "ResolvePS" };
+		for (int i = 0; i < 4; i++)
+		{
+			char Head[96];
+			sprintf_s(Head, "#define GI_PASS %d\n#line 1 \"gi.hlsl\"\n", i == 0 ? 1 : i);
+			const std::string Src = std::string(Head) + Lib;
+			ID3DBlob *Code = nullptr, *Errors = nullptr;
+			const HRESULT hr = D3DCompile(Src.data(), Src.size(), "gi", nullptr, nullptr, Names[i], i == 0 ? "vs_3_0" : "ps_3_0",
+				D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &Code, &Errors);
+			if (FAILED(hr) || Code == nullptr)
+			{
+				Message("gi: %s failed: %s", Names[i], Errors ? (const char *)Errors->GetBufferPointer() : "?");
+				if (Errors) Errors->Release();
+				if (Code) Code->Release();
+				GiBroken = true;
+				return false;
+			}
+			if (Errors) Errors->Release();
+			const HRESULT cr = i == 0 ? Dev->CreateVertexShader((const DWORD *)Code->GetBufferPointer(), &GiVS)
+				: Dev->CreatePixelShader((const DWORD *)Code->GetBufferPointer(), &GiPS[i - 1]);
+			Code->Release();
+			if (FAILED(cr))
+			{
+				Message("gi: the card refused %s (%08x)", Names[i], (unsigned)cr);
+				GiBroken = true;
+				return false;
+			}
+		}
+		const SmaaVertex q[4] = { { -1, 1, 0, 0, 0 }, { 1, 1, 0, 1, 0 }, { -1, -1, 0, 0, 1 }, { 1, -1, 0, 1, 1 } };
+		void *Mem = nullptr;
+		if (FAILED(Dev->CreateVertexBuffer(sizeof(q), D3DUSAGE_WRITEONLY, D3DFVF_XYZ | D3DFVF_TEX1, D3DPOOL_MANAGED, &GiVB, nullptr))
+			|| FAILED(GiVB->Lock(0, sizeof(q), &Mem, 0)))
+		{
+			Message("gi: the quad couldn't be made, global illumination off");
+			GiBroken = true;
+			return false;
+		}
+		memcpy(Mem, q, sizeof(q));
+		GiVB->Unlock();
+		Message("gi: ready (radiance cascades, %d levels)", GiCascades);
+		return true;
+	}
+
+	// the passes; afterwards SceneTex is the lit frame (the copy and the result trade places).
+	// Leaves the post chain's own vertex setup behind it, as RunSmaa does.
+	void RunGi(IDirect3DDevice9 *Dev, IDirect3DSurface9 *BoundDepth)
+	{
+		if (!Gi || GiBroken || SceneTex == nullptr)
+			return;
+		IDirect3DTexture9 *Depth = DepthTexOf(BoundDepth);
+		static int Told = 0;
+		if (Depth == nullptr || !SceneProjOk)
+		{
+			if (Told++ < 3)
+				Message("gi: skipped (%s)", Depth == nullptr ? "the scene's depth isn't one of the readable ones yet" : "no perspective projection seen");
+			return;
+		}
+		D3DSURFACE_DESC DD = {};
+		Depth->GetLevelDesc(0, &DD);
+		if (DD.Width != SceneW || DD.Height != SceneH || !GiBuild(Dev))
+			return;
+		const UINT W = (std::max)(SceneW / 2, 8u), H = (std::max)(SceneH / 2, 8u);
+		if (GiScene == nullptr || GiW != SceneW || GiH != SceneH)
+		{
+			GiReleaseTargets();
+			bool Ok = SUCCEEDED(Dev->CreateTexture(W, H, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &GiGBuf, nullptr))
+				&& SUCCEEDED(Dev->CreateTexture(SceneW, SceneH, 1, D3DUSAGE_RENDERTARGET, SceneFmt, D3DPOOL_DEFAULT, &GiScene, nullptr));
+			for (int i = 0; Ok && i < GiCascades; i++)
+				Ok = SUCCEEDED(Dev->CreateTexture(W, H, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &GiCasc[i], nullptr));
+			if (!Ok)
+			{
+				Message("gi: targets couldn't be made (%ux%u), global illumination off", SceneW, SceneH);
+				GiReleaseTargets();
+				GiBroken = true;
+				return;
+			}
+			GiW = SceneW;
+			GiH = SceneH;
+		}
+		const float half[4] = { 1.0f / W, 1.0f / H, (float)W, (float)H };
+		const float full[4] = { 1.0f / SceneW, 1.0f / SceneH, (float)SceneW, (float)SceneH };
+		const float proj[4] = { SceneProj._11, SceneProj._22, SceneProj._33, SceneProj._43 };
+		Dev->SetFVF(D3DFVF_XYZ | D3DFVF_TEX1);
+		Dev->SetStreamSource(0, GiVB, 0, sizeof(SmaaVertex));
+		Dev->SetVertexShader(GiVS);
+		Dev->SetVertexShaderConstantF(0, half, 1);
+		Dev->SetPixelShaderConstantF(0, half, 1);
+		Dev->SetPixelShaderConstantF(1, proj, 1);
+		Dev->SetPixelShaderConstantF(3, full, 1);
+		Dev->SetPixelShaderConstantF(4, GiFx, 1);
+
+		// 1: depth and normals, half size
+		Target(Dev, GiGBuf);
+		Dev->SetPixelShader(GiPS[0]);
+		SmaaSampler(Dev, 0, D3DTEXF_POINT);
+		Dev->SetTexture(0, Depth);
+		Dev->SetTexture(1, nullptr);
+		Dev->SetTexture(2, nullptr);
+		Dev->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
+
+		// 2: the cascades, the farthest first, each merging the one before
+		Dev->SetPixelShader(GiPS[1]);
+		SmaaSampler(Dev, 1, D3DTEXF_LINEAR);
+		SmaaSampler(Dev, 2, D3DTEXF_LINEAR);
+		Dev->SetTexture(0, GiGBuf);
+		Dev->SetTexture(1, SceneTex);
+		for (int c = GiCascades - 1; c >= 0; c--)
+		{
+			float start = 0, len = GiBase;
+			for (int i = 0; i < c; i++) { start += len; len *= 4; }
+			const float casc[4] = { (float)(2 << c), start, len, c < GiCascades - 1 ? 1.0f : 0.0f };
+			Dev->SetPixelShaderConstantF(2, casc, 1);
+			Dev->SetTexture(2, nullptr);
+			Target(Dev, GiCasc[c]);
+			Dev->SetTexture(2, c < GiCascades - 1 ? GiCasc[c + 1] : nullptr);
+			Dev->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
+		}
+
+		// 3: gathered per pixel into the lit frame, full size
+		Dev->SetTexture(2, nullptr);
+		Target(Dev, GiScene);
+		Dev->SetVertexShaderConstantF(0, full, 1);
+		Dev->SetPixelShaderConstantF(0, full, 1);
+		Dev->SetPixelShader(GiPS[2]);
+		Dev->SetTexture(2, GiCasc[0]);
+		Dev->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
+		std::swap(SceneTex, GiScene);
+		static int Ran = 0;
+		if (Ran++ < 1)
+			Message("gi: running (%ux%u, cascades at half size, base %.0f px, strength %.2f, corners %.2f, reach %.0f)",
+				SceneW, SceneH, GiBase, GiFx[0], GiFx[1], GiFx[2]);
+
+		// back to the post chain's setup
+		Dev->SetVertexShader(nullptr);
+		Dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+		Dev->SetStreamSource(0, PostQuadVB, 0, sizeof(U2QuadVertex));
+		for (DWORD t = 0; t < 3; t++)
+			SmaaSampler(Dev, t, D3DTEXF_LINEAR);
+		Dev->SetTexture(1, nullptr);
+		Dev->SetTexture(2, nullptr);
 	}
 
 	// ---- SMAA 1x (smaa=1 by default, smaa=0 off) -------------------------------------------
@@ -2834,6 +3109,11 @@ public:
 		if (BloomB) { BloomB->Release(); BloomB = nullptr; }
 		ReleaseChain();
 		SmaaReleaseTargets();
+		GiReleaseTargets();
+		for (auto &It : DepthSwap)
+			if (It.second.Tex) It.second.Tex->Release();
+		DepthSwap.clear();
+		DepthDirty = true;
 		if (PostQuadVB) { PostQuadVB->Release(); PostQuadVB = nullptr; }
 	}
 
@@ -3338,6 +3618,12 @@ public:
 			}
 			else if (sscanf_s(Line, " smaa=%u", &V) == 1)
 				Smaa = V != 0;
+			else if (sscanf_s(Line, " gi=%u", &V) == 1)
+				Gi = V != 0;
+			else if (sscanf_s(Line, " gifx=%f %f %f %f", &GiFx[0], &GiFx[1], &GiFx[2], &GiFx[3]) >= 1)
+				;
+			else if (sscanf_s(Line, " gibase=%f", &GiBase) == 1)
+				GiBase = (std::min)((std::max)(GiBase, 2.0f), 32.0f);
 			else if (sscanf_s(Line, " bloomchain=%u", &V) == 1)
 				BloomChain = V != 0;
 			else if (sscanf_s(Line, " bloomscatter=%f", &BloomScatter) == 1)
@@ -3403,6 +3689,8 @@ public:
 	{
 		if (Loaded && Frame % 10 == 0)
 			ReloadPost(IniTime.dwLowDateTime == 0 && IniTime.dwHighDateTime == 0);
+		DepthDirty = true;
+		SceneProjOk = false;
 		if (PostTrace > 0)
 		{
 			char end[96];
@@ -3506,6 +3794,9 @@ public:
 			if (R->PS != nullptr) { R->PS->Release(); R->PS = nullptr; R->Tried = false; }
 		SmaaReleaseAll();
 		SmaaBroken = false;
+		GiReleaseAll();
+		GiBroken = false;
+		DepthBroken = false;
 		// managed textures survive a reset but belong to this device: the game makes a new device
 		// on every fullscreen/windowed switch, and a texture from the old one bound to the new one
 		// broke it (black screen, then a crash in the game's resource cleanup)
