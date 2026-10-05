@@ -6,6 +6,7 @@
 #include "d3dx9.hpp"
 #include "d3d8to9.hpp"
 #include "fakefull.hpp"
+#include "msaa.hpp"
 #include <regex>
 #include <assert.h>
 #include "u2shaders.hpp"
@@ -236,6 +237,12 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::Reset(D3DPRESENT_PARAMETERS8 *pPresen
 		D3DDEVICE_CREATION_PARAMETERS CP = {};
 		ProxyInterface->GetCreationParameters(&CP);
 		U2FakeFull::Adjust(PresentParams, CP.hFocusWindow);
+		IDirect3D9 *D3D = nullptr;
+		if (SUCCEEDED(ProxyInterface->GetDirect3D(&D3D)) && D3D)
+		{
+			U2Msaa::Adjust(PresentParams, D3D, CP.AdapterOrdinal, CP.DeviceType);
+			D3D->Release();
+		}
 	}
 
 	const HRESULT hr = ProxyInterface->Reset(&PresentParams);
@@ -257,6 +264,9 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::Present(const RECT *pSourceRect, cons
 {
 	UNREFERENCED_PARAMETER(pDirtyRegion);
 
+	U2.MsaaResolve(ProxyInterface);
+	if (!U2.MsaaTested && U2Msaa::Wanted() != 0 && U2.Loaded && U2.Frame > 200)
+		U2.MsaaSelfTest(ProxyInterface);
 	U2.OnPresent(ProxyInterface);
 	return ProxyInterface->Present(pSourceRect, pDestRect, hDestWindowOverride, nullptr);
 }
@@ -477,6 +487,7 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::CopyRects(IDirect3DSurface8 *pSourceS
 
 	auto pSourceSurfaceImpl = static_cast<Direct3DSurface8 *>(pSourceSurface);
 	auto pDestinationSurfaceImpl = static_cast<Direct3DSurface8 *>(pDestinationSurface);
+	U2.MsaaBeforeRead(ProxyInterface, nullptr, pSourceSurfaceImpl->GetProxyInterface());
 	U2.OnCopy(pSourceSurfaceImpl->GetProxyInterface(), pDestinationSurfaceImpl->GetProxyInterface());   // shadow maps get copied into their textures
 
 	D3DSURFACE_DESC SourceDesc, DestinationDesc;
@@ -490,6 +501,18 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::CopyRects(IDirect3DSurface8 *pSourceS
 		return D3DERR_INVALIDCALL;
 
 	HRESULT hr = D3DERR_INVALIDCALL;
+
+	// a multisampled source (msaa=N) can't be read as it is: its samples are resolved into a plain
+	// target first (a direct read gave one sample per pixel: hard edges)
+	IDirect3DSurface9 *Resolved = nullptr;
+	IDirect3DSurface9 *Source = pSourceSurfaceImpl->GetProxyInterface();
+	if (SourceDesc.MultiSampleType != D3DMULTISAMPLE_NONE
+		&& SUCCEEDED(ProxyInterface->CreateRenderTarget(SourceDesc.Width, SourceDesc.Height, SourceDesc.Format, D3DMULTISAMPLE_NONE, 0, FALSE, &Resolved, nullptr))
+		&& SUCCEEDED(ProxyInterface->StretchRect(Source, nullptr, Resolved, nullptr, D3DTEXF_NONE)))
+	{
+		Source = Resolved;
+		SourceDesc.MultiSampleType = D3DMULTISAMPLE_NONE;
+	}
 
 	if (cRects == 0)
 		cRects  = 1;
@@ -527,7 +550,7 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::CopyRects(IDirect3DSurface8 *pSourceS
 			hr = D3DERR_INVALIDCALL;
 			if (D3DXLoadSurfaceFromSurface != nullptr)
 			{
-				if (SUCCEEDED(D3DXLoadSurfaceFromSurface(pDestinationSurfaceImpl->GetProxyInterface(), nullptr, &DestinationRect, pSourceSurfaceImpl->GetProxyInterface(), nullptr, &SourceRect, D3DX_FILTER_NONE, 0)))
+				if (SUCCEEDED(D3DXLoadSurfaceFromSurface(pDestinationSurfaceImpl->GetProxyInterface(), nullptr, &DestinationRect, Source, nullptr, &SourceRect, D3DX_FILTER_NONE, 0)))
 				{
 					// Explicitly call AddDirtyRect on the surface
 					void *pContainer = nullptr;
@@ -543,13 +566,13 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::CopyRects(IDirect3DSurface8 *pSourceS
 		}
 		else if (SourceDesc.Pool == D3DPOOL_DEFAULT)
 		{
-			hr = ProxyInterface->StretchRect(pSourceSurfaceImpl->GetProxyInterface(), &SourceRect, pDestinationSurfaceImpl->GetProxyInterface(), &DestinationRect, D3DTEXF_NONE);
+			hr = ProxyInterface->StretchRect(Source, &SourceRect, pDestinationSurfaceImpl->GetProxyInterface(), &DestinationRect, D3DTEXF_NONE);
 		}
 		else if (SourceDesc.Pool == D3DPOOL_SYSTEMMEM)
 		{
 			const POINT pt = { DestinationRect.left, DestinationRect.top };
 
-			hr = ProxyInterface->UpdateSurface(pSourceSurfaceImpl->GetProxyInterface(), &SourceRect, pDestinationSurfaceImpl->GetProxyInterface(), &pt);
+			hr = ProxyInterface->UpdateSurface(Source, &SourceRect, pDestinationSurfaceImpl->GetProxyInterface(), &pt);
 		}
 
 		if (FAILED(hr))
@@ -560,6 +583,8 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::CopyRects(IDirect3DSurface8 *pSourceS
 			break;
 		}
 	}
+	if (Resolved)
+		Resolved->Release();
 
 	return hr;
 }
@@ -605,7 +630,11 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::SetRenderTarget(IDirect3DSurface8 *pR
 	if (pRenderTarget != nullptr)
 	{
 		auto pRenderTargetImpl = static_cast<Direct3DSurface8 *>(pRenderTarget);
-		hr = ProxyInterface->SetRenderTarget(0, pRenderTargetImpl->GetProxyInterface());
+		// msaa=N: a multisampled stand-in for the game's screen-sized render texture
+		{
+			IDirect3DSurface9 *Bind = U2.MsaaTarget(ProxyInterface, pRenderTargetImpl->GetProxyInterface());
+			hr = ProxyInterface->SetRenderTarget(0, Bind);
+		}
 		if (FAILED(hr))
 			return hr;
 	}
@@ -629,6 +658,7 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::SetRenderTarget(IDirect3DSurface8 *pR
 	{
 		ProxyInterface->SetDepthStencilSurface(nullptr);
 	}
+	U2.MatchDepth(ProxyInterface);                  // msaa=N: a plain target gets a plain depth buffer
 
 	return D3D_OK;
 }
@@ -642,6 +672,15 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::GetRenderTarget(IDirect3DSurface8 **p
 	const HRESULT hr = ProxyInterface->GetRenderTarget(0, &SurfaceInterface);
 	if (FAILED(hr))
 		return hr;
+	{
+		IDirect3DSurface9 *Plain = U2.MsaaPlainOf(SurfaceInterface);
+		if (Plain != SurfaceInterface)
+		{
+			Plain->AddRef();
+			SurfaceInterface->Release();
+			SurfaceInterface = Plain;
+		}
+	}
 
 	*ppRenderTarget = ProxyAddressLookupTable->FindAddress<Direct3DSurface8>(SurfaceInterface);
 
@@ -781,6 +820,15 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::GetClipPlane(DWORD Index, float *pPla
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::SetRenderState(D3DRENDERSTATETYPE State, DWORD Value)
 {
 	HRESULT hr;
+
+	// msaa=N: the game's own "no multisampling" doesn't apply
+	if ((State == D3DRS_MULTISAMPLEANTIALIAS || State == D3DRS_MULTISAMPLEMASK) && U2Msaa::Wanted() != 0)
+	{
+		static int Told = 0;
+		if (Told++ < 8)
+			U2FakeFull::Note(State == D3DRS_MULTISAMPLEANTIALIAS ? "msaa: the game sets MULTISAMPLEANTIALIAS (kept on)" : "msaa: the game sets MULTISAMPLEMASK (kept all samples)");
+		Value = State == D3DRS_MULTISAMPLEANTIALIAS ? TRUE : 0xFFFFFFFF;
+	}
 
 	switch (static_cast<DWORD>(State))
 	{
@@ -1007,6 +1055,7 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::SetTexture(DWORD Stage, IDirect3DBase
 	default:
 		return D3DERR_INVALIDCALL;
 	}
+	U2.MsaaBeforeRead(ProxyInterface, BaseTextureInterface, nullptr);
 
 	return ProxyInterface->SetTexture(Stage, BaseTextureInterface);
 }

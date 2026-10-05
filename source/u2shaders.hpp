@@ -53,6 +53,7 @@
 
 #pragma once
 
+#include "msaa.hpp"
 #include <d3dcompiler.h>
 #include "fakefull.hpp"
 #include <algorithm>
@@ -2288,6 +2289,40 @@ public:
 			SegDraws++;                       // the size of this part of the frame (OnClear)
 		if (Gi && DepthDirty)
 			DepthLazySwap(Dev);
+		if (U2Msaa::Wanted() != 0 && !programmable && !rhw && P._34 == 1.0f && P._44 == 0.0f)
+		{
+			{
+				IDirect3DSurface9 *RT = nullptr, *BB = nullptr;
+				Dev->GetRenderTarget(0, &RT);
+				Dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &BB);
+				if (RT == BB) MsaaCount[0]++;
+				else if (MsaaBound >= 0 && RT == MsaaProxies[MsaaBound].Multi) MsaaCount[1]++;
+				else MsaaCount[2]++;
+				if (RT) RT->Release();
+				if (BB) BB->Release();
+				if (Frame != MsaaCountFrame)
+				{
+					MsaaCountFrame = Frame;
+					static int Told = 0;
+					if ((Frame % 300) == 0 && Told++ < 4)
+						Message("msaa probe: perspective draws so far: back buffer %u, stand-in %u, other %u", MsaaCount[0], MsaaCount[1], MsaaCount[2]);
+				}
+			}
+			static int Told = 0;
+			if (Told < 6 && (Frame % 120) == 60)
+			{
+				Told++;
+				IDirect3DSurface9 *RT = nullptr, *DS = nullptr, *BB = nullptr;
+				D3DSURFACE_DESC R = {}, D = {}, B = {};
+				DWORD MS = 0;
+				Dev->GetRenderState(D3DRS_MULTISAMPLEANTIALIAS, &MS);
+				if (SUCCEEDED(Dev->GetRenderTarget(0, &RT)) && RT) { RT->GetDesc(&R); RT->Release(); }
+				if (SUCCEEDED(Dev->GetDepthStencilSurface(&DS)) && DS) { DS->GetDesc(&D); DS->Release(); }
+				if (SUCCEEDED(Dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &BB)) && BB) { BB->GetDesc(&B); BB->Release(); }
+				Message("msaa probe: world draw into %p %ux%u sampled %u (back buffer %p sampled %u), depth %p sampled %u, MULTISAMPLEANTIALIAS %u",
+					(void *)RT, R.Width, R.Height, (unsigned)R.MultiSampleType, (void *)BB, (unsigned)B.MultiSampleType, (void *)DS, (unsigned)D.MultiSampleType, (unsigned)MS);
+			}
+		}
 		if (Gi && !programmable && !rhw && P._34 == 1.0f && P._44 == 0.0f)
 		{
 			SceneProj = P;                    // gi.hlsl rebuilds positions from depth with it
@@ -2702,7 +2737,7 @@ public:
 	// when it can't be swapped (multisampled, an unknown format, or the card has no INTZ)
 	IDirect3DSurface9 *DepthFor(IDirect3DDevice9 *Dev, IDirect3DSurface9 *Game)
 	{
-		if (!Gi || DepthBroken || Game == nullptr)
+		if (!Gi || DepthBroken || Game == nullptr || U2Msaa::Wanted() != 0)    // msaa: a multisampled scene's depth can't be read
 			return Game;
 		auto It = DepthSwap.find(Game);
 		if (It != DepthSwap.end())
@@ -2735,9 +2770,250 @@ public:
 		return P.Surf;
 	}
 
+	// msaa=N (see msaa.hpp): a plain depth buffer for a plain target drawn while the multisampled
+	// one is bound (Direct3D 9 draws nothing when the two differ). One per size and sampling.
+	struct MatchPair { IDirect3DSurface9 *Surf; UINT W, H; D3DMULTISAMPLE_TYPE MS; D3DFORMAT Fmt; IDirect3DSurface9 *Game; };
+	std::vector<MatchPair> DepthMatches;
+
+	void MatchDepth(IDirect3DDevice9 *Dev)
+	{
+		if (U2Msaa::Wanted() == 0)
+			return;
+		IDirect3DSurface9 *RT = nullptr, *DS = nullptr;
+		if (FAILED(Dev->GetRenderTarget(0, &RT)) || RT == nullptr)
+			return;
+		if (FAILED(Dev->GetDepthStencilSurface(&DS)) || DS == nullptr)
+		{
+			RT->Release();
+			return;
+		}
+		D3DSURFACE_DESC R = {}, D = {};
+		RT->GetDesc(&R);
+		DS->GetDesc(&D);
+		RT->Release();
+		DS->Release();
+		if (R.MultiSampleType == D.MultiSampleType && D.Width >= R.Width && D.Height >= R.Height)
+			return;
+		IDirect3DSurface9 *Game = DS;
+		for (const MatchPair &M : DepthMatches)
+			if (M.Surf == DS)
+				Game = M.Game;
+		MatchPair *Use = nullptr;
+		for (MatchPair &M : DepthMatches)
+			if (M.W == R.Width && M.H == R.Height && M.MS == R.MultiSampleType && M.Fmt == D.Format)
+				Use = &M;
+		if (Use == nullptr)
+		{
+			MatchPair M = { nullptr, R.Width, R.Height, R.MultiSampleType, D.Format, Game };
+			if (FAILED(Dev->CreateDepthStencilSurface(R.Width, R.Height, D.Format, R.MultiSampleType, 0, TRUE, &M.Surf, nullptr)) || M.Surf == nullptr)
+			{
+				static int Told = 0;
+				if (Told++ < 3)
+					Message("msaa: no depth buffer %ux%u format %u for a target sampled %u", R.Width, R.Height, (unsigned)D.Format, (unsigned)R.MultiSampleType);
+				return;
+			}
+			DepthMatches.push_back(M);
+			Use = &DepthMatches.back();
+			Message("msaa: a %ux%u target (sampled %u) drawn with depth sampled %u: it gets its own depth buffer",
+				R.Width, R.Height, (unsigned)R.MultiSampleType, (unsigned)D.MultiSampleType);
+		}
+		Use->Game = Game;
+		if (SUCCEEDED(Dev->SetDepthStencilSurface(Use->Surf)))
+			Dev->Clear(0, nullptr, D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL, 0, 1.0f, 0);
+	}
+
+	// msaa=N: the game draws its world into a screen-sized render-target TEXTURE, which can't be
+	// multisampled. While it is bound, a multisampled surface of the same size stands in for it;
+	// its samples are resolved into the texture before the game reads it (as a texture, by a copy,
+	// or at Present) and whenever another target is bound.
+	struct MsaaProxy { IDirect3DSurface9 *Plain, *Multi; IDirect3DBaseTexture9 *Tex; };
+	std::vector<MsaaProxy> MsaaProxies;
+	int MsaaBound = -1;
+	unsigned MsaaCount[3] = {}, MsaaCountFrame = 0;
+	bool MsaaDirty = false;
+
+	void MsaaResolve(IDirect3DDevice9 *Dev)
+	{
+		if (MsaaBound >= 0 && MsaaDirty)
+		{
+			if (U2Msaa::ShotTest() && Frame > 300)
+				MsaaStamp(Dev, MsaaProxies[MsaaBound].Multi);    // test: a triangle on what the game drew
+			Dev->StretchRect(MsaaProxies[MsaaBound].Multi, nullptr, MsaaProxies[MsaaBound].Plain, nullptr, D3DTEXF_NONE);
+			MsaaDirty = false;
+		}
+	}
+
+	// the device's SetRenderTarget: the surface to bind in place of the game's
+	IDirect3DSurface9 *MsaaTarget(IDirect3DDevice9 *Dev, IDirect3DSurface9 *S)
+	{
+		MsaaResolve(Dev);
+		MsaaBound = -1;
+		if (U2Msaa::Wanted() == 0 || S == nullptr)
+			return S;
+		for (size_t i = 0; i < MsaaProxies.size(); i++)
+			if (MsaaProxies[i].Plain == S)
+			{
+				MsaaBound = (int)i;
+				MsaaDirty = true;
+				return MsaaProxies[i].Multi;
+			}
+		D3DSURFACE_DESC D = {}, B = {};
+		S->GetDesc(&D);
+		if (D.MultiSampleType != D3DMULTISAMPLE_NONE || !(D.Usage & D3DUSAGE_RENDERTARGET))
+			return S;
+		IDirect3DSurface9 *BB = nullptr;
+		if (SUCCEEDED(Dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &BB)) && BB) { BB->GetDesc(&B); BB->Release(); }
+		if (B.MultiSampleType == D3DMULTISAMPLE_NONE || D.Width != B.Width || D.Height != B.Height)
+			return S;
+		IDirect3DTexture9 *Tex = nullptr;
+		if (FAILED(S->GetContainer(IID_IDirect3DTexture9, (void **)&Tex)) || Tex == nullptr)
+			return S;
+		Tex->Release();                             // the game keeps it alive
+		MsaaProxy P = { S, nullptr, Tex };
+		if (FAILED(Dev->CreateRenderTarget(D.Width, D.Height, D.Format, B.MultiSampleType, 0, FALSE, &P.Multi, nullptr)) || P.Multi == nullptr)
+		{
+			static int Told = 0;
+			if (Told++ < 3)
+				Message("msaa: no multisampled stand-in %ux%u format %u", D.Width, D.Height, (unsigned)D.Format);
+			return S;
+		}
+		MsaaProxies.push_back(P);
+		MsaaBound = (int)MsaaProxies.size() - 1;
+		MsaaDirty = true;
+		Message("msaa: the game's %ux%u render texture (format %u) gets a multisampled stand-in", D.Width, D.Height, (unsigned)D.Format);
+		return P.Multi;
+	}
+
+	// before the game reads a texture or copies a surface: the bound stand-in resolved if it is that one
+	void MsaaBeforeRead(IDirect3DDevice9 *Dev, IDirect3DBaseTexture9 *Tex, IDirect3DSurface9 *Surf)
+	{
+		if (MsaaBound < 0 || !MsaaDirty)
+			return;
+		const MsaaProxy &P = MsaaProxies[MsaaBound];
+		if ((Tex != nullptr && Tex == P.Tex) || (Surf != nullptr && Surf == P.Plain))
+			MsaaResolve(Dev);
+	}
+
+	// msaa: once, a white triangle drawn into a small multisampled target and resolved: are there
+	// in-between pixels on its edge? (no: something - often the driver's own settings - turns the
+	// sampling off)
+	bool MsaaTested = false;
+	void MsaaSelfTest(IDirect3DDevice9 *Dev)
+	{
+		MsaaTested = true;
+		IDirect3DSurface9 *Multi = nullptr, *Plain = nullptr, *Sys = nullptr, *OldRT = nullptr, *OldDS = nullptr;
+		IDirect3DStateBlock9 *SB = nullptr;
+		const D3DMULTISAMPLE_TYPE MS = (D3DMULTISAMPLE_TYPE)U2Msaa::Wanted();
+		if (FAILED(Dev->CreateRenderTarget(64, 64, D3DFMT_A8R8G8B8, MS, 0, FALSE, &Multi, nullptr))
+			|| FAILED(Dev->CreateRenderTarget(64, 64, D3DFMT_A8R8G8B8, D3DMULTISAMPLE_NONE, 0, FALSE, &Plain, nullptr))
+			|| FAILED(Dev->CreateOffscreenPlainSurface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, &Sys, nullptr))
+			|| FAILED(Dev->CreateStateBlock(D3DSBT_ALL, &SB)))
+		{
+			Message("msaa self-test: couldn't make its targets");
+		}
+		else
+		{
+			Dev->GetRenderTarget(0, &OldRT);
+			Dev->GetDepthStencilSurface(&OldDS);
+			Dev->SetRenderTarget(0, Multi);
+			Dev->SetDepthStencilSurface(nullptr);
+			Dev->Clear(0, nullptr, D3DCLEAR_TARGET, 0xFF000000, 1.0f, 0);
+			struct V { float x, y, z, w; DWORD c; } Tri[3] = {
+				{ 2, 2, 0.5f, 1, 0xFFFFFFFF }, { 62, 10, 0.5f, 1, 0xFFFFFFFF }, { 6, 61, 0.5f, 1, 0xFFFFFFFF } };
+			Dev->SetVertexShader(nullptr);
+			Dev->SetPixelShader(nullptr);
+			Dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+			Dev->SetTexture(0, nullptr);
+			Dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+			Dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+			Dev->SetRenderState(D3DRS_ZENABLE, FALSE);
+			Dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+			Dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+			Dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+			Dev->SetRenderState(D3DRS_LIGHTING, FALSE);
+			Dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
+			Dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+			Dev->SetRenderState(D3DRS_MULTISAMPLEANTIALIAS, TRUE);
+			Dev->SetRenderState(D3DRS_MULTISAMPLEMASK, 0xFFFFFFFF);
+			Dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, Tri, sizeof(V));
+			Dev->StretchRect(Multi, nullptr, Plain, nullptr, D3DTEXF_NONE);
+			int Mid = 0, Lit = 0;
+			D3DLOCKED_RECT L = {};
+			if (SUCCEEDED(Dev->GetRenderTargetData(Plain, Sys)) && SUCCEEDED(Sys->LockRect(&L, nullptr, D3DLOCK_READONLY)))
+			{
+				for (int y = 0; y < 64; y++)
+					for (int x = 0; x < 64; x++)
+					{
+						const BYTE g = static_cast<const BYTE *>(L.pBits)[y * L.Pitch + x * 4 + 1];
+						if (g > 20 && g < 235) Mid++;
+						if (g >= 235) Lit++;
+					}
+				Sys->UnlockRect();
+			}
+			Message("msaa self-test (%ux): %d lit pixels, %d in-between on the edges -> %s", (unsigned)MS, Lit, Mid,
+				Mid > 10 ? "the card multisamples" : "NOT multisampled (the driver's anti-aliasing settings may override the game: set it to 'application-controlled')");
+			Dev->SetRenderTarget(0, OldRT);
+			Dev->SetDepthStencilSurface(OldDS);
+			SB->Apply();
+		}
+		if (OldRT) OldRT->Release();
+		if (OldDS) OldDS->Release();
+		if (SB) SB->Release();
+		if (Sys) Sys->Release();
+		if (Plain) Plain->Release();
+		if (Multi) Multi->Release();
+	}
+
+	// test (msaastamp=1): a white triangle into a surface (top left), state kept
+	void MsaaStamp(IDirect3DDevice9 *Dev, IDirect3DSurface9 *Into)
+	{
+		IDirect3DSurface9 *OldRT = nullptr, *OldDS = nullptr;
+		IDirect3DStateBlock9 *SB = nullptr;
+		if (FAILED(Dev->CreateStateBlock(D3DSBT_ALL, &SB)))
+			return;
+		Dev->GetRenderTarget(0, &OldRT);
+		Dev->GetDepthStencilSurface(&OldDS);
+		Dev->SetRenderTarget(0, Into);
+		Dev->SetDepthStencilSurface(nullptr);
+		struct V { float x, y, z, w; DWORD c; } Tri[3] = {
+			{ 2, 2, 0.5f, 1, 0xFFFFFFFF }, { 182, 30, 0.5f, 1, 0xFFFFFFFF }, { 18, 183, 0.5f, 1, 0xFFFFFFFF } };
+		Dev->SetVertexShader(nullptr);
+		Dev->SetPixelShader(nullptr);
+		Dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+		Dev->SetTexture(0, nullptr);
+		Dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+		Dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+		Dev->SetRenderState(D3DRS_ZENABLE, FALSE);
+		Dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+		Dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+		Dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+		Dev->SetRenderState(D3DRS_LIGHTING, FALSE);
+		Dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
+		Dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+		Dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, Tri, sizeof(V));
+		Dev->SetRenderTarget(0, OldRT);
+		Dev->SetDepthStencilSurface(OldDS);
+		SB->Apply();
+		SB->Release();
+		if (OldRT) OldRT->Release();
+		if (OldDS) OldDS->Release();
+	}
+
+	// the game's own target for a stand-in
+	IDirect3DSurface9 *MsaaPlainOf(IDirect3DSurface9 *S)
+	{
+		for (const MsaaProxy &P : MsaaProxies)
+			if (P.Multi == S)
+				return P.Plain;
+		return S;
+	}
+
 	// the game's own surface for one of ours (nullptr: not ours)
 	IDirect3DSurface9 *GameDepthOf(IDirect3DSurface9 *Ours)
 	{
+		for (const MatchPair &M : DepthMatches)
+			if (M.Surf == Ours)
+				return M.Game;
 		for (auto &It : DepthSwap)
 			if (It.second.Surf == Ours || (Ours != nullptr && It.second.Surf2 == Ours))
 				return It.first;
@@ -2885,6 +3161,13 @@ public:
 		}
 		DepthSwap.clear();
 		KeptDepth = nullptr;
+		for (MatchPair &M : DepthMatches)
+			if (M.Surf) M.Surf->Release();
+		DepthMatches.clear();
+		for (MsaaProxy &P : MsaaProxies)
+			if (P.Multi) P.Multi->Release();
+		MsaaProxies.clear();
+		MsaaBound = -1;
 		DepthDirty = true;
 		if (GiVS) { GiVS->Release(); GiVS = nullptr; }
 		for (int i = 0; i < 7; i++)
@@ -3485,6 +3768,13 @@ public:
 		}
 		DepthSwap.clear();
 		KeptDepth = nullptr;
+		for (MatchPair &M : DepthMatches)
+			if (M.Surf) M.Surf->Release();
+		DepthMatches.clear();
+		for (MsaaProxy &P : MsaaProxies)
+			if (P.Multi) P.Multi->Release();
+		MsaaProxies.clear();
+		MsaaBound = -1;
 		DepthDirty = true;
 		if (PostQuadVB) { PostQuadVB->Release(); PostQuadVB = nullptr; }
 	}
@@ -3892,6 +4182,49 @@ public:
 			if (SUCCEEDED(Dev->CreateRenderTarget(D.Width, D.Height, D.Format, D3DMULTISAMPLE_NONE, 0, FALSE, &Plain, nullptr))
 				&& SUCCEEDED(Dev->StretchRect(BB, nullptr, Plain, nullptr, D3DTEXF_NONE)))
 				Src = Plain;
+		}
+		// msaa test (msaashot=1): the game's render texture, its stand-in resolved, instead
+		if (!MsaaProxies.empty() && U2Msaa::ShotTest())
+		{
+			MsaaProxy &P = MsaaProxies[MsaaBound >= 0 ? MsaaBound : 0];
+			{
+				// a white triangle in the top left corner of the stand-in, to tell a sampling problem
+				// in the game's drawing from one in this capture
+				IDirect3DSurface9 *OldRT = nullptr, *OldDS = nullptr;
+				IDirect3DStateBlock9 *SB = nullptr;
+				if (SUCCEEDED(Dev->CreateStateBlock(D3DSBT_ALL, &SB)))
+				{
+					Dev->GetRenderTarget(0, &OldRT);
+					Dev->GetDepthStencilSurface(&OldDS);
+					Dev->SetRenderTarget(0, P.Multi);
+					Dev->SetDepthStencilSurface(nullptr);
+					struct V { float x, y, z, w; DWORD c; } Tri[3] = {
+						{ 2, 2, 0.5f, 1, 0xFFFFFFFF }, { 182, 30, 0.5f, 1, 0xFFFFFFFF }, { 18, 183, 0.5f, 1, 0xFFFFFFFF } };
+					Dev->SetVertexShader(nullptr);
+					Dev->SetPixelShader(nullptr);
+					Dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+					Dev->SetTexture(0, nullptr);
+					Dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+					Dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+					Dev->SetRenderState(D3DRS_ZENABLE, FALSE);
+					Dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+					Dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+					Dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+					Dev->SetRenderState(D3DRS_LIGHTING, FALSE);
+					Dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
+					Dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+					Dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, Tri, sizeof(V));
+					Dev->SetRenderTarget(0, OldRT);
+					Dev->SetDepthStencilSurface(OldDS);
+					SB->Apply();
+					SB->Release();
+					if (OldRT) OldRT->Release();
+					if (OldDS) OldDS->Release();
+				}
+			}
+			Dev->StretchRect(P.Multi, nullptr, P.Plain, nullptr, D3DTEXF_NONE);
+			Src = P.Plain;
+			P.Plain->GetDesc(&D);
 		}
 		HRESULT hr = Dev->CreateOffscreenPlainSurface(D.Width, D.Height, D.Format, D3DPOOL_SYSTEMMEM, &Sys, nullptr);
 		if (SUCCEEDED(hr))
