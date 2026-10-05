@@ -8,8 +8,8 @@
 //
 // Radiance cascades (Sannikov, Path of Exile 2): light from near needs many probes but few
 // directions, light from far few probes but many directions. Cascade c has probes every
-// 2^(c+1) half-size pixels and 4^(c+1) directions, and covers a stretch 4x as long as the
-// one before. Each cascade is one texture the size of the half-size screen: k x k tiles
+// 2^(c+1) of its texels and 4^(c+1) directions, and covers a stretch 4x as long as the
+// one before. Each cascade is one texture (the frame's size over gires): k x k tiles
 // (k = 2^(c+1)), one per direction, each a small picture of the screen's probes, so the
 // probes of a direction interpolate with plain bilinear filtering.
 //
@@ -21,6 +21,7 @@
 float4 Px : register(c0);       // the target's 1/w, 1/h, w, h
 float4 Proj : register(c1);     // the scene projection's _11, _22, _33, _43
 float4 Casc : register(c2);     // tiles per axis k, stretch start (pixels), stretch length, 1 = merge the next cascade
+                                // (the resolve: 0, 0, the cascade texture's w, h)
 float4 Scr : register(c3);      // the frame's 1/w, 1/h, w, h
 float4 Fx : register(c4);       // bounce strength, corner darkening, reach (world units), debug view
 
@@ -56,8 +57,11 @@ float4 GBufPS(float2 uv : TEXCOORD0) : COLOR
 	// the normal from the nearer neighbour on each axis (so edges don't bend it)
 	float2 dx = float2(Scr.x, 0), dy = float2(0, Scr.y);
 	float zl = ViewZ(uv - dx), zr = ViewZ(uv + dx), zu = ViewZ(uv - dy), zd = ViewZ(uv + dy);
-	float3 ax = abs(zl - z) < abs(zr - z) ? p - ViewPos(uv - dx, zl) : ViewPos(uv + dx, zr) - p;
-	float3 ay = abs(zu - z) < abs(zd - z) ? p - ViewPos(uv - dy, zu) : ViewPos(uv + dy, zd) - p;
+	// both neighbours where the surface carries on (steadier: far depth comes in coarse steps)
+	float3 pl = ViewPos(uv - dx, zl), pr = ViewPos(uv + dx, zr), pu = ViewPos(uv - dy, zu), pd = ViewPos(uv + dy, zd);
+	float el = abs(zl - z), er = abs(zr - z), eu = abs(zu - z), ed = abs(zd - z), same = 0.01 * z;
+	float3 ax = (zl > 0 && zr > 0 && el < same && er < same) ? (pr - pl) * 0.5 : (el < er ? p - pl : pr - p);
+	float3 ay = (zu > 0 && zd > 0 && eu < same && ed < same) ? (pd - pu) * 0.5 : (eu < ed ? p - pu : pd - p);
 	float3 n = normalize(cross(ay, ax));
 	if (n.z > 0)
 		n = -n;                                     // towards the camera
@@ -102,12 +106,15 @@ float4 CascadePS(float2 uv : TEXCOORD0) : COLOR
 		float dist = length(v);
 		// how high it stands over the surface; things beyond the reach fade out (on a
 		// screen, something far in front of the surface would else pass for a wall next to it)
-		float s = dot(v, n0) / max(dist, 0.001);
+		// (a little under the horizon doesn't count: sloped surfaces would else shade
+		// themselves in stripes, from the depth buffer's steps)
+		float s = saturate((dot(v, n0) / max(dist, 0.001) - 0.1) / 0.9);
 		float near = saturate(1 - dist * dist / (Fx.z * Fx.z));
 		s = lerp(h, s, near);
 		if (s > h)
 		{
-			light += tex2Dlod(S1, float4(suv, 0, 0)).rgb * (s * s - h * h);
+			// the frame is gamma-space: light adds up in linear
+			light += pow(max(tex2Dlod(S1, float4(suv, 0, 0)).rgb, 0), 2.2) * (s * s - h * h);
 			h = s;
 		}
 	}
@@ -144,7 +151,7 @@ float4 ResolvePS(float2 uv : TEXCOORD0) : COLOR
 	float4 g = tex2Dlod(S0, float4(uv, 0, 0));
 	if (g.a < 0.5)
 		return c;
-	float2 tileSize = Scr.zw * 0.25;                // half-size screen, 2 tiles per axis
+	float2 tileSize = Casc.zw * 0.5;                // the cascade texture's size, 2 tiles per axis
 	float2 puv = clamp(uv, 0.5 / tileSize, 1 - 0.5 / tileSize);
 	float4 sum = 0;
 	float open = 0;
@@ -166,7 +173,8 @@ float4 ResolvePS(float2 uv : TEXCOORD0) : COLOR
 	if (Fx.w > 1.5)
 		return float4(shade, shade, shade, 1);      // 2: the corner darkening alone
 	if (Fx.w > 0.5)
-		return float4(light, 1);                    // 1: the gathered light alone
-	return float4(c.rgb * shade + hue * light * Fx.x, c.a);
+		return float4(pow(max(light, 0), 1 / 2.2), 1);      // 1: the gathered light alone
+	float3 lit = pow(max(c.rgb, 0), 2.2) * shade + pow(max(hue, 0), 2.2) * light * Fx.x;
+	return float4(pow(max(lit, 0), 1 / 2.2), c.a);
 }
 #endif

@@ -2550,7 +2550,7 @@ public:
 	IDirect3DPixelShader9 *GiPS[3] = {};
 	IDirect3DVertexBuffer9 *GiVB = nullptr;
 	IDirect3DTexture9 *GiGBuf = nullptr, *GiCasc[GiCascades] = {}, *GiScene = nullptr;
-	UINT GiW = 0, GiH = 0;
+	UINT GiW = 0, GiH = 0, GiRes = 1, GiDiv = 0;    // gires=1|2: the cascades at full or half size
 
 	// the depth surface to bind in place of the game's: an INTZ texture's, or the game's own
 	// when it can't be swapped (multisampled, an unknown format, or the card has no INTZ)
@@ -2716,8 +2716,8 @@ public:
 		Depth->GetLevelDesc(0, &DD);
 		if (DD.Width != SceneW || DD.Height != SceneH || !GiBuild(Dev))
 			return;
-		const UINT W = (std::max)(SceneW / 2, 8u), H = (std::max)(SceneH / 2, 8u);
-		if (GiScene == nullptr || GiW != SceneW || GiH != SceneH)
+		const UINT W = (std::max)(SceneW / GiRes, 8u), H = (std::max)(SceneH / GiRes, 8u);
+		if (GiScene == nullptr || GiW != SceneW || GiH != SceneH || GiDiv != GiRes)
 		{
 			GiReleaseTargets();
 			bool Ok = SUCCEEDED(Dev->CreateTexture(W, H, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &GiGBuf, nullptr))
@@ -2733,6 +2733,7 @@ public:
 			}
 			GiW = SceneW;
 			GiH = SceneH;
+			GiDiv = GiRes;
 		}
 		const float half[4] = { 1.0f / W, 1.0f / H, (float)W, (float)H };
 		const float full[4] = { 1.0f / SceneW, 1.0f / SceneH, (float)SceneW, (float)SceneH };
@@ -2778,13 +2779,15 @@ public:
 		Target(Dev, GiScene);
 		Dev->SetVertexShaderConstantF(0, full, 1);
 		Dev->SetPixelShaderConstantF(0, full, 1);
+		const float atlas[4] = { 0, 0, (float)W, (float)H };
+		Dev->SetPixelShaderConstantF(2, atlas, 1);
 		Dev->SetPixelShader(GiPS[2]);
 		Dev->SetTexture(2, GiCasc[0]);
 		Dev->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
 		std::swap(SceneTex, GiScene);
 		static int Ran = 0;
 		if (Ran++ < 1)
-			Message("gi: running (%ux%u, cascades at half size, base %.0f px, strength %.2f, corners %.2f, reach %.0f)",
+			Message("gi: running (%ux%u, base %.0f px, strength %.2f, corners %.2f, reach %.0f)",
 				SceneW, SceneH, GiBase, GiFx[0], GiFx[1], GiFx[2]);
 
 		// back to the post chain's setup
@@ -3622,6 +3625,8 @@ public:
 				Gi = V != 0;
 			else if (sscanf_s(Line, " gifx=%f %f %f %f", &GiFx[0], &GiFx[1], &GiFx[2], &GiFx[3]) >= 1)
 				;
+			else if (sscanf_s(Line, " gires=%u", &V) == 1)
+				GiRes = V >= 2 ? 2 : 1;
 			else if (sscanf_s(Line, " gibase=%f", &GiBase) == 1)
 				GiBase = (std::min)((std::max)(GiBase, 2.0f), 32.0f);
 			else if (sscanf_s(Line, " bloomchain=%u", &V) == 1)
