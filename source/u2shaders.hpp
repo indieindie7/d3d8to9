@@ -2284,6 +2284,8 @@ public:
 		Dev->GetTransform(D3DTS_PROJECTION, &P);
 		const bool rhw = (fvf & D3DFVF_POSITION_MASK) == D3DFVF_XYZRHW;
 		const bool ortho = !programmable && !rhw && P._34 == 0.0f && P._44 == 1.0f;
+		if (Gi && !rhw && !ortho)
+			SegDraws++;                       // the size of this part of the frame (OnClear)
 		if (Gi && DepthDirty)
 			DepthLazySwap(Dev);
 		if (Gi && !programmable && !rhw && P._34 == 1.0f && P._44 == 0.0f)
@@ -2656,7 +2658,16 @@ public:
 	float GiFx[4] = { 0.35f, 0.6f, 300.0f, 0.0f };
 	float GiBase = 6.0f;
 	static const int GiCascades = 4;
-	struct DepthPair { IDirect3DTexture9 *Tex; IDirect3DSurface9 *Surf; UINT W, H; };
+	// A game that clears depth in mid-frame (Unreal II before its first-person weapon, and
+	// after its sky box) leaves only the last part's depth by the time the post chain runs.
+	// So each readable depth surface is one of a pair: at such a clear (OnClear) the part just
+	// drawn is kept, if it is the biggest so far this frame (counted in perspective draws), and
+	// the game carries on in the other one. RunGi reads the kept part when it is bigger than
+	// the last one, and leaves alone what the last one covers (the weapon).
+	struct DepthPair { IDirect3DTexture9 *Tex; IDirect3DSurface9 *Surf; UINT W, H; IDirect3DTexture9 *Tex2; IDirect3DSurface9 *Surf2; bool Alt; };
+	int SegDraws = 0, KeptDraws = 0;
+	IDirect3DTexture9 *KeptDepth = nullptr;
+	D3DMATRIX KeptProj = {}, KeptView = {};
 	std::map<IDirect3DSurface9 *, DepthPair> DepthSwap;     // the game's depth surface -> ours
 	D3DMATRIX SceneProj = {}, SceneView = {};
 	bool SceneProjOk = false;
@@ -2682,9 +2693,9 @@ public:
 			return Game;
 		auto It = DepthSwap.find(Game);
 		if (It != DepthSwap.end())
-			return It->second.Surf;
+			return It->second.Alt ? It->second.Surf2 : It->second.Surf;
 		for (auto &Other : DepthSwap)
-			if (Other.second.Surf == Game)
+			if (Other.second.Surf == Game || Other.second.Surf2 == Game)
 				return Game;                        // already one of ours
 		D3DSURFACE_DESC D = {};
 		Game->GetDesc(&D);
@@ -2696,7 +2707,7 @@ public:
 					D.Width, D.Height, (unsigned)D.Format, (unsigned)D.MultiSampleType);
 			return Game;
 		}
-		DepthPair P = { nullptr, nullptr, D.Width, D.Height };
+		DepthPair P = { nullptr, nullptr, D.Width, D.Height, nullptr, nullptr, false };
 		if (FAILED(Dev->CreateTexture(D.Width, D.Height, 1, D3DUSAGE_DEPTHSTENCIL, (D3DFORMAT)MAKEFOURCC('I', 'N', 'T', 'Z'), D3DPOOL_DEFAULT, &P.Tex, nullptr))
 			|| P.Tex == nullptr || FAILED(P.Tex->GetSurfaceLevel(0, &P.Surf)) || P.Surf == nullptr)
 		{
@@ -2715,16 +2726,63 @@ public:
 	IDirect3DSurface9 *GameDepthOf(IDirect3DSurface9 *Ours)
 	{
 		for (auto &It : DepthSwap)
-			if (It.second.Surf == Ours)
+			if (It.second.Surf == Ours || (Ours != nullptr && It.second.Surf2 == Ours))
 				return It.first;
 		return nullptr;
+	}
+
+	// the device's Clear, before it happens: a depth clear in mid-frame (see DepthPair)
+	void OnClear(IDirect3DDevice9 *Dev, DWORD Count, DWORD Flags)
+	{
+		if (!Gi || DepthBroken || Count != 0 || (Flags & D3DCLEAR_ZBUFFER) == 0 || (Flags & D3DCLEAR_TARGET) != 0)
+			return;
+		const int Draws = SegDraws;
+		SegDraws = 0;
+		if (Draws == 0 || Draws < KeptDraws || Offscreen(Dev))
+			return;
+		IDirect3DSurface9 *DS = nullptr;
+		if (FAILED(Dev->GetDepthStencilSurface(&DS)) || DS == nullptr)
+			return;
+		DS->Release();
+		for (auto &It : DepthSwap)
+		{
+			DepthPair &P = It.second;
+			if (P.Surf != DS && P.Surf2 != DS)
+				continue;
+			if (P.Tex2 == nullptr)
+			{
+				if (FAILED(Dev->CreateTexture(P.W, P.H, 1, D3DUSAGE_DEPTHSTENCIL, (D3DFORMAT)MAKEFOURCC('I', 'N', 'T', 'Z'), D3DPOOL_DEFAULT, &P.Tex2, nullptr))
+					|| P.Tex2 == nullptr || FAILED(P.Tex2->GetSurfaceLevel(0, &P.Surf2)) || P.Surf2 == nullptr)
+				{
+					if (P.Tex2) { P.Tex2->Release(); P.Tex2 = nullptr; }
+					return;
+				}
+				P.Surf2->Release();
+				Message("gi: the game clears depth in mid-frame (after %d draws): that part's depth is kept", Draws);
+			}
+			if (FAILED(Dev->SetDepthStencilSurface(P.Alt ? P.Surf : P.Surf2)))
+				return;
+			KeptDepth = P.Alt ? P.Tex2 : P.Tex;
+			P.Alt = !P.Alt;
+			KeptDraws = Draws;
+			KeptProj = SceneProj;
+			KeptView = SceneView;
+			// the stencil isn't carried over: the new surface starts clean
+			if ((Flags & D3DCLEAR_STENCIL) == 0)
+				Dev->Clear(0, nullptr, D3DCLEAR_STENCIL, 0, 1.0f, 0);
+			return;
+		}
 	}
 
 	IDirect3DTexture9 *DepthTexOf(IDirect3DSurface9 *Ours)
 	{
 		for (auto &It : DepthSwap)
+		{
 			if (It.second.Surf == Ours)
 				return It.second.Tex;
+			if (Ours != nullptr && It.second.Surf2 == Ours)
+				return It.second.Tex2;
+		}
 		return nullptr;
 	}
 
@@ -2759,8 +2817,12 @@ public:
 	{
 		GiReleaseTargets();
 		for (auto &It : DepthSwap)
+		{
 			if (It.second.Tex) It.second.Tex->Release();
+			if (It.second.Tex2) It.second.Tex2->Release();
+		}
 		DepthSwap.clear();
+		KeptDepth = nullptr;
 		DepthDirty = true;
 		if (GiVS) { GiVS->Release(); GiVS = nullptr; }
 		for (int i = 0; i < 5; i++)
@@ -2830,7 +2892,15 @@ public:
 	{
 		if (!Gi || GiBroken || SceneTex == nullptr)
 			return;
-		IDirect3DTexture9 *Depth = DepthTexOf(BoundDepth);
+		IDirect3DTexture9 *Depth = DepthTexOf(BoundDepth), *Over = nullptr;
+		if (Depth != nullptr && KeptDepth != nullptr && KeptDepth != Depth && KeptDraws > SegDraws)
+		{
+			// the last part of the frame was the smaller one (a first-person weapon): the world is the kept part
+			Over = Depth;
+			Depth = KeptDepth;
+			SceneProj = KeptProj;
+			SceneView = KeptView;
+		}
 		static int Told = 0;
 		if (Depth == nullptr || !SceneProjOk)
 		{
@@ -2881,8 +2951,9 @@ public:
 		Target(Dev, GiGBuf);
 		Dev->SetPixelShader(GiPS[0]);
 		SmaaSampler(Dev, 0, D3DTEXF_POINT);
+		SmaaSampler(Dev, 1, D3DTEXF_POINT);
 		Dev->SetTexture(0, Depth);
-		Dev->SetTexture(1, nullptr);
+		Dev->SetTexture(1, Over);                   // what was drawn over the world after a depth clear
 		Dev->SetTexture(2, nullptr);
 		Dev->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
 
@@ -3303,8 +3374,12 @@ public:
 		SmaaReleaseTargets();
 		GiReleaseTargets();
 		for (auto &It : DepthSwap)
+		{
 			if (It.second.Tex) It.second.Tex->Release();
+			if (It.second.Tex2) It.second.Tex2->Release();
+		}
 		DepthSwap.clear();
+		KeptDepth = nullptr;
 		DepthDirty = true;
 		if (PostQuadVB) { PostQuadVB->Release(); PostQuadVB = nullptr; }
 	}
@@ -3895,6 +3970,8 @@ public:
 			ReloadPost(IniTime.dwLowDateTime == 0 && IniTime.dwHighDateTime == 0);
 		DepthDirty = true;
 		SceneProjOk = false;
+		SegDraws = KeptDraws = 0;
+		KeptDepth = nullptr;
 		if (PostTrace > 0)
 		{
 			char end[96];

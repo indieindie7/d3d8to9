@@ -679,6 +679,7 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::EndScene()
 }
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::Clear(DWORD Count, const D3DRECT *pRects, DWORD Flags, D3DCOLOR Color, float Z, DWORD Stencil)
 {
+	U2.OnClear(ProxyInterface, Count, Flags);       // gi=1: a depth clear in mid-frame keeps the part drawn so far
 	return ProxyInterface->Clear(Count, pRects, Flags, Color, Z, Stencil);
 }
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::SetTransform(D3DTRANSFORMSTATETYPE State, const D3DMATRIX *pMatrix)
