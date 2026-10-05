@@ -84,6 +84,10 @@ struct U2Rule
 	bool KeepBlend = false;    // decal=: the draw keeps its own blending, no frame copy
 	bool Surface = false;      // surface=: solid draws only, see SurfaceBegin
 	bool Solid = false;        // glass=: a shader= rule that also takes solid (unblended) draws
+	bool Pbr = false;          // pbr=: a lit solid draw shaded by char_pbr.hlsl with a material map
+	std::string MapFile;       // pbr=: the map (normal xy, roughness, metallic), a DDS in U2Shaders
+	IDirect3DTexture9 *Map = nullptr;
+	bool MapTried = false;
 	bool Refused = false;      // surface=: an unsupported stage setup was logged once
 	float Levels[4] = {};      // surface=: the texture's brightness levels (see TextureLevels)
 	IDirect3DPixelShader9 *PS = nullptr;
@@ -171,7 +175,7 @@ public:
 				R.File = Name;
 				PsReplace[Hash] = R;
 			}
-			else if (sscanf_s(Line, " pslog=%u", &Hash) == 1)
+			else if (sscanf_s(Line, " pslog=%u", &Hash) == 1 && (PsLogCode = Hash >= 2, true))
 				PsLog = Hash != 0;
 			else if (sscanf_s(Line, " shadowtint=%f %f %f", &ShadowTint[0], &ShadowTint[1], &ShadowTint[2]) == 3)
 				;
@@ -243,6 +247,17 @@ public:
 			{
 				StageLog = Hash != 0;          // stagetrace=N: every draw of N frames (from frame 600)
 				StageTrace = (int)Hash;
+			}
+			else if (sscanf_s(Line, " pbr=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
+			{
+				// a character's (or weapon's) texture shaded as a physically based material:
+				// char_pbr.hlsl with the D3D lights the game set, and <Name> as its material map
+				U2Rule R;
+				R.Hash = Hash;
+				R.File = "char_pbr.hlsl";
+				R.MapFile = Name;
+				R.Pbr = true;
+				Rules.push_back(R);
 			}
 			else if (sscanf_s(Line, " glass=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
 			{
@@ -704,6 +719,8 @@ public:
 				Rule = &R;
 		if (Rule == nullptr)
 			return CharLight ? CharBegin(Dev, FixedFunction) : false;
+		if (Rule->Pbr)
+			return CharBegin(Dev, FixedFunction, Rule);
 		if (Rule->Surface)
 			return SurfaceBegin(Dev, *Rule, FixedFunction);
 		// only the see-through parts: an atlas is often shared with solid ones
@@ -1657,7 +1674,16 @@ public:
 	//   colour (light x material diffuse) rgb, range | attenuation 0, 1, 2, cos(theta / 2)
 	// Stage 1 keeps its own coordinates (TEXCOORD1); stages 2 and 3 carry the camera-space
 	// normal and position (TEXCOORD2/3).
-	bool CharBegin(IDirect3DDevice9 *Dev, bool FixedFunction)
+	// pbr=: the same for one texture's draws, with char_pbr.hlsl and the rule's material map on
+	// sampler 3. The game may draw these with a pixel shader of its own (Advent's characters:
+	// ps_1_1 over fixed-function vertices), which this replaces: the stages aren't looked at,
+	// the texture counts twice over (Advent's skins are drawn at double brightness).
+	DWORD CurPsHash = 0;       // the game's pixel shader for this draw (0 none), set by the device
+	float PbrDebug = 0;        // pbrdebug=N: 1 the light alone, 2 normals, 3 roughness, 4 metalness
+	IDirect3DBaseTexture9 *OldPbrTex = nullptr;
+	DWORD OldPbrSS[5] = {};
+	bool PbrBound = false;
+	bool CharBegin(IDirect3DDevice9 *Dev, bool FixedFunction, U2Rule *Pbr = nullptr)
 	{
 		DWORD Blending = 0, Lighting = 0, DiffSrc = 0, AmbSrc = 0, ColorVertex = 0;
 		Dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &Blending);
@@ -1704,20 +1730,39 @@ public:
 				Kind1 = -1;                   // no texture, or a cube map (reflections): not handled
 			if (T1) T1->Release();
 		}
-		const bool Ok = Ok0 && Kind1 >= 0 && (Kind1 == 0 && op[1] == D3DTOP_DISABLE ? true : op[2] == D3DTOP_DISABLE) && !VertexColours;
+		bool Ok = Ok0 && Kind1 >= 0 && (Kind1 == 0 && op[1] == D3DTOP_DISABLE ? true : op[2] == D3DTOP_DISABLE) && !VertexColours;
+		if (Pbr != nullptr)
+		{
+			if (!Pbr->Refused)
+				Message("pbr %08x: drawn with game ps %08x, stages %u %x %x | %u %x %x | %u, vertex colours as material %d",
+					(unsigned)Pbr->Hash, (unsigned)CurPsHash, op[0], a1[0], a2[0], op[1], a1[1], a2[1], op[2], (int)VertexColours);
+			Pbr->Refused = true;              // (told once)
+			Ok = true;
+			if (!Ok0) { Factor = 2; UseTex0 = 1; }
+			Kind1 = 0;
+		}
 		char Key[200];
 		sprintf_s(Key, "st0 op %u %x %x | st1 op %u %x %x | st2 op %u | vertex colours as material %d",
 			op[0], a1[0], a2[0], op[1], a1[1], a2[1], op[2], (int)VertexColours);
-		if (!CharRefused[Key])
+		if (Pbr == nullptr && !CharRefused[Key])
 			Message(Ok ? "charlight: taken (%s)" : "charlight: setup not supported, drawn as before (%s)", Key);
-		CharRefused[Key] = true;
+		if (Pbr == nullptr)
+			CharRefused[Key] = true;
 		if (!Ok)
 			return false;
-		IDirect3DPixelShader9 *PS = Compile(Dev, CharRule);
+		IDirect3DPixelShader9 *PS = Compile(Dev, Pbr != nullptr ? *Pbr : CharRule);
 		if (PS == nullptr)
 			return false;
+		if (Pbr != nullptr && !Pbr->MapTried)
+		{
+			Pbr->MapTried = true;
+			Pbr->Map = LoadDDS(Dev, Pbr->MapFile);
+			Message("pbr %08x: map %s %s", (unsigned)Pbr->Hash, Pbr->MapFile.c_str(), Pbr->Map ? "loaded" : "missing: flat, half rough, not metal");
+		}
 
-		float C[24][4] = {};
+		float C[32][4] = {};
+		const int MaxLights = 4;
+		int LightsOn = 0;
 		D3DMATERIAL9 M = {};
 		Dev->GetMaterial(&M);
 		D3DMATRIX V;
@@ -1743,7 +1788,8 @@ public:
 			if (FAILED(Dev->GetLightEnable(i, &On)) || !On || FAILED(Dev->GetLight(i, &L)))
 				continue;
 			AmbR += L.Ambient.r; AmbG += L.Ambient.g; AmbB += L.Ambient.b;   // lights' ambient adds up, as in D3D
-			if (Count == 4)
+			LightsOn++;
+			if (Count == MaxLights)
 				continue;                  // more than 4: their ambient still counts, their light not
 			float *P = C[8 + Count * 4];
 			Point(L.Position, P);
@@ -1773,19 +1819,53 @@ public:
 		const D3DVECTOR Up = { 0, 0, 1 };      // Unreal's up (Z) in the world space the game draws in
 		Dir(Up, C[4]);
 
-		Dev->GetPixelShader(&OldPS);
-		Dev->GetPixelShaderConstantF(0, OldCharConst[0], 24);
 		static const D3DMATRIX Identity = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
-		for (DWORD s = 2; s <= 3; s++)
+		// pbr=: stages 4 and 5 carry them, so the game's own coordinates for stages 1-3 stay
+		// (Advent's skin shader reads three more textures with them)
+		CharGen = Pbr != nullptr ? 4 : 2;
+		for (DWORD s = CharGen; s <= CharGen + 1; s++)
 		{
 			Dev->GetTextureStageState(s, D3DTSS_TEXCOORDINDEX, &OldCharTCI[s]);
 			Dev->GetTextureStageState(s, D3DTSS_TEXTURETRANSFORMFLAGS, &OldCharTTF[s]);
 			Dev->GetTransform((D3DTRANSFORMSTATETYPE)(D3DTS_TEXTURE0 + s), &OldCharTexMat[s]);
-			Dev->SetTextureStageState(s, D3DTSS_TEXCOORDINDEX, (s == 2 ? D3DTSS_TCI_CAMERASPACENORMAL : D3DTSS_TCI_CAMERASPACEPOSITION) | s);
+			Dev->SetTextureStageState(s, D3DTSS_TEXCOORDINDEX, (s == CharGen ? D3DTSS_TCI_CAMERASPACENORMAL : D3DTSS_TCI_CAMERASPACEPOSITION) | s);
 			Dev->SetTextureStageState(s, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT3);
 			Dev->SetTransform((D3DTRANSFORMSTATETYPE)(D3DTS_TEXTURE0 + s), &Identity);
 		}
-		Dev->SetPixelShaderConstantF(0, C[0], 24);
+		if (Pbr != nullptr)
+		{
+			static const D3DSAMPLERSTATETYPE SS[5] = { D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER };
+			static const DWORD Want[5] = { D3DTADDRESS_WRAP, D3DTADDRESS_WRAP, D3DTEXF_LINEAR, D3DTEXF_LINEAR, D3DTEXF_LINEAR };
+			Dev->GetTexture(4, &OldPbrTex);
+			for (int i = 0; i < 5; i++)
+			{
+				Dev->GetSamplerState(4, SS[i], &OldPbrSS[i]);
+				Dev->SetSamplerState(4, SS[i], Want[i]);
+			}
+			Dev->SetTexture(4, Pbr->Map);
+			C[5][1] = Pbr->Map != nullptr ? 1.0f : 0.0f;
+			C[5][3] = PbrDebug;
+			// Advent's skin shader (e55c6e08): a second lit layer (t1, masked by t2 . c1) and
+			// unlit parts (t3 . c2), all times c0. Its constants go along in c1, c6, c7.
+			if (CurPsHash == 0xe55c6e08)
+			{
+				float Game[3][4] = {};
+				Dev->GetPixelShaderConstantF(0, Game[0], 3);
+				memcpy(C[1], Game[0], sizeof(Game[0]));
+				memcpy(C[6], Game[1], sizeof(Game[1]));
+				memcpy(C[7], Game[2], sizeof(Game[2]));
+				C[5][2] = 1;
+			}
+			PbrBound = true;
+		}
+		Dev->GetPixelShader(&OldPS);
+		Dev->GetPixelShaderConstantF(0, OldCharConst[0], 32);
+		Dev->SetPixelShaderConstantF(0, C[0], 32);
+		if (Pbr != nullptr && !Pbr->Solid)
+		{
+			Pbr->Solid = true;                // (told once)
+			Message("pbr %08x: %d lights on (%d used), ambient %.2f %.2f %.2f, texture factor %.0f", (unsigned)Pbr->Hash, LightsOn, Count, C[3][0], C[3][1], C[3][2], Factor);
+		}
 		Dev->SetPixelShader(PS);
 		Mode = 6;
 		return true;
@@ -1806,9 +1886,18 @@ public:
 		}
 		if (Mode == 6)
 		{
+			if (PbrBound)
+			{
+				static const D3DSAMPLERSTATETYPE SS[5] = { D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER };
+				Dev->SetTexture(4, OldPbrTex);
+				for (int i = 0; i < 5; i++)
+					Dev->SetSamplerState(4, SS[i], OldPbrSS[i]);
+				if (OldPbrTex) { OldPbrTex->Release(); OldPbrTex = nullptr; }
+				PbrBound = false;
+			}
 			Dev->SetPixelShader(OldPS);
-			Dev->SetPixelShaderConstantF(0, OldCharConst[0], 24);
-			for (DWORD s = 2; s <= 3; s++)
+			Dev->SetPixelShaderConstantF(0, OldCharConst[0], 32);
+			for (DWORD s = CharGen; s <= CharGen + 1; s++)
 			{
 				Dev->SetTextureStageState(s, D3DTSS_TEXCOORDINDEX, OldCharTCI[s]);
 				Dev->SetTextureStageState(s, D3DTSS_TEXTURETRANSFORMFLAGS, OldCharTTF[s]);
@@ -1994,7 +2083,8 @@ public:
 	DWORD OldTerrTCI5 = 0, OldTerrTTF5 = 0;
 	D3DMATRIX OldTerrTexMat5 = {};
 
-	void LogGamePS(DWORD Hash, DWORD Tokens, DWORD Version)
+	bool PsLogCode = false;
+	void LogGamePS(DWORD Hash, DWORD Tokens, DWORD Version, const void *Code9 = nullptr, size_t Bytes9 = 0)
 	{
 		if (!Loaded)
 			Load();
@@ -2003,6 +2093,13 @@ public:
 		{
 			told[Hash] = true;
 			Message("game ps %08x: %u tokens, version %x%s", (unsigned)Hash, (unsigned)Tokens, (unsigned)Version, PsReplace.count(Hash) ? " (replaced)" : "");
+			// pslog=2: what it does (the D3D9 form of the game's D3D8 shader)
+			ID3DBlob *Text = nullptr;
+			if (PsLogCode && Code9 != nullptr && SUCCEEDED(D3DDisassemble(Code9, Bytes9, 0, nullptr, &Text)) && Text)
+			{
+				Message("%s", (const char *)Text->GetBufferPointer());
+				Text->Release();
+			}
 		}
 	}
 
@@ -3458,9 +3555,10 @@ public:
 
 	U2Rule CharRule;
 	std::map<std::string, bool> CharRefused;   // stage/material setups charlight= logged and left alone
-	float OldCharConst[24][4] = {};
-	DWORD OldCharTCI[4] = {}, OldCharTTF[4] = {};
-	D3DMATRIX OldCharTexMat[4] = {};
+	float OldCharConst[32][4] = {};
+	DWORD OldCharTCI[6] = {}, OldCharTTF[6] = {};
+	D3DMATRIX OldCharTexMat[6] = {};
+	DWORD CharGen = 2;         // the first of the two stages that carry normal and position
 	unsigned MapsThisFrame = 0, ProbeFrames = 0, FramesWithMaps = 0;
 	unsigned PassMap = 0, PassBlur = 0, PassProj = 0;   // pcssdebug>=5: shadow passes per 300 frames
 	struct U2Probe { unsigned Draws = 0, AfterMaps = 0, FirstFrame = 0; std::string Sample; };
@@ -3697,6 +3795,8 @@ public:
 			}
 			else if (sscanf_s(Line, " smaa=%u", &V) == 1)
 				Smaa = V != 0;
+			else if (sscanf_s(Line, " pbrdebug=%f", &PbrDebug) == 1)
+				;
 			else if (sscanf_s(Line, " gi=%u", &V) == 1)
 				Gi = V != 0;
 			else if (sscanf_s(Line, " gifx=%f %f %f %f", &GiFx[0], &GiFx[1], &GiFx[2], &GiFx[3]) >= 1)
@@ -3877,7 +3977,11 @@ public:
 	{
 		OnLost();
 		for (U2Rule &R : Rules)
+		{
 			if (R.PS != nullptr) { R.PS->Release(); R.PS = nullptr; R.Tried = false; }
+			if (R.Map != nullptr) { R.Map->Release(); R.Map = nullptr; }
+			R.MapTried = false;
+		}
 		for (U2Rule *R : { &MapRule, &ProjRule, &PostBright, &PostBlur, &PostFinal, &PostDown, &PostUp })
 			if (R->PS != nullptr) { R->PS->Release(); R->PS = nullptr; R->Tried = false; }
 		SmaaReleaseAll();

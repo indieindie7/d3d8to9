@@ -1220,6 +1220,14 @@ bool Direct3DDevice8::U2Begin()
 		sprintf_s(Key + n, sizeof(Key) - n, "blend %u %u/%u ff %d z %.2f-%.2f", Blend, Src, Dst, FixedFunction, VP.MinZ, VP.MaxZ);
 		U2.StageLogDraw(ProxyInterface, Key);
 	}
+	// pbr=: the rule's log line names the game's pixel shader for the draw
+	U2.CurPsHash = 0;
+	if (CurrentPixelShaderHandle != 0)
+	{
+		auto PsIt = U2PsHash.find(CurrentPixelShaderHandle);
+		if (PsIt != U2PsHash.end())
+			U2.CurPsHash = PsIt->second;
+	}
 	U2.RelightBegin(ProxyInterface, U2Stage0 != nullptr, FixedFunction);
 	U2.LightProbeDraw(ProxyInterface, U2Stage0 ? U2Stage0->U2Hash : 0, U2Stage0 != nullptr, FixedFunction);
 	if (CurrentPixelShaderHandle != 0 && !U2.PsReplace.empty())
@@ -2566,6 +2574,8 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::CreatePixelShader(const DWORD *pFunct
 
 	hr = ProxyInterface->CreatePixelShader(static_cast<const DWORD *>(Assembly->GetBufferPointer()), reinterpret_cast<IDirect3DPixelShader9 **>(pHandle));
 
+	// (kept for pslog=2, which prints the shader's code)
+	const std::string U2Code9(static_cast<const char *>(Assembly->GetBufferPointer()), Assembly->GetBufferSize());
 	Assembly->Release();
 
 	if (FAILED(hr))
@@ -2586,7 +2596,7 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::CreatePixelShader(const DWORD *pFunct
 				break;
 		}
 		U2PsHash[*pHandle] = Hash;
-		U2.LogGamePS(Hash, n + 1, pFunction[0]);
+		U2.LogGamePS(Hash, n + 1, pFunction[0], U2Code9.data(), U2Code9.size());
 	}
 
 	return hr;
