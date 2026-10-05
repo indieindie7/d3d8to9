@@ -4,8 +4,9 @@
 //   2 CascadePS  one cascade: for each probe and direction, what the screen shows along
 //                that direction over the cascade's stretch of pixels, merged with the next
 //                (farther, finer in angle) cascade
-//   3 ResolvePS  the nearest cascade gathered per pixel: bounce light added, corners darkened
+//   3 GatherPS   the nearest cascade gathered per pixel
 //   4 CachePS    the world cache brought up to date from this frame
+//   5 ResolvePS  the gathered light smoothed along surfaces: bounce light added, corners darkened
 //
 // The world cache (gicache=1) is what the screen can't give: a coarse grid of cells around
 // the camera (64 x 64 x 32, slices side by side in one texture) that remembers the light
@@ -132,11 +133,16 @@ float4 CascadePS(float2 uv : TEXCOORD0) : COLOR
 	float angle = 6.2831853 * (dirIndex + 0.5) / n;
 	float2 dir = float2(cos(angle), sin(angle)) * Scr.xy;
 
+	// each probe steps along its directions from its own offset: the steps' regular
+	// pattern (stripes and hatching on slopes and round things) becomes fine grain, which
+	// the resolve smooths away
+	float2 probe = floor(frac(uv * k) * tileSize);
+	float jitter = frac(52.9829189 * frac(dot(probe, float2(0.06711056, 0.00583715))));
 	float h = 0;
 	float3 light = 0;
 	for (int i = 0; i < 8; i++)
 	{
-		float t = Casc.y + Casc.z * (i + 0.5) / 8;
+		float t = Casc.y + Casc.z * (i + jitter) / 8;
 		float2 suv = puv + dir * t;
 		if (suv.x < 0 || suv.x > 1 || suv.y < 0 || suv.y > 1)
 			break;
@@ -202,38 +208,63 @@ float4 CascadePS(float2 uv : TEXCOORD0) : COLOR
 #endif
 
 #if GI_PASS == 3
-// S0 = depth + normal, S1 = the frame, S2 = the nearest cascade (2 x 2 directions)
+// S2 = the nearest cascade (2 x 2 directions): gathered per pixel, rgb the light, a the
+// part of the sky closed off
+float4 GatherPS(float2 uv : TEXCOORD0) : COLOR
+{
+	float2 tileSize = Casc.zw * 0.5;                // the cascade texture's size, 2 tiles per axis
+	float2 puv = clamp(uv, 0.5 / tileSize, 1 - 0.5 / tileSize);
+	float4 sum = 0;
+	float closed = 0;
+	for (int j = 0; j < 4; j++)
+	{
+		float2 t = float2(j % 2, j / 2);
+		float4 r = tex2Dlod(S2, float4((t + puv) * 0.5, 0, 0));
+		sum += r;
+		closed += r.a * r.a;
+	}
+	return float4(sum.rgb * 0.25, closed * 0.25);
+}
+#endif
+
+#if GI_PASS == 5
+// S0 = depth + normal, S1 = the frame, S2 = the gathered light (debug view 5: the world cache)
 float4 ResolvePS(float2 uv : TEXCOORD0) : COLOR
 {
 	float4 c = tex2D(S1, uv);
 	float4 g = tex2Dlod(S0, float4(uv, 0, 0));
 	if (g.a < 0.5)
 		return c;
-	float2 tileSize = Casc.zw * 0.5;                // the cascade texture's size, 2 tiles per axis
-	float2 puv = clamp(uv, 0.5 / tileSize, 1 - 0.5 / tileSize);
-	float4 sum = 0;
-	float open = 0;
-	for (int j = 0; j < 4; j++)
-	{
-		float2 t = float2(j % 2, j / 2);
-		float4 r = tex2Dlod(S2, float4((t + puv) * 0.5, 0, 0));
-		sum += r;
-		open += r.a * r.a;
-	}
-	float3 light = sum.rgb * 0.25;
-	float shade = 1 - Fx.y * open * 0.25;
-	// the surface's own colour, guessed from the lit frame: its hue, not its brightness
-	float3 hue = c.rgb / (max(c.r, max(c.g, c.b)) + 0.08);
 	if (Fx.w > 4.5)
 	{
 		// 5: the world cache where this pixel's surface is
 		float4 cell = CacheAt(S2, Xform(ViewPos(uv, g.x)), Grid.xyz);
 		return float4(pow(max(cell.rgb, 0), 1 / 2.2), 1);
 	}
+	// the gathered light smoothed over the pixels around that lie on the same surface (the
+	// cascades' probes are jittered: this turns their grain into an even result, and keeps
+	// it from spreading over edges)
+	float3 n = Normal(g);
+	float4 sum = 0;
+	float wsum = 0;
+	for (int y = -2; y <= 2; y++)
+		for (int x = -2; x <= 2; x++)
+		{
+			float2 o = uv + float2(x, y) * 2 * Scr.xy;
+			float4 gs = tex2Dlod(S0, float4(o, 0, 0));
+			float w = gs.a * saturate(1 - abs(gs.x - g.x) / (0.03 * g.x)) * pow(saturate(dot(Normal(gs), n)), 8) + 0.0001;
+			sum += tex2Dlod(S2, float4(o, 0, 0)) * w;
+			wsum += w;
+		}
+	sum /= wsum;
+	float3 light = sum.rgb;
+	float shade = 1 - Fx.y * sum.a;
+	// the surface's own colour, guessed from the lit frame: its hue, not its brightness
+	float3 hue = c.rgb / (max(c.r, max(c.g, c.b)) + 0.08);
 	if (Fx.w > 3.5)
 		return float4(frac(g.x / 500), 0, 0, 1);    // 4: depth, in bands of 500 units
 	if (Fx.w > 2.5)
-		return float4(Normal(g) * 0.5 + 0.5, 1);    // 3: normals
+		return float4(n * 0.5 + 0.5, 1);            // 3: normals
 	if (Fx.w > 1.5)
 		return float4(shade, shade, shade, 1);      // 2: the corner darkening alone
 	if (Fx.w > 0.5)

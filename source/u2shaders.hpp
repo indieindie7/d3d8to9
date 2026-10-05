@@ -2555,7 +2555,8 @@ public:
 	float GiCorner[3] = {};
 	bool GiCacheFresh = true;
 	IDirect3DVertexShader9 *GiVS = nullptr;
-	IDirect3DPixelShader9 *GiPS[4] = {};
+	IDirect3DPixelShader9 *GiPS[5] = {};
+	IDirect3DTexture9 *GiLight = nullptr;
 	IDirect3DVertexBuffer9 *GiVB = nullptr;
 	IDirect3DTexture9 *GiGBuf = nullptr, *GiCasc[GiCascades] = {}, *GiScene = nullptr;
 	UINT GiW = 0, GiH = 0, GiRes = 1, GiDiv = 0;    // gires=1|2: the cascades at full or half size
@@ -2632,6 +2633,7 @@ public:
 	{
 		if (GiGBuf) { GiGBuf->Release(); GiGBuf = nullptr; }
 		if (GiScene) { GiScene->Release(); GiScene = nullptr; }
+		if (GiLight) { GiLight->Release(); GiLight = nullptr; }
 		for (int i = 0; i < GiCascades; i++)
 			if (GiCasc[i]) { GiCasc[i]->Release(); GiCasc[i] = nullptr; }
 		for (int i = 0; i < 2; i++)
@@ -2648,7 +2650,7 @@ public:
 		DepthSwap.clear();
 		DepthDirty = true;
 		if (GiVS) { GiVS->Release(); GiVS = nullptr; }
-		for (int i = 0; i < 4; i++)
+		for (int i = 0; i < 5; i++)
 			if (GiPS[i]) { GiPS[i]->Release(); GiPS[i] = nullptr; }
 		if (GiVB) { GiVB->Release(); GiVB = nullptr; }
 	}
@@ -2657,7 +2659,7 @@ public:
 	{
 		if (GiBroken)
 			return false;
-		if (GiPS[3] != nullptr && GiVB != nullptr)
+		if (GiPS[4] != nullptr && GiVB != nullptr)
 			return true;
 		const std::string Lib = ReadShaderFile("gi.hlsl");
 		if (Lib.empty())
@@ -2666,8 +2668,8 @@ public:
 			GiBroken = true;
 			return false;
 		}
-		static const char *Names[5] = { "GiVS", "GBufPS", "CascadePS", "ResolvePS", "CachePS" };
-		for (int i = 0; i < 5; i++)
+		static const char *Names[6] = { "GiVS", "GBufPS", "CascadePS", "GatherPS", "CachePS", "ResolvePS" };
+		for (int i = 0; i < 6; i++)
 		{
 			char Head[96];
 			sprintf_s(Head, "#define GI_PASS %d\n#line 1 \"gi.hlsl\"\n", i == 0 ? 1 : i);
@@ -2732,7 +2734,8 @@ public:
 		{
 			GiReleaseTargets();
 			bool Ok = SUCCEEDED(Dev->CreateTexture(W, H, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &GiGBuf, nullptr))
-				&& SUCCEEDED(Dev->CreateTexture(SceneW, SceneH, 1, D3DUSAGE_RENDERTARGET, SceneFmt, D3DPOOL_DEFAULT, &GiScene, nullptr));
+				&& SUCCEEDED(Dev->CreateTexture(SceneW, SceneH, 1, D3DUSAGE_RENDERTARGET, SceneFmt, D3DPOOL_DEFAULT, &GiScene, nullptr))
+				&& SUCCEEDED(Dev->CreateTexture(SceneW, SceneH, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &GiLight, nullptr));
 			for (int i = 0; Ok && i < GiCascades; i++)
 				Ok = SUCCEEDED(Dev->CreateTexture(W, H, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &GiCasc[i], nullptr));
 			for (int i = 0; Ok && i < 2; i++)
@@ -2840,15 +2843,22 @@ public:
 			Dev->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
 		}
 
-		// 3: gathered per pixel into the lit frame, full size
+		// 3: gathered per pixel, full size
 		Dev->SetTexture(2, nullptr);
-		Target(Dev, GiScene);
+		Target(Dev, GiLight);
 		Dev->SetVertexShaderConstantF(0, full, 1);
 		Dev->SetPixelShaderConstantF(0, full, 1);
 		const float atlas[4] = { 0, 0, (float)W, (float)H };
 		Dev->SetPixelShaderConstantF(2, atlas, 1);
 		Dev->SetPixelShader(GiPS[2]);
-		Dev->SetTexture(2, GiFx[3] > 4.5f && GiCache ? GiCacheTex[GiCacheNow] : GiCasc[0]);    // debug view 5 shows the cache
+		Dev->SetTexture(2, GiCasc[0]);
+		Dev->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
+
+		// 4: smoothed along surfaces into the lit frame
+		Dev->SetTexture(2, nullptr);
+		Target(Dev, GiScene);
+		Dev->SetPixelShader(GiPS[4]);
+		Dev->SetTexture(2, GiFx[3] > 4.5f && GiCache ? GiCacheTex[GiCacheNow] : GiLight);    // debug view 5 shows the cache
 		Dev->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
 		std::swap(SceneTex, GiScene);
 		static int Ran = 0;
