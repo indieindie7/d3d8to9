@@ -739,11 +739,12 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::SetLight(DWORD Index, const D3DLIGHT8
 		}
 	}
 
-	if (U2.LightProbeFile)
 	{
 		D3DLIGHT9 L9;
 		memcpy(&L9, &Light, sizeof(L9));
-		U2.LightProbeLight(ProxyInterface, Index, L9);
+		if (U2.LightProbeFile)
+			U2.LightProbeLight(ProxyInterface, Index, L9);
+		U2.GiLightSet(Index, L9);                    // gi=1: the game's lights on the world cache
 	}
 	return ProxyInterface->SetLight(Index, &Light);
 }
@@ -754,6 +755,7 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::GetLight(DWORD Index, D3DLIGHT8 *pLig
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::LightEnable(DWORD Index, BOOL Enable)
 {
 	U2.LightProbeEnable(Index, Enable);
+	U2.GiLightEnable(Index, Enable);
 	return ProxyInterface->LightEnable(Index, Enable);
 }
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::GetLightEnable(DWORD Index, BOOL *pEnable)

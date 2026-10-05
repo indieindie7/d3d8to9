@@ -2293,6 +2293,8 @@ public:
 			SceneProj = P;                    // gi.hlsl rebuilds positions from depth with it
 			Dev->GetTransform(D3DTS_VIEW, &SceneView);
 			SceneProjOk = true;
+			if (GiSlotDirty)
+				GiGatherLights(Dev);
 		}
 		// the HUD draws without depth testing; orthographic draws that still test depth are part
 		// of the scene (in third person one came mid-frame: the post ran too early and covered
@@ -2678,8 +2680,19 @@ public:
 	int GiCacheNow = 0;
 	float GiCorner[3] = {};
 	bool GiCacheFresh = true;
+	// the cache's second half: per cell the surface's facing (world space) as last seen
+	// (same grid, same ping-pong); and the cells' light with the game's own lights added
+	// (gilights=strength count): what the cascades read
+	IDirect3DTexture9 *GiNormTex[2] = {}, *GiLitTex = nullptr;
+	float GiLightGain = 0.4f;
+	int GiLightMax = 16;
+	// the game's fixed-function lights: set by slot, and gathered from every lit draw of
+	// the frame (each light once)
+	D3DLIGHT9 GiSlot[8] = {};
+	bool GiSlotOn[8] = {}, GiSlotDirty = true;
+	std::vector<D3DLIGHT9> GiFrameLights;
 	IDirect3DVertexShader9 *GiVS = nullptr;
-	IDirect3DPixelShader9 *GiPS[5] = {};
+	IDirect3DPixelShader9 *GiPS[7] = {};
 	IDirect3DTexture9 *GiLight = nullptr;
 	IDirect3DVertexBuffer9 *GiVB = nullptr;
 	IDirect3DTexture9 *GiGBuf = nullptr, *GiCasc[GiCascades] = {}, *GiScene = nullptr;
@@ -2800,6 +2813,51 @@ public:
 		DS->Release();
 	}
 
+	// the device's SetLight / LightEnable (gi=1)
+	void GiLightSet(DWORD Index, const D3DLIGHT9 &L)
+	{
+		if (Index < 8) { GiSlot[Index] = L; GiSlotDirty = true; }
+	}
+	void GiLightEnable(DWORD Index, BOOL On)
+	{
+		if (Index < 8) { GiSlotOn[Index] = On != FALSE; GiSlotDirty = true; }
+	}
+
+	// a lit draw of the world: its lights into this frame's list, each once (fixed-function
+	// lights are in world space)
+	void GiGatherLights(IDirect3DDevice9 *Dev)
+	{
+		if (!Gi)
+			return;
+		GiSlotDirty = false;
+		DWORD Lit = 0;
+		if (FAILED(Dev->GetRenderState(D3DRS_LIGHTING, &Lit)) || !Lit)
+		{
+			GiSlotDirty = true;                         // look again at the next draw
+			return;
+		}
+		for (int i = 0; i < 8; i++)
+		{
+			if (!GiSlotOn[i])
+				continue;
+			const D3DLIGHT9 &L = GiSlot[i];
+			if (L.Type != D3DLIGHT_POINT && L.Type != D3DLIGHT_SPOT && L.Type != D3DLIGHT_DIRECTIONAL)
+				continue;
+			if (L.Diffuse.r + L.Diffuse.g + L.Diffuse.b < 0.01f)
+				continue;
+			bool Seen = false;
+			for (const D3DLIGHT9 &O : GiFrameLights)
+				if (O.Type == L.Type && fabsf(O.Position.x - L.Position.x) < 1 && fabsf(O.Position.y - L.Position.y) < 1 && fabsf(O.Position.z - L.Position.z) < 1
+					&& fabsf(O.Direction.x - L.Direction.x) < 0.01f && fabsf(O.Direction.y - L.Direction.y) < 0.01f && fabsf(O.Diffuse.r - L.Diffuse.r) < 0.01f)
+				{
+					Seen = true;
+					break;
+				}
+			if (!Seen && GiFrameLights.size() < 64)
+				GiFrameLights.push_back(L);
+		}
+	}
+
 	void GiReleaseTargets()
 	{
 		if (GiGBuf) { GiGBuf->Release(); GiGBuf = nullptr; }
@@ -2808,7 +2866,11 @@ public:
 		for (int i = 0; i < GiCascades; i++)
 			if (GiCasc[i]) { GiCasc[i]->Release(); GiCasc[i] = nullptr; }
 		for (int i = 0; i < 2; i++)
+		{
 			if (GiCacheTex[i]) { GiCacheTex[i]->Release(); GiCacheTex[i] = nullptr; }
+			if (GiNormTex[i]) { GiNormTex[i]->Release(); GiNormTex[i] = nullptr; }
+		}
+		if (GiLitTex) { GiLitTex->Release(); GiLitTex = nullptr; }
 		GiCacheFresh = true;
 		GiW = GiH = 0;
 	}
@@ -2825,7 +2887,7 @@ public:
 		KeptDepth = nullptr;
 		DepthDirty = true;
 		if (GiVS) { GiVS->Release(); GiVS = nullptr; }
-		for (int i = 0; i < 5; i++)
+		for (int i = 0; i < 7; i++)
 			if (GiPS[i]) { GiPS[i]->Release(); GiPS[i] = nullptr; }
 		if (GiVB) { GiVB->Release(); GiVB = nullptr; }
 	}
@@ -2834,7 +2896,7 @@ public:
 	{
 		if (GiBroken)
 			return false;
-		if (GiPS[4] != nullptr && GiVB != nullptr)
+		if (GiPS[6] != nullptr && GiVB != nullptr)
 			return true;
 		const std::string Lib = ReadShaderFile("gi.hlsl");
 		if (Lib.empty())
@@ -2843,8 +2905,8 @@ public:
 			GiBroken = true;
 			return false;
 		}
-		static const char *Names[6] = { "GiVS", "GBufPS", "CascadePS", "GatherPS", "CachePS", "ResolvePS" };
-		for (int i = 0; i < 6; i++)
+		static const char *Names[8] = { "GiVS", "GBufPS", "CascadePS", "GatherPS", "CachePS", "ResolvePS", "CacheNormalPS", "LightPS" };
+		for (int i = 0; i < 8; i++)
 		{
 			char Head[96];
 			sprintf_s(Head, "#define GI_PASS %d\n#line 1 \"gi.hlsl\"\n", i == 0 ? 1 : i);
@@ -2922,7 +2984,9 @@ public:
 			for (int i = 0; Ok && i < GiCascades; i++)
 				Ok = SUCCEEDED(Dev->CreateTexture(W, H, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &GiCasc[i], nullptr));
 			for (int i = 0; Ok && i < 2; i++)
-				Ok = SUCCEEDED(Dev->CreateTexture(512, 256, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &GiCacheTex[i], nullptr));
+				Ok = SUCCEEDED(Dev->CreateTexture(512, 256, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &GiCacheTex[i], nullptr))
+					&& SUCCEEDED(Dev->CreateTexture(512, 256, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &GiNormTex[i], nullptr));
+			Ok = Ok && SUCCEEDED(Dev->CreateTexture(512, 256, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &GiLitTex, nullptr));
 			GiCacheFresh = true;
 			if (!Ok)
 			{
@@ -2980,6 +3044,8 @@ public:
 				// nothing remembered yet: the texture it reads from starts empty
 				Target(Dev, GiCacheTex[GiCacheNow]);
 				Dev->Clear(0, nullptr, D3DCLEAR_TARGET, 0, 1.0f, 0);
+				Target(Dev, GiNormTex[GiCacheNow]);
+				Dev->Clear(0, nullptr, D3DCLEAR_TARGET, 0, 1.0f, 0);
 				Target(Dev, GiCacheTex[1 - GiCacheNow]);
 				memcpy(gridOld, grid, 3 * sizeof(float));
 				GiCacheFresh = false;
@@ -2995,8 +3061,47 @@ public:
 			SmaaSampler(Dev, 2, D3DTEXF_POINT);
 			Dev->SetTexture(2, GiCacheTex[GiCacheNow]);
 			Dev->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
+			// the surfaces' facing, the same way
+			Dev->SetTexture(2, nullptr);
+			Target(Dev, GiNormTex[1 - GiCacheNow]);
+			Dev->SetPixelShader(GiPS[5]);
+			Dev->SetTexture(2, GiNormTex[GiCacheNow]);
+			Dev->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
 			Dev->SetTexture(2, nullptr);
 			GiCacheNow = 1 - GiCacheNow;
+			// the game's lights on the cells (c10 gain + count; per light c11+i position + range,
+			// c43+i colour + 1 if directional, c75+i direction)
+			{
+				float head[4] = { GiLightGain, 0, 0, 0 };
+				int n = 0;
+				for (const D3DLIGHT9 &L : GiFrameLights)
+				{
+					if (n >= GiLightMax || n >= 32)
+						break;
+					const bool dir = L.Type == D3DLIGHT_DIRECTIONAL;
+					const float a[4] = { L.Position.x, L.Position.y, L.Position.z, dir ? 0.0f : L.Range };
+					const float b[4] = { L.Diffuse.r, L.Diffuse.g, L.Diffuse.b, dir ? 1.0f : 0.0f };
+					const float c[4] = { L.Direction.x, L.Direction.y, L.Direction.z, 0 };
+					Dev->SetPixelShaderConstantF(11 + n, a, 1);
+					Dev->SetPixelShaderConstantF(43 + n, b, 1);
+					Dev->SetPixelShaderConstantF(75 + n, c, 1);
+					n++;
+				}
+				head[1] = (float)n;
+				Dev->SetPixelShaderConstantF(10, head, 1);
+				static int Told = 0;
+				if (n > 0 && Told++ < 3)
+					Message("gi: %d of the game's lights on the world cache (%d this frame, gain %.2f)", n, (int)GiFrameLights.size(), GiLightGain);
+				Target(Dev, GiLitTex);
+				Dev->SetPixelShader(GiPS[6]);
+				Dev->SetTexture(0, GiCacheTex[GiCacheNow]);
+				Dev->SetTexture(1, GiNormTex[GiCacheNow]);
+				SmaaSampler(Dev, 0, D3DTEXF_POINT);
+				SmaaSampler(Dev, 1, D3DTEXF_POINT);
+				Dev->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
+				Dev->SetTexture(0, nullptr);
+				Dev->SetTexture(1, nullptr);
+			}
 			memcpy(GiCorner, grid, 3 * sizeof(float));
 			Dev->SetVertexShaderConstantF(0, half, 1);
 			Dev->SetPixelShaderConstantF(0, half, 1);
@@ -3023,7 +3128,7 @@ public:
 			Dev->SetPixelShaderConstantF(2, casc, 1);
 			Dev->SetTexture(2, nullptr);
 			Target(Dev, GiCasc[c]);
-			Dev->SetTexture(2, c < GiCascades - 1 ? GiCasc[c + 1] : (GiCache ? GiCacheTex[GiCacheNow] : nullptr));
+			Dev->SetTexture(2, c < GiCascades - 1 ? GiCasc[c + 1] : (GiCache ? GiLitTex : nullptr));
 			Dev->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
 		}
 
@@ -3042,7 +3147,7 @@ public:
 		Dev->SetTexture(2, nullptr);
 		Target(Dev, GiScene);
 		Dev->SetPixelShader(GiPS[4]);
-		Dev->SetTexture(2, GiFx[3] > 4.5f && GiCache ? GiCacheTex[GiCacheNow] : GiLight);    // debug view 5 shows the cache
+		Dev->SetTexture(2, GiFx[3] > 4.5f && GiCache ? GiLitTex : GiLight);    // debug view 5 shows the cache (with the game's lights)
 		Dev->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
 		std::swap(SceneTex, GiScene);
 		static int Ran = 0;
@@ -3894,6 +3999,8 @@ public:
 				;
 			else if (sscanf_s(Line, " gires=%u", &V) == 1)
 				GiRes = V >= 2 ? 2 : 1;
+			else if (sscanf_s(Line, " gilights=%f %d", &GiLightGain, &GiLightMax) >= 1)
+				GiLightMax = (std::min)((std::max)(GiLightMax, 0), 32);
 			else if (sscanf_s(Line, " gicache=%u", &V) == 1)
 				GiCache = V != 0;
 			else if (sscanf_s(Line, " gicell=%f", &GiCell) == 1)
@@ -3970,6 +4077,8 @@ public:
 			ReloadPost(IniTime.dwLowDateTime == 0 && IniTime.dwHighDateTime == 0);
 		DepthDirty = true;
 		SceneProjOk = false;
+		GiFrameLights.clear();
+		GiSlotDirty = true;
 		SegDraws = KeptDraws = 0;
 		KeptDepth = nullptr;
 		if (PostTrace > 0)
