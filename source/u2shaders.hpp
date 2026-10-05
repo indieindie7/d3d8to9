@@ -250,6 +250,9 @@ public:
 			}
 			else if (sscanf_s(Line, " pbr=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
 			{
+				// (after the map: highlight strength and normal map strength, 1 1 if left out)
+				float Spec = 1, Bump = 1;
+				sscanf_s(Line, " pbr=%*x %*s %f %f", &Spec, &Bump);
 				// a character's (or weapon's) texture shaded as a physically based material:
 				// char_pbr.hlsl with the D3D lights the game set, and <Name> as its material map
 				U2Rule R;
@@ -257,6 +260,8 @@ public:
 				R.File = "char_pbr.hlsl";
 				R.MapFile = Name;
 				R.Pbr = true;
+				R.Levels[0] = Spec;
+				R.Levels[1] = Bump;
 				Rules.push_back(R);
 			}
 			else if (sscanf_s(Line, " glass=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
@@ -1844,6 +1849,8 @@ public:
 			}
 			Dev->SetTexture(4, Pbr->Map);
 			C[5][1] = Pbr->Map != nullptr ? 1.0f : 0.0f;
+			C[2][2] = Pbr->Levels[0];
+			C[2][3] = Pbr->Levels[1];
 			C[5][3] = PbrDebug;
 			// Advent's skin shader (e55c6e08): a second lit layer (t1, masked by t2 . c1) and
 			// unlit parts (t3 . c2), all times c0. Its constants go along in c1, c6, c7.
