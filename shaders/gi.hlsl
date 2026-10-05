@@ -5,6 +5,15 @@
 //                that direction over the cascade's stretch of pixels, merged with the next
 //                (farther, finer in angle) cascade
 //   3 ResolvePS  the nearest cascade gathered per pixel: bounce light added, corners darkened
+//   4 CachePS    the world cache brought up to date from this frame
+//
+// The world cache (gicache=1) is what the screen can't give: a coarse grid of cells around
+// the camera (64 x 64 x 32, slices side by side in one texture) that remembers the light
+// seen on the surfaces in each cell over the last frames. A cell on screen takes the
+// frame's colour where the depth buffer says a surface is in it, empties where it is seen
+// to be air, and keeps what it had while hidden or off screen. The farthest cascade ends
+// its directions in the cache, so light from behind the camera or behind a pillar still
+// arrives, for as long as the cache remembers it.
 //
 // Radiance cascades (Sannikov, Path of Exile 2): light from near needs many probes but few
 // directions, light from far few probes but many directions. Cascade c has probes every
@@ -24,6 +33,38 @@ float4 Casc : register(c2);     // tiles per axis k, stretch start (pixels), str
                                 // (the resolve: 0, 0, the cascade texture's w, h)
 float4 Scr : register(c3);      // the frame's 1/w, 1/h, w, h
 float4 Fx : register(c4);       // bounce strength, corner darkening, reach (world units), debug view
+float4 Mat0 : register(c5);     // a matrix's columns (row vectors: x' = dot(float4(p, 1), Mat0)): the
+float4 Mat1 : register(c6);     // camera's inverse view in the cascade and resolve passes, its view in
+float4 Mat2 : register(c7);     // the cache pass
+float4 Grid : register(c8);     // the cache's lowest corner (world), its cell size
+float4 GridOld : register(c9);  // last frame's corner, 1 = the cache is on
+
+static const float3 GridN = float3(64, 64, 32);
+static const float2 GridTiles = float2(8, 4);
+
+float3 Xform(float3 p)
+{
+	float4 q = float4(p, 1);
+	return float3(dot(q, Mat0), dot(q, Mat1), dot(q, Mat2));
+}
+
+float3 Rotate(float3 v)
+{
+	return float3(dot(v, Mat0.xyz), dot(v, Mat1.xyz), dot(v, Mat2.xyz));
+}
+
+// the cache at a world position (s = its sampler), between the two nearest slices
+float4 CacheAt(sampler s, float3 world, float3 corner)
+{
+	float3 g = (world - corner) / Grid.w;
+	if (any(g < 0.5) || any(g > GridN - 0.5))
+		return 0;
+	float2 inTile = clamp(g.xy / GridN.xy, 0.5 / GridN.xy, 1 - 0.5 / GridN.xy);
+	float z = g.z - 0.5, z0 = floor(z);
+	float2 t0 = float2(fmod(z0, GridTiles.x), floor(z0 / GridTiles.x));
+	float2 t1 = float2(fmod(z0 + 1, GridTiles.x), floor((z0 + 1) / GridTiles.x));
+	return lerp(tex2Dlod(s, float4((t0 + inTile) / GridTiles, 0, 0)), tex2Dlod(s, float4((t1 + inTile) / GridTiles, 0, 0)), z - z0);
+}
 
 sampler S0 : register(s0);
 sampler S1 : register(s1);
@@ -75,7 +116,7 @@ float3 Normal(float4 g)
 }
 
 #if GI_PASS == 2
-// S0 = depth + normal, S1 = the frame, S2 = the next cascade
+// S0 = depth + normal, S1 = the frame, S2 = the next cascade (the farthest: the world cache)
 float4 CascadePS(float2 uv : TEXCOORD0) : COLOR
 {
 	float k = Casc.x, n = k * k;
@@ -133,11 +174,28 @@ float4 CascadePS(float2 uv : TEXCOORD0) : COLOR
 			up += tex2Dlod(S2, float4((float2(tx, ty) + puvU) / ku, 0, 0));
 		}
 		up *= 0.25;
-		if (up.a > h)
+		// the farther light fills what is still open above this stretch's horizon
+		light += up.rgb * (1 - h * h);
+		h = max(h, up.a);
+	}
+	else if (GridOld.w > 0.5)
+	{
+		// the farthest cascade: what is still open ends in the world cache, a few steps out
+		// along the middle of the open part of this direction's slice of the sky
+		float3 d3 = float3(cos(angle), -sin(angle), 0);
+		float3 tangent = normalize(d3 - n0 * dot(d3, n0));
+		float sinE = 0.5 * (h + 1), cosE = sqrt(1 - sinE * sinE);
+		float3 dirW = Rotate(tangent * cosE + n0 * sinE);
+		float3 p0W = Xform(p0);
+		float3 far = 0;
+		float cover = 0;
+		for (int m = 0; m < 5; m++)
 		{
-			light += up.rgb * (up.a * up.a - h * h) / max(up.a * up.a, 0.0001);
-			h = up.a;
+			float4 cell = CacheAt(S2, p0W + dirW * Grid.w * (1.5 + 1.75 * m * (1 + 0.5 * m)), Grid.xyz);
+			far += (1 - cover) * cell.rgb;
+			cover += (1 - cover) * cell.a;
 		}
+		light += far * (1 - h * h);
 	}
 	return float4(light, h);
 }
@@ -166,6 +224,12 @@ float4 ResolvePS(float2 uv : TEXCOORD0) : COLOR
 	float shade = 1 - Fx.y * open * 0.25;
 	// the surface's own colour, guessed from the lit frame: its hue, not its brightness
 	float3 hue = c.rgb / (max(c.r, max(c.g, c.b)) + 0.08);
+	if (Fx.w > 4.5)
+	{
+		// 5: the world cache where this pixel's surface is
+		float4 cell = CacheAt(S2, Xform(ViewPos(uv, g.x)), Grid.xyz);
+		return float4(pow(max(cell.rgb, 0), 1 / 2.2), 1);
+	}
 	if (Fx.w > 3.5)
 		return float4(frac(g.x / 500), 0, 0, 1);    // 4: depth, in bands of 500 units
 	if (Fx.w > 2.5)
@@ -176,5 +240,40 @@ float4 ResolvePS(float2 uv : TEXCOORD0) : COLOR
 		return float4(pow(max(light, 0), 1 / 2.2), 1);      // 1: the gathered light alone
 	float3 lit = pow(max(c.rgb, 0), 2.2) * shade + pow(max(hue, 0), 2.2) * light * Fx.x;
 	return float4(pow(max(lit, 0), 1 / 2.2), c.a);
+}
+#endif
+
+#if GI_PASS == 4
+// S0 = depth + normal, S1 = the frame, S2 = the cache as it was
+float4 CachePS(float2 uv : TEXCOORD0) : COLOR
+{
+	// this texel's cell, and where its middle is in the world
+	float2 t = uv * GridTiles;
+	float2 tile = floor(t);
+	float3 cellIndex = float3(floor(frac(t) * GridN.xy), tile.y * GridTiles.x + tile.x);
+	float3 world = Grid.xyz + (cellIndex + 0.5) * Grid.w;
+	// what it remembered (the grid may have stepped since)
+	float3 go = (world - GridOld.xyz) / Grid.w;
+	float4 old = 0;
+	if (all(go > 0) && all(go < GridN))
+	{
+		float3 ci = floor(go);
+		old = tex2Dlod(S2, float4((float2(fmod(ci.z, GridTiles.x), floor(ci.z / GridTiles.x)) + (ci.xy + 0.5) / GridN.xy) / GridTiles, 0, 0));
+	}
+	float3 v = Xform(world);
+	if (v.z > 4)
+	{
+		float2 suv = float2(0.5 + 0.5 * v.x * Proj.x / v.z, 0.5 - 0.5 * v.y * Proj.y / v.z);
+		if (suv.x > 0 && suv.x < 1 && suv.y > 0 && suv.y < 1)
+		{
+			float4 g = tex2Dlod(S0, float4(suv, 0, 0));
+			float dz = g.a < 0.5 ? -1e6 : v.z - g.x;
+			if (abs(dz) < Grid.w * 0.75)
+				return lerp(old, float4(pow(max(tex2Dlod(S1, float4(suv, 0, 0)).rgb, 0), 2.2), 1), 0.12);
+			if (dz < 0)
+				return old * 0.85;              // seen to be air
+		}
+	}
+	return old * 0.999;                         // hidden or off screen: remembered
 }
 #endif

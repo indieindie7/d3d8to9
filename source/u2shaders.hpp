@@ -2176,6 +2176,7 @@ public:
 		if (Gi && !programmable && !rhw && P._34 == 1.0f && P._44 == 0.0f)
 		{
 			SceneProj = P;                    // gi.hlsl rebuilds positions from depth with it
+			Dev->GetTransform(D3DTS_VIEW, &SceneView);
 			SceneProjOk = true;
 		}
 		// the HUD draws without depth testing; orthographic draws that still test depth are part
@@ -2301,7 +2302,7 @@ public:
 		DWORD RS[sizeof(PostRS) / sizeof(PostRS[0])] = {};
 		DWORD SS[3][sizeof(PostSS) / sizeof(PostSS[0])] = {};
 		DWORD TCI[3] = {}, TTF[3] = {};
-		float Const[6][4] = {};
+		float Const[12][4] = {};
 		float VConst[4] = {};
 
 		void Save(IDirect3DDevice9 *Dev)
@@ -2325,7 +2326,7 @@ public:
 			}
 			for (size_t i = 0; i < sizeof(PostRS) / sizeof(PostRS[0]); i++)
 				Dev->GetRenderState(PostRS[i], &RS[i]);
-			Dev->GetPixelShaderConstantF(0, Const[0], 6);
+			Dev->GetPixelShaderConstantF(0, Const[0], 12);
 			Dev->GetVertexShaderConstantF(0, VConst, 1);
 		}
 
@@ -2352,7 +2353,7 @@ public:
 			}
 			for (size_t i = 0; i < sizeof(PostRS) / sizeof(PostRS[0]); i++)
 				Dev->SetRenderState(PostRS[i], RS[i]);
-			Dev->SetPixelShaderConstantF(0, Const[0], 6);
+			Dev->SetPixelShaderConstantF(0, Const[0], 12);
 			Dev->SetVertexShaderConstantF(0, VConst, 1);
 		}
 
@@ -2544,10 +2545,17 @@ public:
 	static const int GiCascades = 4;
 	struct DepthPair { IDirect3DTexture9 *Tex; IDirect3DSurface9 *Surf; UINT W, H; };
 	std::map<IDirect3DSurface9 *, DepthPair> DepthSwap;     // the game's depth surface -> ours
-	D3DMATRIX SceneProj = {};
+	D3DMATRIX SceneProj = {}, SceneView = {};
 	bool SceneProjOk = false;
+	// the world cache (gicache=1, gicell=world units): see gi.hlsl
+	bool GiCache = true;
+	float GiCell = 64.0f;
+	IDirect3DTexture9 *GiCacheTex[2] = {};
+	int GiCacheNow = 0;
+	float GiCorner[3] = {};
+	bool GiCacheFresh = true;
 	IDirect3DVertexShader9 *GiVS = nullptr;
-	IDirect3DPixelShader9 *GiPS[3] = {};
+	IDirect3DPixelShader9 *GiPS[4] = {};
 	IDirect3DVertexBuffer9 *GiVB = nullptr;
 	IDirect3DTexture9 *GiGBuf = nullptr, *GiCasc[GiCascades] = {}, *GiScene = nullptr;
 	UINT GiW = 0, GiH = 0, GiRes = 1, GiDiv = 0;    // gires=1|2: the cascades at full or half size
@@ -2626,6 +2634,9 @@ public:
 		if (GiScene) { GiScene->Release(); GiScene = nullptr; }
 		for (int i = 0; i < GiCascades; i++)
 			if (GiCasc[i]) { GiCasc[i]->Release(); GiCasc[i] = nullptr; }
+		for (int i = 0; i < 2; i++)
+			if (GiCacheTex[i]) { GiCacheTex[i]->Release(); GiCacheTex[i] = nullptr; }
+		GiCacheFresh = true;
 		GiW = GiH = 0;
 	}
 
@@ -2637,7 +2648,7 @@ public:
 		DepthSwap.clear();
 		DepthDirty = true;
 		if (GiVS) { GiVS->Release(); GiVS = nullptr; }
-		for (int i = 0; i < 3; i++)
+		for (int i = 0; i < 4; i++)
 			if (GiPS[i]) { GiPS[i]->Release(); GiPS[i] = nullptr; }
 		if (GiVB) { GiVB->Release(); GiVB = nullptr; }
 	}
@@ -2646,7 +2657,7 @@ public:
 	{
 		if (GiBroken)
 			return false;
-		if (GiPS[2] != nullptr && GiVB != nullptr)
+		if (GiPS[3] != nullptr && GiVB != nullptr)
 			return true;
 		const std::string Lib = ReadShaderFile("gi.hlsl");
 		if (Lib.empty())
@@ -2655,8 +2666,8 @@ public:
 			GiBroken = true;
 			return false;
 		}
-		static const char *Names[4] = { "GiVS", "GBufPS", "CascadePS", "ResolvePS" };
-		for (int i = 0; i < 4; i++)
+		static const char *Names[5] = { "GiVS", "GBufPS", "CascadePS", "ResolvePS", "CachePS" };
+		for (int i = 0; i < 5; i++)
 		{
 			char Head[96];
 			sprintf_s(Head, "#define GI_PASS %d\n#line 1 \"gi.hlsl\"\n", i == 0 ? 1 : i);
@@ -2724,6 +2735,9 @@ public:
 				&& SUCCEEDED(Dev->CreateTexture(SceneW, SceneH, 1, D3DUSAGE_RENDERTARGET, SceneFmt, D3DPOOL_DEFAULT, &GiScene, nullptr));
 			for (int i = 0; Ok && i < GiCascades; i++)
 				Ok = SUCCEEDED(Dev->CreateTexture(W, H, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &GiCasc[i], nullptr));
+			for (int i = 0; Ok && i < 2; i++)
+				Ok = SUCCEEDED(Dev->CreateTexture(512, 256, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &GiCacheTex[i], nullptr));
+			GiCacheFresh = true;
 			if (!Ok)
 			{
 				Message("gi: targets couldn't be made (%ux%u), global illumination off", SceneW, SceneH);
@@ -2756,6 +2770,58 @@ public:
 		Dev->SetTexture(2, nullptr);
 		Dev->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
 
+		// the world cache: its grid follows the camera in whole cells; every cell is brought
+		// up to date from this frame into the other texture
+		SmaaSampler(Dev, 1, D3DTEXF_LINEAR);
+		Dev->SetTexture(0, GiGBuf);
+		Dev->SetTexture(1, SceneTex);
+		const D3DMATRIX Inv = InvView(SceneView);
+		float grid[4] = { 0, 0, 0, GiCell }, gridOld[4] = { GiCorner[0], GiCorner[1], GiCorner[2], GiCache ? 1.0f : 0.0f };
+		static const float GridN[3] = { 64, 64, 32 };
+		for (int a = 0; a < 3; a++)
+			grid[a] = (floorf(Inv.m[3][a] / GiCell) - GridN[a] * 0.5f) * GiCell;
+		if (GiCache)
+		{
+			const float cachePx[4] = { 1.0f / 512, 1.0f / 256, 512, 256 };
+			const float v0[4] = { SceneView._11, SceneView._21, SceneView._31, SceneView._41 };
+			const float v1[4] = { SceneView._12, SceneView._22, SceneView._32, SceneView._42 };
+			const float v2[4] = { SceneView._13, SceneView._23, SceneView._33, SceneView._43 };
+			Dev->SetTexture(2, nullptr);
+			Target(Dev, GiCacheTex[1 - GiCacheNow]);
+			if (GiCacheFresh)
+			{
+				// nothing remembered yet: the texture it reads from starts empty
+				Target(Dev, GiCacheTex[GiCacheNow]);
+				Dev->Clear(0, nullptr, D3DCLEAR_TARGET, 0, 1.0f, 0);
+				Target(Dev, GiCacheTex[1 - GiCacheNow]);
+				memcpy(gridOld, grid, 3 * sizeof(float));
+				GiCacheFresh = false;
+			}
+			Dev->SetVertexShaderConstantF(0, cachePx, 1);
+			Dev->SetPixelShaderConstantF(0, cachePx, 1);
+			Dev->SetPixelShaderConstantF(5, v0, 1);
+			Dev->SetPixelShaderConstantF(6, v1, 1);
+			Dev->SetPixelShaderConstantF(7, v2, 1);
+			Dev->SetPixelShaderConstantF(8, grid, 1);
+			Dev->SetPixelShaderConstantF(9, gridOld, 1);
+			Dev->SetPixelShader(GiPS[3]);
+			SmaaSampler(Dev, 2, D3DTEXF_POINT);
+			Dev->SetTexture(2, GiCacheTex[GiCacheNow]);
+			Dev->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
+			Dev->SetTexture(2, nullptr);
+			GiCacheNow = 1 - GiCacheNow;
+			memcpy(GiCorner, grid, 3 * sizeof(float));
+			Dev->SetVertexShaderConstantF(0, half, 1);
+			Dev->SetPixelShaderConstantF(0, half, 1);
+		}
+		// from here on the matrix is the camera's inverse view: view space to world
+		const float i0[4] = { Inv._11, Inv._21, Inv._31, Inv._41 }, i1[4] = { Inv._12, Inv._22, Inv._32, Inv._42 }, i2[4] = { Inv._13, Inv._23, Inv._33, Inv._43 };
+		Dev->SetPixelShaderConstantF(5, i0, 1);
+		Dev->SetPixelShaderConstantF(6, i1, 1);
+		Dev->SetPixelShaderConstantF(7, i2, 1);
+		Dev->SetPixelShaderConstantF(8, grid, 1);
+		Dev->SetPixelShaderConstantF(9, gridOld, 1);
+
 		// 2: the cascades, the farthest first, each merging the one before
 		Dev->SetPixelShader(GiPS[1]);
 		SmaaSampler(Dev, 1, D3DTEXF_LINEAR);
@@ -2770,7 +2836,7 @@ public:
 			Dev->SetPixelShaderConstantF(2, casc, 1);
 			Dev->SetTexture(2, nullptr);
 			Target(Dev, GiCasc[c]);
-			Dev->SetTexture(2, c < GiCascades - 1 ? GiCasc[c + 1] : nullptr);
+			Dev->SetTexture(2, c < GiCascades - 1 ? GiCasc[c + 1] : (GiCache ? GiCacheTex[GiCacheNow] : nullptr));
 			Dev->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
 		}
 
@@ -2782,7 +2848,7 @@ public:
 		const float atlas[4] = { 0, 0, (float)W, (float)H };
 		Dev->SetPixelShaderConstantF(2, atlas, 1);
 		Dev->SetPixelShader(GiPS[2]);
-		Dev->SetTexture(2, GiCasc[0]);
+		Dev->SetTexture(2, GiFx[3] > 4.5f && GiCache ? GiCacheTex[GiCacheNow] : GiCasc[0]);    // debug view 5 shows the cache
 		Dev->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
 		std::swap(SceneTex, GiScene);
 		static int Ran = 0;
@@ -3627,6 +3693,13 @@ public:
 				;
 			else if (sscanf_s(Line, " gires=%u", &V) == 1)
 				GiRes = V >= 2 ? 2 : 1;
+			else if (sscanf_s(Line, " gicache=%u", &V) == 1)
+				GiCache = V != 0;
+			else if (sscanf_s(Line, " gicell=%f", &GiCell) == 1)
+			{
+				GiCell = (std::min)((std::max)(GiCell, 16.0f), 512.0f);
+				GiCacheFresh = true;
+			}
 			else if (sscanf_s(Line, " gibase=%f", &GiBase) == 1)
 				GiBase = (std::min)((std::max)(GiBase, 2.0f), 32.0f);
 			else if (sscanf_s(Line, " bloomchain=%u", &V) == 1)
