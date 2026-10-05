@@ -1688,6 +1688,7 @@ public:
 	IDirect3DBaseTexture9 *OldPbrTex = nullptr;
 	DWORD OldPbrSS[5] = {};
 	bool PbrBound = false;
+	float PbrLayer = 0;        // pbr=: stage 1 multiplies a second texture on, by this factor
 	bool CharBegin(IDirect3DDevice9 *Dev, bool FixedFunction, U2Rule *Pbr = nullptr)
 	{
 		DWORD Blending = 0, Lighting = 0, DiffSrc = 0, AmbSrc = 0, ColorVertex = 0;
@@ -1744,6 +1745,9 @@ public:
 			Pbr->Refused = true;              // (told once)
 			Ok = true;
 			if (!Ok0) { Factor = 2; UseTex0 = 1; }
+			// a second texture multiplied on (AdventMod's blood-stained skins: the skin
+			// times a blood texture) is kept; anything else on stage 1 isn't
+			PbrLayer = Kind1 == 1 && CurPsHash == 0 ? Factor1 : 0;
 			Kind1 = 0;
 		}
 		char Key[200];
@@ -1854,6 +1858,11 @@ public:
 			C[5][3] = PbrDebug;
 			// Advent's skin shader (e55c6e08): a second lit layer (t1, masked by t2 . c1) and
 			// unlit parts (t3 . c2), all times c0. Its constants go along in c1, c6, c7.
+			if (PbrLayer > 0)
+			{
+				C[5][2] = 2;
+				C[1][3] = PbrLayer;
+			}
 			if (CurPsHash == 0xe55c6e08)
 			{
 				float Game[3][4] = {};
