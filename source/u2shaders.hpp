@@ -2287,9 +2287,9 @@ public:
 		Dev->GetTransform(D3DTS_PROJECTION, &P);
 		const bool rhw = (fvf & D3DFVF_POSITION_MASK) == D3DFVF_XYZRHW;
 		const bool ortho = !programmable && !rhw && P._34 == 0.0f && P._44 == 1.0f;
-		if (Gi && !rhw && !ortho)
+		if (NeedDepth() && !rhw && !ortho)
 			SegDraws++;                       // the size of this part of the frame (OnClear)
-		if (Gi && DepthDirty)
+		if (NeedDepth() && DepthDirty)
 			DepthLazySwap(Dev);
 		if (U2Msaa::Wanted() != 0 && !programmable && !rhw && P._34 == 1.0f && P._44 == 0.0f)
 		{
@@ -2325,9 +2325,9 @@ public:
 					(void *)RT, R.Width, R.Height, (unsigned)R.MultiSampleType, (void *)BB, (unsigned)B.MultiSampleType, (void *)DS, (unsigned)D.MultiSampleType, (unsigned)MS);
 			}
 		}
-		if (Gi && !programmable && !rhw && P._34 == 1.0f && P._44 == 0.0f)
+		if (NeedDepth() && !programmable && !rhw && P._34 == 1.0f && P._44 == 0.0f)
 		{
-			SceneProj = P;                    // gi.hlsl rebuilds positions from depth with it
+			SceneProj = P;                    // gi.hlsl / ssao.hlsl rebuild positions from depth with it
 			Dev->GetTransform(D3DTS_VIEW, &SceneView);
 			SceneProjOk = true;
 			if (GiSlotDirty)
@@ -2606,6 +2606,7 @@ public:
 			}
 			Dev->SetTexture(1, nullptr);
 			RunGi(Dev, Saved.DS);
+			RunSsao(Dev, Saved.DS);
 			IDirect3DTexture9 *AAFrame = RunSmaa(Dev);
 
 			float c[6][4] = {};
@@ -2739,7 +2740,7 @@ public:
 	// when it can't be swapped (multisampled, an unknown format, or the card has no INTZ)
 	IDirect3DSurface9 *DepthFor(IDirect3DDevice9 *Dev, IDirect3DSurface9 *Game)
 	{
-		if (!Gi || DepthBroken || Game == nullptr || U2Msaa::Wanted() != 0)    // msaa: a multisampled scene's depth can't be read
+		if (!NeedDepth() || DepthBroken || Game == nullptr || U2Msaa::Wanted() != 0)    // msaa: a multisampled scene's depth can't be read
 			return Game;
 		auto It = DepthSwap.find(Game);
 		if (It != DepthSwap.end())
@@ -3025,7 +3026,7 @@ public:
 	// the device's Clear, before it happens: a depth clear in mid-frame (see DepthPair)
 	void OnClear(IDirect3DDevice9 *Dev, DWORD Count, DWORD Flags)
 	{
-		if (!Gi || DepthBroken || Count != 0 || (Flags & D3DCLEAR_ZBUFFER) == 0 || (Flags & D3DCLEAR_TARGET) != 0)
+		if (!NeedDepth() || DepthBroken || Count != 0 || (Flags & D3DCLEAR_ZBUFFER) == 0 || (Flags & D3DCLEAR_TARGET) != 0)
 			return;
 		const int Draws = SegDraws;
 		SegDraws = 0;
@@ -3448,6 +3449,230 @@ public:
 			SmaaSampler(Dev, t, D3DTEXF_LINEAR);
 		Dev->SetTexture(1, nullptr);
 		Dev->SetTexture(2, nullptr);
+	}
+
+	// ---- screen-space ambient occlusion (ssao=1) -------------------------------------------
+	// ssao.hlsl on the frame copy, after gi and before SMAA: corners, wall feet and the ground
+	// under things darken, by how much of the space around each point the depth buffer shows
+	// filled (Scalable Ambient Obscurance). Much lighter than gi=1 (no cascades, no cache) and
+	// independent of it: it uses the same readable depth (DepthFor swaps the game's depth surface
+	// for an INTZ texture when gi or ssao is on) and the same mid-frame depth-clear handling
+	// (the first-person weapon is left alone). ssaofx=strength radius intensity debug
+	// (default 0.8 40 1 0; radius in world units, debug 1 shows the AO alone); ssaores=1|2:
+	// the AO at full or half size (default half).
+	bool Ssao = false, SsaoBroken = false;
+	float SsaoFx[4] = { 0.8f, 40.0f, 1.0f, 0.0f };
+	UINT SsaoRes = 2, SsaoW = 0, SsaoH = 0, SsaoDiv = 0;
+	IDirect3DVertexShader9 *SsaoVS = nullptr;
+	IDirect3DPixelShader9 *SsaoPS[4] = {};
+	IDirect3DTexture9 *SsaoGBuf = nullptr, *SsaoA = nullptr, *SsaoB = nullptr, *SsaoOut = nullptr;
+	IDirect3DVertexBuffer9 *SsaoVB = nullptr;
+
+	bool NeedDepth() const { return Gi || Ssao; }
+
+	void SsaoReleaseTargets()
+	{
+		IDirect3DTexture9 **All[] = { &SsaoGBuf, &SsaoA, &SsaoB, &SsaoOut };
+		for (IDirect3DTexture9 **T : All)
+			if (*T) { (*T)->Release(); *T = nullptr; }
+		SsaoW = SsaoH = 0;
+	}
+
+	void SsaoReleaseAll()
+	{
+		SsaoReleaseTargets();
+		if (SsaoVS) { SsaoVS->Release(); SsaoVS = nullptr; }
+		if (SsaoVB) { SsaoVB->Release(); SsaoVB = nullptr; }
+		for (int i = 0; i < 4; i++)
+			if (SsaoPS[i]) { SsaoPS[i]->Release(); SsaoPS[i] = nullptr; }
+	}
+
+	bool SsaoBuild(IDirect3DDevice9 *Dev)
+	{
+		if (SsaoBroken)
+			return false;
+		if (SsaoPS[3] != nullptr)
+			return true;
+		const std::string Lib = ReadShaderFile("ssao.hlsl");
+		if (Lib.empty())
+		{
+			Message("ssao: ssao.hlsl missing in U2Shaders, ambient occlusion off");
+			SsaoBroken = true;
+			return false;
+		}
+		static const char *Names[5] = { "SsaoVS", "GBufPS", "AoPS", "BlurPS", "ApplyPS" };
+		for (int i = 0; i < 5; i++)
+		{
+			char Head[96];
+			sprintf_s(Head, "#define SSAO_PASS %d\n#line 1 \"ssao.hlsl\"\n", i == 0 ? 1 : i);
+			const std::string Src = std::string(Head) + Lib;
+			ID3DBlob *Code = nullptr, *Errors = nullptr;
+			const HRESULT hr = D3DCompile(Src.data(), Src.size(), "ssao", nullptr, nullptr, Names[i], i == 0 ? "vs_3_0" : "ps_3_0",
+				D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &Code, &Errors);
+			if (FAILED(hr) || Code == nullptr)
+			{
+				Message("ssao: %s failed: %s", Names[i], Errors ? (const char *)Errors->GetBufferPointer() : "?");
+				if (Errors) Errors->Release();
+				if (Code) Code->Release();
+				SsaoBroken = true;
+				return false;
+			}
+			if (Errors) Errors->Release();
+			const HRESULT cr = i == 0 ? Dev->CreateVertexShader((const DWORD *)Code->GetBufferPointer(), &SsaoVS)
+				: Dev->CreatePixelShader((const DWORD *)Code->GetBufferPointer(), &SsaoPS[i - 1]);
+			Code->Release();
+			if (FAILED(cr))
+			{
+				Message("ssao: the card refused %s (%08x)", Names[i], (unsigned)cr);
+				SsaoBroken = true;
+				return false;
+			}
+		}
+		Message("ssao: ready");
+		return true;
+	}
+
+	// the passes; afterwards SceneTex is the darkened frame (the copy and the result trade
+	// places). Leaves the post chain's own vertex setup behind it, as RunGi does.
+	void RunSsao(IDirect3DDevice9 *Dev, IDirect3DSurface9 *BoundDepth)
+	{
+		if (!Ssao || SsaoBroken || SceneTex == nullptr)
+			return;
+		IDirect3DTexture9 *Depth = DepthTexOf(BoundDepth), *Over = nullptr;
+		if (Depth != nullptr && KeptDepth != nullptr && KeptDepth != Depth && KeptDraws > SegDraws)
+		{
+			// the last part of the frame was the smaller one (a first-person weapon): the world is the kept part
+			Over = Depth;
+			Depth = KeptDepth;
+			SceneProj = KeptProj;
+			SceneView = KeptView;
+		}
+		static int Told = 0;
+		if (Depth == nullptr || !SceneProjOk)
+		{
+			if (Told++ < 3)
+				Message("ssao: skipped (%s)", Depth == nullptr ? "the scene's depth isn't one of the readable ones yet" : "no perspective projection seen");
+			return;
+		}
+		D3DSURFACE_DESC DD = {};
+		Depth->GetLevelDesc(0, &DD);
+		if (DD.Width != SceneW || DD.Height != SceneH || !SsaoBuild(Dev))
+			return;
+		if (SsaoVB == nullptr)
+		{
+			// the clip-space quad (as gi's)
+			const SmaaVertex q[4] = { { -1, 1, 0, 0, 0 }, { 1, 1, 0, 1, 0 }, { -1, -1, 0, 0, 1 }, { 1, -1, 0, 1, 1 } };
+			void *Mem = nullptr;
+			if (FAILED(Dev->CreateVertexBuffer(sizeof(q), D3DUSAGE_WRITEONLY, D3DFVF_XYZ | D3DFVF_TEX1, D3DPOOL_MANAGED, &SsaoVB, nullptr))
+				|| FAILED(SsaoVB->Lock(0, sizeof(q), &Mem, 0)))
+			{
+				if (SsaoVB) { SsaoVB->Release(); SsaoVB = nullptr; }
+				Message("ssao: the quad couldn't be made, ambient occlusion off");
+				SsaoBroken = true;
+				return;
+			}
+			memcpy(Mem, q, sizeof(q));
+			SsaoVB->Unlock();
+		}
+		const UINT W = (std::max)(SceneW / SsaoRes, 8u), H = (std::max)(SceneH / SsaoRes, 8u);
+		if (SsaoOut == nullptr || SsaoW != SceneW || SsaoH != SceneH || SsaoDiv != SsaoRes)
+		{
+			SsaoReleaseTargets();
+			const bool Ok = SUCCEEDED(Dev->CreateTexture(W, H, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &SsaoGBuf, nullptr))
+				&& SUCCEEDED(Dev->CreateTexture(W, H, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &SsaoA, nullptr))
+				&& SUCCEEDED(Dev->CreateTexture(W, H, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &SsaoB, nullptr))
+				&& SUCCEEDED(Dev->CreateTexture(SceneW, SceneH, 1, D3DUSAGE_RENDERTARGET, SceneFmt, D3DPOOL_DEFAULT, &SsaoOut, nullptr));
+			if (!Ok)
+			{
+				Message("ssao: targets couldn't be made (%ux%u), ambient occlusion off", SceneW, SceneH);
+				SsaoReleaseTargets();
+				SsaoBroken = true;
+				return;
+			}
+			SsaoW = SceneW;
+			SsaoH = SceneH;
+			SsaoDiv = SsaoRes;
+		}
+		const float small[4] = { 1.0f / W, 1.0f / H, (float)W, (float)H };
+		const float full[4] = { 1.0f / SceneW, 1.0f / SceneH, (float)SceneW, (float)SceneH };
+		const float proj[4] = { SceneProj._11, SceneProj._22, SceneProj._33, SceneProj._43 };
+		// stage 3 isn't part of the post chain's saved state: put it back afterwards
+		static const D3DSAMPLERSTATETYPE Samp3[6] = { D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DSAMP_SRGBTEXTURE };
+		DWORD Old3[6] = {};
+		IDirect3DBaseTexture9 *OldTex3 = nullptr;
+		Dev->GetTexture(3, &OldTex3);
+		for (int i = 0; i < 6; i++)
+			Dev->GetSamplerState(3, Samp3[i], &Old3[i]);
+		Dev->SetFVF(D3DFVF_XYZ | D3DFVF_TEX1);
+		Dev->SetStreamSource(0, SsaoVB, 0, sizeof(SmaaVertex));
+		Dev->SetVertexShader(SsaoVS);
+		Dev->SetVertexShaderConstantF(0, small, 1);
+		Dev->SetPixelShaderConstantF(0, small, 1);
+		Dev->SetPixelShaderConstantF(1, proj, 1);
+		Dev->SetPixelShaderConstantF(3, full, 1);
+		Dev->SetPixelShaderConstantF(4, SsaoFx, 1);
+		for (DWORD t = 0; t < 4; t++)
+			SmaaSampler(Dev, t, D3DTEXF_POINT);
+		Dev->SetTexture(2, nullptr);
+		Dev->SetTexture(3, nullptr);
+
+		// 1: depth and normals
+		Target(Dev, SsaoGBuf);
+		Dev->SetPixelShader(SsaoPS[0]);
+		Dev->SetTexture(0, Depth);
+		Dev->SetTexture(1, Over);
+		Dev->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
+		Dev->SetTexture(1, nullptr);
+
+		// 2: the occlusion
+		Target(Dev, SsaoA);
+		Dev->SetPixelShader(SsaoPS[1]);
+		Dev->SetTexture(0, SsaoGBuf);
+		Dev->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
+
+		// 3: blurred across, then down
+		Dev->SetPixelShader(SsaoPS[2]);
+		const float across[4] = { 1.0f / W, 0, 0, 0 }, down[4] = { 0, 1.0f / H, 0, 0 };
+		Target(Dev, SsaoB);
+		Dev->SetTexture(0, SsaoA);
+		Dev->SetPixelShaderConstantF(2, across, 1);
+		Dev->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
+		Dev->SetTexture(0, nullptr);
+		Target(Dev, SsaoA);
+		Dev->SetTexture(0, SsaoB);
+		Dev->SetPixelShaderConstantF(2, down, 1);
+		Dev->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
+
+		// 4: the frame darkened, full size
+		Target(Dev, SsaoOut);
+		Dev->SetVertexShaderConstantF(0, full, 1);
+		Dev->SetPixelShaderConstantF(0, full, 1);
+		Dev->SetPixelShaderConstantF(2, small, 1);
+		Dev->SetPixelShader(SsaoPS[3]);
+		Dev->SetTexture(0, Depth);
+		Dev->SetTexture(1, SceneTex);
+		Dev->SetTexture(2, SsaoA);
+		Dev->SetTexture(3, Over);
+		Dev->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
+		std::swap(SceneTex, SsaoOut);
+		static int Ran = 0;
+		if (Ran++ < 1)
+			Message("ssao: running (%ux%u, AO %ux%u, strength %.2f, radius %.0f, intensity %.2f)",
+				SceneW, SceneH, W, H, SsaoFx[0], SsaoFx[1], SsaoFx[2]);
+
+		// back to the post chain's setup
+		Dev->SetVertexShader(nullptr);
+		Dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+		Dev->SetStreamSource(0, PostQuadVB, 0, sizeof(U2QuadVertex));
+		for (DWORD t = 0; t < 3; t++)
+			SmaaSampler(Dev, t, D3DTEXF_LINEAR);
+		Dev->SetTexture(0, nullptr);
+		Dev->SetTexture(1, nullptr);
+		Dev->SetTexture(2, nullptr);
+		Dev->SetTexture(3, OldTex3);
+		if (OldTex3) OldTex3->Release();
+		for (int i = 0; i < 6; i++)
+			Dev->SetSamplerState(3, Samp3[i], Old3[i]);
 	}
 
 	// ---- SMAA 1x (smaa=1 by default, smaa=0 off) -------------------------------------------
@@ -4332,6 +4557,16 @@ public:
 				Gi = V != 0;
 			else if (sscanf_s(Line, " gifx=%f %f %f %f", &GiFx[0], &GiFx[1], &GiFx[2], &GiFx[3]) >= 1)
 				;
+			else if (sscanf_s(Line, " ssao=%u", &V) == 1)
+			{
+				if ((V != 0) != Ssao)
+					DepthDirty = true;
+				Ssao = V != 0;
+			}
+			else if (sscanf_s(Line, " ssaofx=%f %f %f %f", &SsaoFx[0], &SsaoFx[1], &SsaoFx[2], &SsaoFx[3]) >= 1)
+				SsaoFx[1] = (std::max)(SsaoFx[1], 4.0f);
+			else if (sscanf_s(Line, " ssaores=%u", &V) == 1)
+				SsaoRes = V >= 2 ? 2 : 1;
 			else if (sscanf_s(Line, " gires=%u", &V) == 1)
 				GiRes = V >= 2 ? 2 : 1;
 			else if (sscanf_s(Line, " gilights=%f %d", &GiLightGain, &GiLightMax) >= 1)
@@ -4524,6 +4759,7 @@ public:
 		SmaaReleaseAll();
 		SmaaBroken = false;
 		GiReleaseAll();
+		SsaoReleaseAll();
 		GiBroken = false;
 		DepthBroken = false;
 		// managed textures survive a reset but belong to this device: the game makes a new device
