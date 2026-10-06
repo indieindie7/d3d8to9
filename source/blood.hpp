@@ -7,8 +7,9 @@
 // splashes outward when something steps in it. The mod drives it with commands through
 // AdventNative -> the exported U2BloodCommand():
 //
-//   pool K size gx gy       start slot K: a pool `size` world units across, floor slope gx, gy
-//                           (height per unit along the texture's U and V), sheet cleared
+//   pool K size gx gy kind  start slot K: a pool `size` world units across, floor slope gx, gy
+//                           (height per unit along the texture's U and V), kind 0 red / 1 purple
+//   wet K u v               1 if there is blood at (u, v) (returned, not logged)
 //   pour K u v rate secs    blood pours in at (u, v) in 0..1, `rate` sheet volume/s for secs
 //   stamp K u v du dv r     something moves through: at (u, v) with velocity (du, dv) in
 //                           texture units/s and radius r (texture units), the blood under it
@@ -52,6 +53,7 @@ namespace U2Blood
 		float H2[N * N], Hu2[N * N], Hv2[N * N];  // the write buffer of a step
 		float B[N * N];                            // the bed: the floor's slope
 		float PourU = 0.5f, PourV = 0.5f, PourRate = 0, PourLeft = 0;
+		int Kind = 0;                              // 0 red (human), 1 purple (Seeker)
 		float Still = 0;                           // seconds without motion
 		IDirect3DTexture9 *Tex = nullptr;
 	};
@@ -93,10 +95,18 @@ namespace U2Blood
 		Sheet &S = Slots[K];
 		if (!_stricmp(Word, "pool"))
 		{
-			S.Used = true; S.Size = A > 1 ? A : 100; S.Gx = Bq; S.Gy = C;
+			S.Used = true; S.Size = A > 1 ? A : 100; S.Gx = Bq; S.Gy = C; S.Kind = (int)D;
 			Clear(S);
-			Say("blood: slot %d a pool %.0f units across, slope %.3f %.3f", K, S.Size, S.Gx, S.Gy);
+			Say("blood: slot %d a pool %.0f units across, slope %.3f %.3f, kind %d", K, S.Size, S.Gx, S.Gy, S.Kind);
 			return 1;
+		}
+		if (!_stricmp(Word, "wet"))
+		{
+			// is there blood at (u, v)? (the mod asks before giving a walker bloody feet)
+			const int i = (int)(A * N), j = (int)(Bq * N);
+			if (i < 0 || j < 0 || i >= N || j >= N)
+				return 0;
+			return S.H[j * N + i] > 0.05f ? 1 : 0;
 		}
 		if (!S.Used)
 			return 0;
@@ -271,9 +281,10 @@ namespace U2Blood
 				cov = cov * cov * (3 - 2 * cov);
 				const float deep = fmaxf(0.0f, fminf(1.0f, d / 1.0f));
 				const float k = 1.0f - 0.45f * deep;
-				const int r = (int)(128 * (1 - cov) + 76 * k * cov + 0.5f);
-				const int g = (int)(128 * (1 - cov) + 16 * k * cov + 0.5f);
-				const int b = (int)(128 * (1 - cov) + 13 * k * cov + 0.5f);
+				const float cr = S.Kind == 1 ? 70 : 76, cg = S.Kind == 1 ? 24 : 16, cb = S.Kind == 1 ? 108 : 13;   // the bake's colours
+				const int r = (int)(128 * (1 - cov) + cr * k * cov + 0.5f);
+				const int g = (int)(128 * (1 - cov) + cg * k * cov + 0.5f);
+				const int b = (int)(128 * (1 - cov) + cb * k * cov + 0.5f);
 				const int a = (int)(250 * cov + 0.5f);
 				row[i] = (DWORD)a << 24 | r << 16 | g << 8 | b;
 			}
