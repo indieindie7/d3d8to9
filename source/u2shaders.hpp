@@ -54,6 +54,7 @@
 #pragma once
 
 #include "msaa.hpp"
+#include "blood.hpp"
 #include <d3dcompiler.h>
 #include "fakefull.hpp"
 #include <algorithm>
@@ -285,6 +286,8 @@ public:
 			}
 			else if (sscanf_s(Line, " replace=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
 				Replacements[Hash].File = Name;
+			else if (sscanf_s(Line, " bloodlive=%x", &Hash) == 1)
+				U2Blood::AddHash(Hash);             // a live blood pool's placeholder texture (blood.hpp), slot order
 			else if (sscanf_s(Line, " surface=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
 			{
 				U2Rule R;
@@ -569,9 +572,17 @@ public:
 	{
 		if (!Loaded)
 			Load();
-		if (Replacements.empty() || Tex == nullptr)
+		if (Tex == nullptr || (Replacements.empty() && U2Blood::Count == 0))
 			return nullptr;
 		Known(Tex, Hash);
+		if (U2Blood::Count > 0 && Seen.count(Hash) && Seen[Hash].W == 64 && Seen[Hash].H == 64)
+		{
+			static std::set<DWORD> Told64;
+			if (Told64.insert(Hash).second)
+				Message("blood: a 64x64 texture %08x (format %u) drawn, slot %d", (unsigned)Hash, (unsigned)Seen[Hash].Fmt, U2Blood::SlotOf(Hash));
+		}
+		if (IDirect3DTexture9 *Live = U2Blood::TextureFor(Dev, Hash))
+			return Live;                        // a live blood pool (blood.hpp)
 		const auto It = Replacements.find(Hash);
 		if (It == Replacements.end())
 			return nullptr;
@@ -4645,6 +4656,8 @@ public:
 	{
 		if (Loaded && Frame % 10 == 0)
 			ReloadPost(IniTime.dwLowDateTime == 0 && IniTime.dwHighDateTime == 0);
+		if (U2Blood::Count > 0)
+			U2Blood::Step(Dev);
 		DepthDirty = true;
 		SceneProjOk = false;
 		GiFrameLights.clear();
@@ -4734,6 +4747,7 @@ public:
 	// Before the device is reset or destroyed: default-pool objects must go
 	void OnLost()
 	{
+		U2Blood::Release();
 		MapViews.clear();
 		MapTarget = nullptr;
 		ClearBlurSources();

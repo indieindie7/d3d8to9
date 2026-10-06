@@ -12,6 +12,10 @@
 #include "u2shaders.hpp"
 
 static U2Shaders U2;
+// blood.hpp logs through the layer's log, and the mod's native DLL reaches it by this export
+static void U2BloodLog(const char *S) { U2.Message("%s", S); }
+static int U2BloodLogSet = (U2Blood::Log = U2BloodLog, 0);
+extern "C" __declspec(dllexport) int __cdecl U2BloodCommand(const char *Cmd) { return U2Blood::Command(Cmd); }
 bool U2WantsBuffers()
 {
 	if (!U2.Loaded)
