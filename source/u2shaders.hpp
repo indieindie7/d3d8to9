@@ -1400,12 +1400,14 @@ public:
 			IDirect3DBaseTexture9 *F2 = nullptr;
 			const bool Cube = SUCCEEDED(Dev->GetTexture(2, &F2)) && F2 && F2->GetType() == D3DRTYPE_CUBETEXTURE;
 			if (F2) F2->Release();
+			// pcss_proj.hlsl doesn't read stage 2 any more, so a projector with a plain texture
+			// there (Advent) is taken over too. Leaving it to the engine while the map pass was
+			// still replaced projected the map's red height channel onto the floor (2026-10-05).
 			if (!Cube)
 			{
 				static int toldCube = 0;
-				if (toldCube++ < 4)
-					Message("pcss: projector whose stage 2 isn't a cube map, left stock\n");
-				return false;
+				if (toldCube++ < 2)
+					Message("pcss: projector whose stage 2 isn't a cube map (taken over all the same)\n");
 			}
 		}
 		if (proj && PcssDebug > 2.5)
