@@ -3593,7 +3593,7 @@ public:
 			SsaoH = SceneH;
 			SsaoDiv = SsaoRes;
 		}
-		const float small[4] = { 1.0f / W, 1.0f / H, (float)W, (float)H };
+		const float SmallTex[4] = { 1.0f / W, 1.0f / H, (float)W, (float)H };
 		const float full[4] = { 1.0f / SceneW, 1.0f / SceneH, (float)SceneW, (float)SceneH };
 		const float proj[4] = { SceneProj._11, SceneProj._22, SceneProj._33, SceneProj._43 };
 		// stage 3 isn't part of the post chain's saved state: put it back afterwards
@@ -3606,8 +3606,8 @@ public:
 		Dev->SetFVF(D3DFVF_XYZ | D3DFVF_TEX1);
 		Dev->SetStreamSource(0, SsaoVB, 0, sizeof(SmaaVertex));
 		Dev->SetVertexShader(SsaoVS);
-		Dev->SetVertexShaderConstantF(0, small, 1);
-		Dev->SetPixelShaderConstantF(0, small, 1);
+		Dev->SetVertexShaderConstantF(0, SmallTex, 1);
+		Dev->SetPixelShaderConstantF(0, SmallTex, 1);
 		Dev->SetPixelShaderConstantF(1, proj, 1);
 		Dev->SetPixelShaderConstantF(3, full, 1);
 		Dev->SetPixelShaderConstantF(4, SsaoFx, 1);
@@ -3647,7 +3647,7 @@ public:
 		Target(Dev, SsaoOut);
 		Dev->SetVertexShaderConstantF(0, full, 1);
 		Dev->SetPixelShaderConstantF(0, full, 1);
-		Dev->SetPixelShaderConstantF(2, small, 1);
+		Dev->SetPixelShaderConstantF(2, SmallTex, 1);
 		Dev->SetPixelShader(SsaoPS[3]);
 		Dev->SetTexture(0, Depth);
 		Dev->SetTexture(1, SceneTex);
