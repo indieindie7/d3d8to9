@@ -20,6 +20,7 @@ float4    Setup : register(c1);   // the game's stage setup, read by the fork pe
                                   // x stage 0 colour 0 tex, 1 tex x diffuse, 2 tex x diffuse x 2
                                   // y stage 1 colour 0 unchanged, 1 x mask, 2 x mask x 2
                                   // z alpha 0 stage 0's, 1 x mask alpha, 2 mask alpha only;  w stage 1 used
+float4    Setup0 : register(c2);  // x stage 0 alpha: 0 texture, 1 texture x diffuse, 2 diffuse, 3 texture x diffuse x 2
 
 #define HEX 1                      // 0: plain read (checks the replication against the stock look)
 #define CELL 1.5                   // texture repeats per hex
@@ -66,7 +67,7 @@ float4 main(float2 uv : TEXCOORD0, float2 uvm : TEXCOORD1, float4 diffuse : COLO
 	float4 t = tex2D(Layer, uv);
 #endif
 	float3 c = Setup.x > 0.5 ? t.rgb * diffuse.rgb * Setup.x : t.rgb;
-	float a = t.a * diffuse.a;
+	float a = Setup0.x < 0.5 ? t.a : (Setup0.x < 1.5 ? t.a * diffuse.a : (Setup0.x < 2.5 ? diffuse.a : saturate(t.a * diffuse.a * 2)));
 	if (Setup.w > 0.5)
 	{
 		float4 m = tex2D(Mask, uvm);

@@ -843,10 +843,18 @@ public:
 	//   c1.y stage 1 colour: 0 unchanged, 1 x alpha map, 2 x alpha map x 2
 	//   c1.z alpha: 0 stage 0's (texture alpha x diffuse alpha), 1 that x alpha map alpha, 2 alpha map alpha
 	//   c1.w 1 when stage 1 is used (s1/TEXCOORD1 valid)
+	//   c2.x stage 0 alpha: 0 texture, 1 texture x diffuse, 2 diffuse, 3 texture x diffuse x 2
+	// Stage 2 must be off; game vertex shaders and render-to-texture passes are left alone.
 	// Setups outside that are left to the game (logged once per hash and setup).
-	std::map<std::string, bool> LayerSeen;
-	bool LayerBegin(IDirect3DDevice9 *Dev, U2Rule &Rule)
+	std::set<std::pair<DWORD, unsigned long long>> LayerSeen;   // (hash, packed stage setup) already logged
+	bool LayerBegin(IDirect3DDevice9 *Dev, U2Rule &Rule, bool FixedFunction)
 	{
+		if (!FixedFunction || Offscreen(Dev))       // a game vertex shader, or a render-to-texture pass: stock
+			return false;
+		DWORD c2op = 0, a0a1 = 0, a0a2 = 0;
+		Dev->GetTextureStageState(2, D3DTSS_COLOROP, &c2op);
+		Dev->GetTextureStageState(0, D3DTSS_ALPHAARG1, &a0a1);
+		Dev->GetTextureStageState(0, D3DTSS_ALPHAARG2, &a0a2);
 		DWORD c0op = 0, c0a1 = 0, c0a2 = 0, a0op = 0, c1op = 0, c1a1 = 0, c1a2 = 0, a1op = 0, a1a1 = 0, a1a2 = 0, ttf0 = 0, ttf1 = 0;
 		Dev->GetTextureStageState(0, D3DTSS_COLOROP, &c0op);
 		Dev->GetTextureStageState(0, D3DTSS_COLORARG1, &c0a1);
@@ -866,7 +874,14 @@ public:
 		if (c0op == D3DTOP_SELECTARG1 && c0a1 == D3DTA_TEXTURE) C1[0] = 0;
 		else if (c0op == D3DTOP_MODULATE && texdif) C1[0] = 1;
 		else if (c0op == D3DTOP_MODULATE2X && texdif) C1[0] = 2;
-		bool ok = C1[0] >= 0 && a0op != D3DTOP_DISABLE && !(ttf0 & D3DTTFF_PROJECTED) && !(ttf1 & D3DTTFF_PROJECTED);
+		// stage 0 alpha (c2.x): 0 texture, 1 texture x diffuse, 2 diffuse, 3 texture x diffuse x 2
+		float C2[4] = { -1, 0, 0, 0 };
+		bool atexdif = (a0a1 == D3DTA_TEXTURE && a0a2 == D3DTA_DIFFUSE) || (a0a1 == D3DTA_DIFFUSE && a0a2 == D3DTA_TEXTURE);
+		if ((a0op == D3DTOP_SELECTARG1 && a0a1 == D3DTA_TEXTURE) || (a0op == D3DTOP_SELECTARG2 && a0a2 == D3DTA_TEXTURE)) C2[0] = 0;
+		else if (a0op == D3DTOP_MODULATE && atexdif) C2[0] = 1;
+		else if ((a0op == D3DTOP_SELECTARG1 && a0a1 == D3DTA_DIFFUSE) || (a0op == D3DTOP_SELECTARG2 && a0a2 == D3DTA_DIFFUSE)) C2[0] = 2;
+		else if (a0op == D3DTOP_MODULATE2X && atexdif) C2[0] = 3;
+		bool ok = C1[0] >= 0 && C2[0] >= 0 && c2op == D3DTOP_DISABLE && !(ttf0 & D3DTTFF_PROJECTED) && !(ttf1 & D3DTTFF_PROJECTED);
 		IDirect3DBaseTexture9 *t1 = nullptr;
 		Dev->GetTexture(1, &t1);
 		bool st1 = c1op != D3DTOP_DISABLE && t1 != nullptr;
@@ -885,14 +900,18 @@ public:
 			else ok = false;
 			C1[3] = 1;
 		}
-		char Key[160];
-		sprintf_s(Key, "layer %08x: st0 %u(%u,%u) a%u | st1 %s %u(%u,%u) a%u(%u,%u) | ttf %u %u -> %s", Rule.Hash, c0op, c0a1, c0a2, a0op,
-			st1 ? "on" : "off", c1op, c1a1, c1a2, a1op, a1a1, a1a2, ttf0, ttf1, ok ? "shader" : "left to the game");
-		if (!LayerSeen[Key])
-		{
-			LayerSeen[Key] = true;
-			Message("%s (c1 %.0f %.0f %.0f %.0f)", Key, C1[0], C1[1], C1[2], C1[3]);
-		}
+		// the message only when this setup is new for this texture (a packed key: every value is < 32 but the flags)
+		unsigned long long K = 0;
+		const DWORD Vals[13] = { c0op, c0a1, c0a2, a0op, a0a1, a0a2, c1op, c1a1, c1a2, a1op, a1a1, a1a2, c2op };
+		for (DWORD v : Vals)
+			K = K * 32 + (v & 31);
+		K = K * 4 + (ttf0 & 3);
+		K = K * 4 + (ttf1 & 3);
+		K = K * 2 + (st1 ? 1 : 0);
+		if (LayerSeen.insert(std::make_pair(Rule.Hash, K)).second)
+			Message("layer %08x: st0 %u(%u,%u) a%u(%u,%u) | st1 %s %u(%u,%u) a%u(%u,%u) | st2 %u | ttf %u %u -> %s (c1 %.0f %.0f %.0f %.0f, c2 %.0f)",
+				Rule.Hash, c0op, c0a1, c0a2, a0op, a0a1, a0a2, st1 ? "on" : "off", c1op, c1a1, c1a2, a1op, a1a1, a1a2, c2op, ttf0, ttf1,
+				ok ? "shader" : "left to the game", C1[0], C1[1], C1[2], C1[3], C2[0]);
 		if (!ok)
 			return false;
 		IDirect3DPixelShader9 *PS = Compile(Dev, Rule);
@@ -903,6 +922,7 @@ public:
 		float C0[4] = { (GetTickCount() % 3600000) / 1000.0f, 1.0f, SceneW ? 1.0f / SceneW : 0, SceneH ? 1.0f / SceneH : 0 };
 		Dev->SetPixelShaderConstantF(0, C0, 1);
 		Dev->SetPixelShaderConstantF(1, C1, 1);
+		Dev->SetPixelShaderConstantF(2, C2, 1);
 		Dev->SetPixelShader(PS);
 		Mode = 8;
 		return true;
@@ -963,7 +983,7 @@ public:
 		if (Rule->Surface)
 			return SurfaceBegin(Dev, *Rule, FixedFunction);
 		if (Rule->Layer)
-			return LayerBegin(Dev, *Rule);
+			return LayerBegin(Dev, *Rule, FixedFunction);
 		// only the see-through parts: an atlas is often shared with solid ones
 		DWORD Blending = 0;
 		Dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &Blending);
