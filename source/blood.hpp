@@ -10,7 +10,8 @@
 //   pool K size gx gy kind  start slot K: a pool `size` world units across, floor slope gx, gy
 //                           (height per unit along the texture's U and V), kind 0 red / 1 purple
 //   wet K u v               1 if there is blood at (u, v) (returned, not logged)
-//   pour K u v rate secs    blood pours in at (u, v) in 0..1, `rate` sheet volume/s for secs
+//   pour K u v rate secs kind  a body pours in at (u, v) in 0..1, `rate` sheet volume/s for secs (up to 8 at once)
+//   bed K u v r h           something lies in the blood: the bed rises under it (radius r, height h)
 //   stamp K u v du dv r     something moves through: at (u, v) with velocity (du, dv) in
 //                           texture units/s and radius r (texture units), the blood under it
 //                           takes its velocity and is pushed to the ring around it
@@ -29,12 +30,13 @@
 namespace U2Blood
 {
 	const int MaxSlots = 8;
-	const int N = 64;                          // cells across a sheet (texture N x N)
+	const int N = 128;                         // cells across a sheet (texture N x N): a floor REGION, every body in it pours into the same sheet
+	const int MaxPours = 8;                    // bodies pouring into one sheet at once
 	const float G = 3.0f;                      // gravity, sheet units (as the offline bake)
 	const float Friction = 0.9f;               // per second: pow(1 - Friction, dt) on momentum (a thick liquid)
 	const float Dry = 1e-4f;
 	const float Cfl = 0.45f;
-	const int MaxSub = 8;                      // sub-steps per frame at most
+	const int MaxSub = 5;                      // sub-steps per frame at most (128-cell sheets: bounded cost)
 
 	void (*Log)(const char *) = nullptr;
 	static void Say(const char *Fmt, ...)
@@ -51,9 +53,11 @@ namespace U2Blood
 		float Size = 100, Gx = 0, Gy = 0;
 		float H[N * N], Hu[N * N], Hv[N * N];
 		float H2[N * N], Hu2[N * N], Hv2[N * N];  // the write buffer of a step
-		float B[N * N];                            // the bed: the floor's slope
-		float PourU = 0.5f, PourV = 0.5f, PourRate = 0, PourLeft = 0;
-		int Kind = 0;                              // 0 red (human), 1 purple (Seeker)
+		float B[N * N];                            // the bed: the floor's slope (+ anything lying in the blood: `bed`)
+		float Mix[N * N];                          // per cell: 0 red (human) .. 1 purple (Seeker), set as blood pours in
+		struct PourSrc { float U, V, Rate, Left; int Kind; } Pours[MaxPours];
+		float PourRate = 0;                        // the sum over the sources (0: nothing pouring)
+		int Kind = 0;                              // the region's default kind
 		float Still = 0;                           // seconds without motion
 		IDirect3DTexture9 *Tex = nullptr;
 	};
@@ -79,10 +83,14 @@ namespace U2Blood
 	inline void Clear(Sheet &S)
 	{
 		memset(S.H, 0, sizeof(S.H)); memset(S.Hu, 0, sizeof(S.Hu)); memset(S.Hv, 0, sizeof(S.Hv));
+		memset(S.Pours, 0, sizeof(S.Pours));
 		for (int j = 0; j < N; j++)
 			for (int i = 0; i < N; i++)
+			{
 				S.B[j * N + i] = S.Gx * (i - N / 2) + S.Gy * (j - N / 2);
-		S.PourRate = 0; S.PourLeft = 0; S.Still = 0; S.Frozen = false; S.Dirty = true;
+				S.Mix[j * N + i] = (float)S.Kind;
+			}
+		S.PourRate = 0; S.Still = 0; S.Frozen = false; S.Dirty = true;
 	}
 
 	// U2BloodCommand(): see the header comment
@@ -102,17 +110,46 @@ namespace U2Blood
 		}
 		if (!_stricmp(Word, "wet"))
 		{
-			// is there blood at (u, v)? (the mod asks before giving a walker bloody feet)
+			// is there blood at (u, v)? 1 red, 2 purple, 0 none (the mod asks before giving a walker bloody feet)
 			const int i = (int)(A * N), j = (int)(Bq * N);
 			if (i < 0 || j < 0 || i >= N || j >= N)
 				return 0;
-			return S.H[j * N + i] > 0.05f ? 1 : 0;
+			return S.H[j * N + i] > 0.05f ? (S.Mix[j * N + i] > 0.5f ? 2 : 1) : 0;
+		}
+		if (!_stricmp(Word, "wetkind"))
+		{
+			// the blood's colour at (u, v): 1 purple, 0 red (the mod's native call returns a bool, so two queries)
+			const int i = (int)(A * N), j = (int)(Bq * N);
+			if (i < 0 || j < 0 || i >= N || j >= N)
+				return 0;
+			return S.Mix[j * N + i] > 0.5f ? 1 : 0;
 		}
 		if (!S.Used)
 			return 0;
 		if (!_stricmp(Word, "pour"))
 		{
-			S.PourU = A; S.PourV = Bq; S.PourRate = C; S.PourLeft = D; S.Frozen = false;
+			// a body pours in at (u, v) for D seconds, kind E; the free source, or the one nearest its end
+			int best = -1; float least = 1e9f;
+			for (int p = 0; p < MaxPours; p++)
+				if (S.Pours[p].Left <= 0) { best = p; break; }
+				else if (S.Pours[p].Left < least) { least = S.Pours[p].Left; best = p; }
+			S.Pours[best].U = A; S.Pours[best].V = Bq; S.Pours[best].Rate = C; S.Pours[best].Left = D; S.Pours[best].Kind = (int)E;
+			S.PourRate = fmaxf(S.PourRate, C); S.Frozen = false; S.Still = 0;
+			return 1;
+		}
+		if (!_stricmp(Word, "bed"))
+		{
+			// something lies in the blood at (u, v), radius C (texture units), height D: the bed
+			// rises under it so the blood flows around and against it, not through it
+			const float cx = A * N, cy = Bq * N, r = fmaxf(C * N, 1.0f);
+			for (int j = 0; j < N; j++)
+				for (int i = 0; i < N; i++)
+				{
+					const float d2 = (i + 0.5f - cx) * (i + 0.5f - cx) + (j + 0.5f - cy) * (j + 0.5f - cy);
+					if (d2 < r * r)
+						S.B[j * N + i] += D * (1 - d2 / (r * r));
+				}
+			S.Frozen = false; S.Still = 0;
 			return 1;
 		}
 		if (!_stricmp(Word, "stamp"))
@@ -155,7 +192,7 @@ namespace U2Blood
 		}
 		if (!_stricmp(Word, "stop"))
 		{
-			S.Frozen = true; S.PourRate = 0;
+			S.Frozen = true; S.PourRate = 0; memset(S.Pours, 0, sizeof(S.Pours));
 			return 1;
 		}
 		return 0;
@@ -245,20 +282,34 @@ namespace U2Blood
 
 	inline void Pour(Sheet &S, float dt)
 	{
-		if (S.PourRate <= 0 || S.PourLeft <= 0)
-			return;
-		const float cx = S.PourU * N, cy = S.PourV * N, r2 = 9.0f;
-		const float d = fminf(dt, S.PourLeft);
-		for (int j = 0; j < N; j++)
-			for (int i = 0; i < N; i++)
-			{
-				const float dd = (i + 0.5f - cx) * (i + 0.5f - cx) + (j + 0.5f - cy) * (j + 0.5f - cy);
-				if (dd < r2)
-					S.H[j * N + i] += S.PourRate * d * (1 - dd / r2) / (3.14159f * r2 * 0.5f);
-			}
-		S.PourLeft -= d;
-		if (S.PourLeft <= 0)
-			S.PourRate = 0;
+		S.PourRate = 0;
+		for (int p = 0; p < MaxPours; p++)
+		{
+			Sheet::PourSrc &P = S.Pours[p];
+			if (P.Rate <= 0 || P.Left <= 0)
+				continue;
+			const float cx = P.U * N, cy = P.V * N, r2 = 9.0f;
+			const float d = fminf(dt, P.Left);
+			const int i0 = (int)fmaxf(0.0f, cx - 4), i1 = (int)fminf((float)N, cx + 5), j0 = (int)fmaxf(0.0f, cy - 4), j1 = (int)fminf((float)N, cy + 5);
+			for (int j = j0; j < j1; j++)
+				for (int i = i0; i < i1; i++)
+				{
+					const float dd = (i + 0.5f - cx) * (i + 0.5f - cx) + (j + 0.5f - cy) * (j + 0.5f - cy);
+					if (dd < r2)
+					{
+						const float add = P.Rate * d * (1 - dd / r2) / (3.14159f * r2 * 0.5f);
+						float &h = S.H[j * N + i];
+						// the colour follows the volume: a Seeker's purple into a human's red mixes
+						S.Mix[j * N + i] = (S.Mix[j * N + i] * h + (float)P.Kind * add) / fmaxf(h + add, 1e-6f);
+						h += add;
+					}
+				}
+			P.Left -= d;
+			if (P.Left <= 0)
+				P.Rate = 0;
+			else
+				S.PourRate = fmaxf(S.PourRate, P.Rate);
+		}
 	}
 
 	// the sheet as the decal texture: 50% grey where there's no blood (the decal multiplies
@@ -296,7 +347,8 @@ namespace U2Blood
 				ndh = fmaxf(0.0f, ndh);
 				float spec = ndh * ndh; spec *= spec; spec *= spec; spec *= spec; spec *= spec;   // ^32
 				spec *= 0.85f * cov;
-				const float cr = S.Kind == 1 ? 70.0f : 82.0f, cg = S.Kind == 1 ? 22.0f : 12.0f, cb = S.Kind == 1 ? 112.0f : 10.0f;   // the bake's colours
+				const float mix = S.Mix[j * N + i];                               // red .. purple per cell
+				const float cr = 82.0f + (70.0f - 82.0f) * mix, cg = 12.0f + (22.0f - 12.0f) * mix, cb = 10.0f + (112.0f - 10.0f) * mix;
 				const int r = (int)(128 * (1 - cov) + fminf(255.0f, cr * k + 255.0f * spec) * cov + 0.5f);
 				const int g = (int)(128 * (1 - cov) + fminf(255.0f, cg * k + 235.0f * spec) * cov + 0.5f);
 				const int b = (int)(128 * (1 - cov) + fminf(255.0f, cb * k + 225.0f * spec) * cov + 0.5f);
