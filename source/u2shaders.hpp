@@ -62,6 +62,7 @@
 
 #include "msaa.hpp"
 #include "blood.hpp"
+#include "runs.hpp"
 #include <d3dcompiler.h>
 #include "fakefull.hpp"
 #include <algorithm>
@@ -335,6 +336,11 @@ public:
 		{
 			if (!Reload)
 				U2Blood::AddHash(Hash);         // the slots are fixed once pools exist
+		}
+		else if (sscanf_s(Line, " bloodrun=%x", &Hash) == 1)
+		{
+			if (!Reload)
+				U2Runs::AddHash(Hash);          // a wall run region's placeholder texture (runs.hpp), slot order
 		}             // a live blood pool's placeholder texture (blood.hpp), slot order
 		else if (sscanf_s(Line, " surface=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
 		{
@@ -760,7 +766,7 @@ public:
 	{
 		if (!Loaded)
 			Load();
-		if (Tex == nullptr || (Replacements.empty() && U2Blood::Count == 0))
+		if (Tex == nullptr || (Replacements.empty() && U2Blood::Count == 0 && U2Runs::Count == 0))
 			return nullptr;
 		Known(Tex, Hash);
 		if (U2Blood::Count > 0 && Seen.count(Hash) && Seen[Hash].W == 64 && Seen[Hash].H == 64)
@@ -771,6 +777,8 @@ public:
 		}
 		if (IDirect3DTexture9 *Live = U2Blood::TextureFor(Dev, Hash))
 			return Live;                        // a live blood pool (blood.hpp)
+		if (IDirect3DTexture9 *Run = U2Runs::TextureFor(Dev, Hash))
+			return Run;                         // blood running down a wall (runs.hpp)
 		const auto It = Replacements.find(Hash);
 		if (It == Replacements.end())
 			return nullptr;
@@ -6244,6 +6252,8 @@ public:
 			LivePoll(Dev);
 		if (U2Blood::Count > 0)
 			U2Blood::Step(Dev);
+		if (U2Runs::Count > 0)
+			U2Runs::Step(Dev);
 		DepthDirty = true;
 		SceneProjOk = false;
 		GlossLights = GiFrameLights;             // gloss=: the game's lights of the frame just shown
@@ -6345,6 +6355,7 @@ public:
 	void OnLost()
 	{
 		U2Blood::Release();
+		U2Runs::Release();
 		MapViews.clear();
 		MapTarget = nullptr;
 		ClearBlurSources();

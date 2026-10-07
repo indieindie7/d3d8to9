@@ -14,8 +14,14 @@
 static U2Shaders U2;
 // blood.hpp logs through the layer's log, and the mod's native DLL reaches it by this export
 static void U2BloodLog(const char *S) { U2.Message("%s", S); }
-static int U2BloodLogSet = (U2Blood::Log = U2BloodLog, 0);
-extern "C" __declspec(dllexport) int __cdecl U2BloodCommand(const char *Cmd) { return U2Blood::Command(Cmd); }
+static int U2BloodLogSet = (U2Blood::Log = U2BloodLog, U2Runs::Log = U2BloodLog, 0);
+// the mod's blood commands: floor pools (blood.hpp) and wall runs (runs.hpp: run, drip, rstop)
+extern "C" __declspec(dllexport) int __cdecl U2BloodCommand(const char *Cmd)
+{
+	char Word[16] = "";
+	sscanf_s(Cmd, "%15s", Word, (unsigned)sizeof(Word));
+	return U2Runs::Handles(Word) ? U2Runs::Command(Cmd) : U2Blood::Command(Cmd);
+}
 // a shotp from outside (AdventNative's "Capture"): the next presented frame saved as System\ShotP#####.bmp;
 // Mask 1 also saves the character mask beside it (shotmask), 0 not, -1 as U2Shaders.ini says
 extern "C" __declspec(dllexport) int __cdecl U2ShotP(int Mask) { if (Mask >= 0) U2.ShotMask = Mask != 0; U2.ShotPWant = true; return 1; }
