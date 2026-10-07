@@ -9,6 +9,8 @@
  *                                 save each one to U2Shaders\dump\<hash>_<w>x<h>.dds
  *     tint=1a2b3c4d               draw everything using that texture in flat magenta
  *     shader=1a2b3c4d core.hlsl   draw it with U2Shaders\core.hlsl (entry "main", ps_2_a)
+ *     layer=1a2b3c4d terrain_hex.hlsl   bind only the shader: stages, coordinates, transforms,
+ *                                 samplers and blending stay the game's (Unreal II terrain layers)
  *     decal=1a2b3c4d decal_parallax.hlsl
  *                                 the same, but the draw keeps its own blending (no frame
  *                                 copy in s1): the shader returns what the texture would
@@ -84,13 +86,15 @@ struct U2Rule
 	DWORD Hash = 0;
 	std::string File;          // empty = the built-in tint
 	bool KeepBlend = false;    // decal=: the draw keeps its own blending, no frame copy
+	bool Layer = false;        // layer=: only the pixel shader is bound; every stage, coordinate,
+	                           // transform, sampler and the blending stay the game's (terrain layers)
 	bool Surface = false;      // surface=: solid draws only, see SurfaceBegin
 	bool Solid = false;        // glass=: a shader= rule that also takes solid (unblended) draws
 	bool Pbr = false;          // pbr=: a lit solid draw shaded by char_pbr.hlsl with a material map
 	std::string MapFile;       // pbr=: the map (normal xy, roughness, metallic), a DDS in U2Shaders
 	IDirect3DTexture9 *Map = nullptr;
 	bool MapTried = false;
-	bool Refused = false;      // surface=: an unsupported stage setup was logged once
+	bool Refused = false;      // surface=: an unsupported stage setup was logged once (layer=: the stage setup was)
 	float Levels[4] = {};      // surface=: the texture's brightness levels (see TextureLevels)
 	IDirect3DPixelShader9 *PS = nullptr;
 	bool Tried = false;
@@ -274,6 +278,14 @@ public:
 				R.Hash = Hash;
 				R.File = Name;
 				R.Solid = true;
+				Rules.push_back(R);
+			}
+			else if (sscanf_s(Line, " layer=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
+			{
+				U2Rule R;
+				R.Hash = Hash;
+				R.File = Name;
+				R.Layer = true;
 				Rules.push_back(R);
 			}
 			else if (sscanf_s(Line, " decal=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
@@ -820,6 +832,82 @@ public:
 
 	// Called before a draw. Hash = the stage 0 texture's hash (0: not yet known, read it from
 	// Tex). Returns true if a shader was put in place; End() must then follow the draw.
+	// ---- layer= : a shader that only replaces how the game's own stages combine -----------------
+	// Unreal II draws a terrain layer as a fixed-function pass: stage 0 = the layer texture (its
+	// coordinates generated and transformed by the fixed-function vertex pipeline), stage 1 = the
+	// layer's alpha map, both MODULATE2X, alpha-blended over the layers below (the first solid).
+	// Here nothing of that is touched: TEXCOORD0/1 reach the shader already transformed, s0/s1 keep
+	// their samplers, the blend stays on. The shader gets c0 = (time, 1, 1/width, 1/height).
+	// The shader reproduces whatever stage setup the draw has, read here and passed in c1:
+	//   c1.x stage 0 colour: 0 texture only, 1 texture x diffuse, 2 texture x diffuse x 2
+	//   c1.y stage 1 colour: 0 unchanged, 1 x alpha map, 2 x alpha map x 2
+	//   c1.z alpha: 0 stage 0's (texture alpha x diffuse alpha), 1 that x alpha map alpha, 2 alpha map alpha
+	//   c1.w 1 when stage 1 is used (s1/TEXCOORD1 valid)
+	// Setups outside that are left to the game (logged once per hash and setup).
+	std::map<std::string, bool> LayerSeen;
+	bool LayerBegin(IDirect3DDevice9 *Dev, U2Rule &Rule)
+	{
+		DWORD c0op = 0, c0a1 = 0, c0a2 = 0, a0op = 0, c1op = 0, c1a1 = 0, c1a2 = 0, a1op = 0, a1a1 = 0, a1a2 = 0, ttf0 = 0, ttf1 = 0;
+		Dev->GetTextureStageState(0, D3DTSS_COLOROP, &c0op);
+		Dev->GetTextureStageState(0, D3DTSS_COLORARG1, &c0a1);
+		Dev->GetTextureStageState(0, D3DTSS_COLORARG2, &c0a2);
+		Dev->GetTextureStageState(0, D3DTSS_ALPHAOP, &a0op);
+		Dev->GetTextureStageState(1, D3DTSS_COLOROP, &c1op);
+		Dev->GetTextureStageState(1, D3DTSS_COLORARG1, &c1a1);
+		Dev->GetTextureStageState(1, D3DTSS_COLORARG2, &c1a2);
+		Dev->GetTextureStageState(1, D3DTSS_ALPHAOP, &a1op);
+		Dev->GetTextureStageState(1, D3DTSS_ALPHAARG1, &a1a1);
+		Dev->GetTextureStageState(1, D3DTSS_ALPHAARG2, &a1a2);
+		Dev->GetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, &ttf0);
+		Dev->GetTextureStageState(1, D3DTSS_TEXTURETRANSFORMFLAGS, &ttf1);
+		float C1[4] = { -1, 0, 0, 0 };
+		// stage 0: the layer texture, alone or with the vertex lighting
+		bool texdif = (c0a1 == D3DTA_TEXTURE && c0a2 == D3DTA_DIFFUSE) || (c0a1 == D3DTA_DIFFUSE && c0a2 == D3DTA_TEXTURE);
+		if (c0op == D3DTOP_SELECTARG1 && c0a1 == D3DTA_TEXTURE) C1[0] = 0;
+		else if (c0op == D3DTOP_MODULATE && texdif) C1[0] = 1;
+		else if (c0op == D3DTOP_MODULATE2X && texdif) C1[0] = 2;
+		bool ok = C1[0] >= 0 && a0op != D3DTOP_DISABLE && !(ttf0 & D3DTTFF_PROJECTED) && !(ttf1 & D3DTTFF_PROJECTED);
+		IDirect3DBaseTexture9 *t1 = nullptr;
+		Dev->GetTexture(1, &t1);
+		bool st1 = c1op != D3DTOP_DISABLE && t1 != nullptr;
+		if (t1) t1->Release();
+		if (ok && st1)
+		{
+			bool curtex = (c1a1 == D3DTA_CURRENT && c1a2 == D3DTA_TEXTURE) || (c1a1 == D3DTA_TEXTURE && c1a2 == D3DTA_CURRENT);
+			if ((c1op == D3DTOP_SELECTARG1 && c1a1 == D3DTA_CURRENT) || (c1op == D3DTOP_SELECTARG2 && c1a2 == D3DTA_CURRENT)) C1[1] = 0;
+			else if (c1op == D3DTOP_MODULATE && curtex) C1[1] = 1;
+			else if (c1op == D3DTOP_MODULATE2X && curtex) C1[1] = 2;
+			else ok = false;
+			bool acurtex = (a1a1 == D3DTA_CURRENT && a1a2 == D3DTA_TEXTURE) || (a1a1 == D3DTA_TEXTURE && a1a2 == D3DTA_CURRENT);
+			if (a1op == D3DTOP_DISABLE || (a1op == D3DTOP_SELECTARG1 && a1a1 == D3DTA_CURRENT) || (a1op == D3DTOP_SELECTARG2 && a1a2 == D3DTA_CURRENT)) C1[2] = 0;
+			else if (a1op == D3DTOP_MODULATE && acurtex) C1[2] = 1;
+			else if ((a1op == D3DTOP_SELECTARG1 && a1a1 == D3DTA_TEXTURE) || (a1op == D3DTOP_SELECTARG2 && a1a2 == D3DTA_TEXTURE)) C1[2] = 2;
+			else ok = false;
+			C1[3] = 1;
+		}
+		char Key[160];
+		sprintf_s(Key, "layer %08x: st0 %u(%u,%u) a%u | st1 %s %u(%u,%u) a%u(%u,%u) | ttf %u %u -> %s", Rule.Hash, c0op, c0a1, c0a2, a0op,
+			st1 ? "on" : "off", c1op, c1a1, c1a2, a1op, a1a1, a1a2, ttf0, ttf1, ok ? "shader" : "left to the game");
+		if (!LayerSeen[Key])
+		{
+			LayerSeen[Key] = true;
+			Message("%s (c1 %.0f %.0f %.0f %.0f)", Key, C1[0], C1[1], C1[2], C1[3]);
+		}
+		if (!ok)
+			return false;
+		IDirect3DPixelShader9 *PS = Compile(Dev, Rule);
+		if (PS == nullptr)
+			return false;
+		Dev->GetPixelShader(&OldPS);
+		Dev->GetPixelShaderConstantF(0, OldConst[0], 8);
+		float C0[4] = { (GetTickCount() % 3600000) / 1000.0f, 1.0f, SceneW ? 1.0f / SceneW : 0, SceneH ? 1.0f / SceneH : 0 };
+		Dev->SetPixelShaderConstantF(0, C0, 1);
+		Dev->SetPixelShaderConstantF(1, C1, 1);
+		Dev->SetPixelShader(PS);
+		Mode = 8;
+		return true;
+	}
+
 	bool Begin(IDirect3DDevice9 *Dev, IDirect3DTexture9 *Tex, DWORD &Hash, bool FixedFunction)
 	{
 		if (!Loaded)
@@ -874,6 +962,8 @@ public:
 			return CharBegin(Dev, FixedFunction, Rule);
 		if (Rule->Surface)
 			return SurfaceBegin(Dev, *Rule, FixedFunction);
+		if (Rule->Layer)
+			return LayerBegin(Dev, *Rule);
 		// only the see-through parts: an atlas is often shared with solid ones
 		DWORD Blending = 0;
 		Dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &Blending);
@@ -2058,6 +2148,14 @@ public:
 
 	void End(IDirect3DDevice9 *Dev)
 	{
+		if (Mode == 8)
+		{
+			Dev->SetPixelShader(OldPS);
+			Dev->SetPixelShaderConstantF(0, OldConst[0], 8);
+			if (OldPS != nullptr) { OldPS->Release(); OldPS = nullptr; }
+			Mode = 0;
+			return;
+		}
 		if (Mode == 7)
 		{
 			Dev->SetPixelShader(OldPS);
