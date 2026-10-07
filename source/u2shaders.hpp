@@ -1918,11 +1918,16 @@ public:
 			LiveBroken = true;
 			return;
 		}
+		// UPlayer::Exec reaches the player's script exec functions (its controller, pawn, input,
+		// interactions); the viewport's own Exec handles viewport commands and didn't pass ours on
+		static ViewportExec_t PlayerExec = (ViewportExec_t)GetProcAddress(GetModuleHandleA("Engine.dll"), "?Exec@UPlayer@@UAEHPBGAAVFOutputDevice@@@Z");
 		for (const std::string &L : Lines)
 		{
-			Message("live: > %s", L.c_str());
 			std::wstring Cmd(L.begin(), L.end());
-			Call(Self, nullptr, Cmd.c_str(), *LiveLog);
+			int Done = PlayerExec ? PlayerExec(Self, nullptr, Cmd.c_str(), *LiveLog) : 0;
+			if (!Done)
+				Done = Call(Self, nullptr, Cmd.c_str(), *LiveLog);
+			Message("live: > %s (%s)", L.c_str(), Done ? "taken" : "not recognised");
 		}
 		FILE *A = nullptr;
 		if (LiveQueueBatch >= 0 && !fopen_s(&A, (Dir + "U2Live.ack").c_str(), "w") && A)
