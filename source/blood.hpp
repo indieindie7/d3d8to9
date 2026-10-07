@@ -271,20 +271,35 @@ namespace U2Blood
 		D3DLOCKED_RECT L;
 		if (FAILED(S.Tex->LockRect(0, &L, nullptr, 0)))
 			return;
+		// a puddle, not paint: dark where deep, a thin lighter meniscus at the wet edge, and a
+		// baked highlight from a fixed light over the surface's slope (the decal multiplies the
+		// floor x2, so a highlight can reach twice the floor's brightness, no more)
+		const float hx = -0.35f, hy = -0.30f, hz = 0.89f;        // the half vector of a light up and to one side
 		for (int j = 0; j < N; j++)
 		{
 			DWORD *row = (DWORD *)((BYTE *)L.pBits + j * L.Pitch);
 			for (int i = 0; i < N; i++)
 			{
 				const float d = S.H[j * N + i];
-				float cov = fmaxf(0.0f, fminf(1.0f, (d - 0.01f) / 0.03f));
+				float cov = fmaxf(0.0f, fminf(1.0f, (d - 0.01f) / 0.02f));
 				cov = cov * cov * (3 - 2 * cov);
-				const float deep = fmaxf(0.0f, fminf(1.0f, d / 1.0f));
-				const float k = 1.0f - 0.45f * deep;
-				const float cr = S.Kind == 1 ? 70 : 76, cg = S.Kind == 1 ? 24 : 16, cb = S.Kind == 1 ? 108 : 13;   // the bake's colours
-				const int r = (int)(128 * (1 - cov) + cr * k * cov + 0.5f);
-				const int g = (int)(128 * (1 - cov) + cg * k * cov + 0.5f);
-				const int b = (int)(128 * (1 - cov) + cb * k * cov + 0.5f);
+				const float deep = fmaxf(0.0f, fminf(1.0f, d / 0.8f));
+				float k = 1.0f - 0.6f * deep;
+				// the meniscus: the band just inside the edge is lighter (surface tension catches the light)
+				const float edge = fmaxf(0.0f, fminf(1.0f, (d - 0.02f) / 0.06f));
+				k *= 1.0f + 0.7f * (1.0f - edge) * cov;
+				// the highlight: the slope of the surface against the half vector
+				const int i0 = i > 0 ? i - 1 : i, i1 = i < N - 1 ? i + 1 : i, j0 = j > 0 ? j - 1 : j, j1 = j < N - 1 ? j + 1 : j;
+				const float gx = (S.H[j * N + i1] - S.H[j * N + i0]) * 6.0f, gy = (S.H[j1 * N + i] - S.H[j0 * N + i]) * 6.0f;
+				const float nl = sqrtf(gx * gx + gy * gy + 1.0f);
+				float ndh = (-gx * hx - gy * hy + hz) / nl;
+				ndh = fmaxf(0.0f, ndh);
+				float spec = ndh * ndh; spec *= spec; spec *= spec; spec *= spec; spec *= spec;   // ^32
+				spec *= 0.85f * cov;
+				const float cr = S.Kind == 1 ? 70.0f : 82.0f, cg = S.Kind == 1 ? 22.0f : 12.0f, cb = S.Kind == 1 ? 112.0f : 10.0f;   // the bake's colours
+				const int r = (int)(128 * (1 - cov) + fminf(255.0f, cr * k + 255.0f * spec) * cov + 0.5f);
+				const int g = (int)(128 * (1 - cov) + fminf(255.0f, cg * k + 235.0f * spec) * cov + 0.5f);
+				const int b = (int)(128 * (1 - cov) + fminf(255.0f, cb * k + 225.0f * spec) * cov + 0.5f);
 				const int a = (int)(250 * cov + 0.5f);
 				row[i] = (DWORD)a << 24 | r << 16 | g << 8 | b;
 			}
