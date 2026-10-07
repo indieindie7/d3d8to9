@@ -1906,7 +1906,7 @@ public:
 		if (Mode == 7)
 		{
 			Dev->SetPixelShader(OldPS);
-			Dev->SetPixelShaderConstantF(0, OldTerrConst[0], 8);
+			Dev->SetPixelShaderConstantF(0, OldTerrConst[0], 9);
 			Dev->SetTextureStageState(5, D3DTSS_TEXCOORDINDEX, OldTerrTCI5);
 			Dev->SetTextureStageState(5, D3DTSS_TEXTURETRANSFORMFLAGS, OldTerrTTF5);
 			Dev->SetTransform(D3DTS_TEXTURE5, &OldTerrTexMat5);
@@ -2110,7 +2110,8 @@ public:
 	float TerrainFog[4] = { 0, 0, 0, 0 };
 	float TerrainFog2[4] = { 0, 0, 0, 0 };
 	float TerrainFx2[4] = { 0, 0, 0, 0 };                // c7 terrainfx2=: relief, relief scale, slope rock, strata
-	float OldTerrConst[8][4] = {};
+	float TerrainTone[4] = { 0, 0, 0, 0 };               // c8 terraintone=: ground lift, desaturate, rock brightness, 0
+	float OldTerrConst[9][4] = {};
 	DWORD OldTerrTCI5 = 0, OldTerrTTF5 = 0;
 	D3DMATRIX OldTerrTexMat5 = {};
 
@@ -2145,7 +2146,7 @@ public:
 		if (PS == nullptr)
 			return false;
 		Dev->GetPixelShader(&OldPS);
-		Dev->GetPixelShaderConstantF(0, OldTerrConst[0], 8);
+		Dev->GetPixelShaderConstantF(0, OldTerrConst[0], 9);
 		Dev->GetTextureStageState(5, D3DTSS_TEXCOORDINDEX, &OldTerrTCI5);
 		Dev->GetTextureStageState(5, D3DTSS_TEXTURETRANSFORMFLAGS, &OldTerrTTF5);
 		Dev->GetTransform(D3DTS_TEXTURE5, &OldTerrTexMat5);
@@ -2153,7 +2154,7 @@ public:
 		Dev->SetTextureStageState(5, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_CAMERASPACEPOSITION | 5);
 		Dev->SetTextureStageState(5, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT3);
 		Dev->SetTransform(D3DTS_TEXTURE5, &Identity);
-		float c[8][4] = {};
+		float c[9][4] = {};
 		c[0][0] = (GetTickCount() % 100000) / 1000.0f;
 		D3DMATRIX V;
 		Dev->GetTransform(D3DTS_VIEW, &V);
@@ -2166,7 +2167,8 @@ public:
 		memcpy(c[5], TerrainFog, sizeof(TerrainFog));
 		memcpy(c[6], TerrainFog2, sizeof(TerrainFog2));
 		memcpy(c[7], TerrainFx2, sizeof(TerrainFx2));
-		Dev->SetPixelShaderConstantF(0, c[0], 8);
+		memcpy(c[8], TerrainTone, sizeof(TerrainTone));
+		Dev->SetPixelShaderConstantF(0, c[0], 9);
 		Dev->SetPixelShader(PS);
 		Mode = 7;
 		return true;
@@ -4618,6 +4620,8 @@ public:
 			else if (sscanf_s(Line, " terrainfog2=%f %f %f %f", &TerrainFog2[0], &TerrainFog2[1], &TerrainFog2[2], &TerrainFog2[3]) >= 1)
 				;
 			else if (sscanf_s(Line, " terrainfx2=%f %f %f %f", &TerrainFx2[0], &TerrainFx2[1], &TerrainFx2[2], &TerrainFx2[3]) >= 1)
+				;
+			else if (sscanf_s(Line, " terraintone=%f %f %f %f", &TerrainTone[0], &TerrainTone[1], &TerrainTone[2], &TerrainTone[3]) >= 1)
 				;
 			else if (strncmp(Line + strspn(Line, " \t"), "lut=", 4) == 0)
 			{
