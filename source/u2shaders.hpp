@@ -187,6 +187,8 @@ public:
 				;
 			else if (sscanf_s(Line, " glossenv=%f %f %f %f", &GlossEnv[0], &GlossEnv[1], &GlossEnv[2], &GlossEnv[3]) >= 3)
 				;
+			else if (sscanf_s(Line, " glossdry=%f %f %f %f", &GlossDry[0], &GlossDry[1], &GlossDry[2], &GlossDry[3]) >= 2)
+				;
 			else if (sscanf_s(Line, " relight=%u", &Hash) == 1)
 				Relight = Hash != 0;
 			else if (sscanf_s(Line, " pcssprobe=%u", &Hash) == 1)
@@ -1452,18 +1454,87 @@ public:
 	// c0 time, 1, 1/w, 1/h; c1.yz blend kind and neutral brightness; c4..c7 the projection) and:
 	//   c2  glossfx=  strength, highlight sharpness (Blinn exponent), light gain, sheen gain
 	//   c3  glossenv= the colour a grazing look reflects (r g b, and a multiplier)
+	//   c1.w how wet this decal still is (1 fresh .. 0 dry), from its age (see GlossAge)
 	//   c8..c15 up to 4 of the game's lights in camera space, nearest the camera first:
 	//       c8+2i = position (or the direction toward a directional light) and range (0:
 	//       directional), c9+2i = colour and 1 if used. The lights are the ones the game set for
 	//       lit draws (characters) in the frame before (gi's light gathering: gi=1 or ssao=1).
 	// Fog stays on with a black fog colour, so highlights fade with distance like the rest.
+	// The pass blends ONE / SRCALPHA: the shader's colour is added and the alpha multiplies what
+	// is there, so a drying decal can also darken (blood going brown-black as it dries).
 	std::vector<U2Rule> GlossRules;
+	// Drying: each projector decal is told apart by where it sits in the world (its texture
+	// matrix with the view taken out: the projector's own, fixed while it stays put) and aged
+	// from the first time it was drawn. A growing pool changes a little each frame and is
+	// matched to the nearest known one, so it stays fresh while it spreads and ages from then.
+	// glossdry= seconds wet, seconds until dry, how much a dry decal darkens (0-1).
+	float GlossDry[4] = { 60.0f, 240.0f, 0.4f, 0.0f };
+	struct GlossDecal { float M[16]; DWORD Born, Seen; };
+	std::vector<GlossDecal> GlossDecals;
+	float GlossAge(IDirect3DDevice9 *Dev)
+	{
+		D3DMATRIX T, V;
+		Dev->GetTransform(D3DTS_TEXTURE0, &T);
+		Dev->GetTransform(D3DTS_VIEW, &V);
+		// texture coordinates = camera position x T, camera position = world x V: world x (V T)
+		float W[16];
+		for (int r = 0; r < 4; r++)
+			for (int c = 0; c < 4; c++)
+			{
+				float x = 0;
+				for (int k = 0; k < 4; k++)
+					x += V.m[r][k] * T.m[k][c];
+				W[r * 4 + c] = x;
+			}
+		const DWORD Now = GetTickCount();
+		GlossDecal *Best = nullptr;
+		float BestD = 1e30f;
+		for (GlossDecal &D : GlossDecals)
+		{
+			// the rotation/scale part relative to its size, the translation part as is
+			float Scale = 1e-6f, Diff = 0;
+			for (int i = 0; i < 12; i++)
+			{
+				Scale = (std::max)(Scale, fabsf(D.M[i]));
+				Diff = (std::max)(Diff, fabsf(D.M[i] - W[i]));
+			}
+			// the translation row is large far from the level's origin: compared relative to its size
+			float Rel = Diff / Scale, Move = 0, Big = 1;
+			for (int i = 12; i < 16; i++)
+			{
+				Move = (std::max)(Move, fabsf(D.M[i] - W[i]));
+				Big = (std::max)(Big, fabsf(D.M[i]));
+			}
+			Move /= Big;
+			const float Dist = Rel + Move;
+			if (Rel < 0.03f && Move < 0.01f && Dist < BestD)
+			{
+				BestD = Dist;
+				Best = &D;
+			}
+		}
+		if (Best == nullptr)
+		{
+			// forget decals not drawn for 10 minutes (and the oldest past 4096)
+			GlossDecals.erase(std::remove_if(GlossDecals.begin(), GlossDecals.end(), [Now](const GlossDecal &D) { return Now - D.Seen > 600000; }), GlossDecals.end());
+			if (GlossDecals.size() >= 4096)
+				GlossDecals.erase(GlossDecals.begin());
+			GlossDecal N;
+			memcpy(N.M, W, sizeof(W));
+			N.Born = N.Seen = Now;
+			GlossDecals.push_back(N);
+			return 0;
+		}
+		memcpy(Best->M, W, sizeof(W));       // a growing pool: follow it
+		Best->Seen = Now;
+		return (Now - Best->Born) / 1000.0f;
+	}
 	std::vector<D3DLIGHT9> GlossLights;
 	float GlossFx[4] = { 1.0f, 90.0f, 1.0f, 0.35f };
-	float GlossEnv[4] = { 0.55f, 0.6f, 0.68f, 1.0f };
+	float GlossEnv[4] = { 0.6f, 0.58f, 0.56f, 1.0f };
 	IDirect3DPixelShader9 *GlossOldPS = nullptr;
 	IDirect3DBaseTexture9 *GlossOldTex0 = nullptr;
-	float GlossOldConst[16][4];
+	float GlossOldConst[17][4];
 	DWORD GlossOldRS[6], GlossOldTCI[3], GlossOldTTF[3];
 	D3DMATRIX GlossOldTexMat[3];
 	bool GlossSwapped0 = false;
@@ -1497,7 +1568,7 @@ public:
 		for (int i = 0; i < 6; i++)
 			Dev->GetRenderState(RS[i], &GlossOldRS[i]);
 		Dev->GetPixelShader(&GlossOldPS);
-		Dev->GetPixelShaderConstantF(0, GlossOldConst[0], 16);
+		Dev->GetPixelShaderConstantF(0, GlossOldConst[0], 17);
 		// the live blood pools' simulated sheet in place of their placeholder, as for the draw itself
 		GlossSwapped0 = false;
 		DWORD H = Hash;
@@ -1524,6 +1595,14 @@ public:
 		C[0][2] = SceneW ? 1.0f / SceneW : 0;
 		C[0][3] = SceneH ? 1.0f / SceneH : 0;
 		C[1][0] = (GlossOldTTF[0] & D3DTTFF_PROJECTED) ? 1.0f : 0.0f;
+		C[1][3] = 1;
+		if (C[1][0] > 0.5f && GlossDry[1] > GlossDry[0])
+		{
+			const float Age = GlossAge(Dev);
+			float t = (Age - GlossDry[0]) / (GlossDry[1] - GlossDry[0]);
+			t = t < 0 ? 0 : t > 1 ? 1 : t;
+			C[1][3] = 1 - t * t * (3 - 2 * t);
+		}
 		memcpy(C[2], GlossFx, sizeof(GlossFx));
 		memcpy(C[3], GlossEnv, sizeof(GlossEnv));
 		D3DMATRIX P, V;
@@ -1573,9 +1652,11 @@ public:
 			Col[0] = L.Diffuse.r; Col[1] = L.Diffuse.g; Col[2] = L.Diffuse.b; Col[3] = 1;
 		}
 		Dev->SetPixelShaderConstantF(0, C[0], 16);
+		const float DryC[4] = { GlossDry[2], 0, 0, 0 };
+		Dev->SetPixelShaderConstantF(16, DryC, 1);     // c16.x: how much a dry decal darkens
 		Dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
 		Dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);
-		Dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);
+		Dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_SRCALPHA);
 		Dev->SetRenderState(D3DRS_BLENDOP, D3DBLENDOP_ADD);
 		Dev->SetRenderState(D3DRS_FOGCOLOR, 0);
 		Dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
@@ -1586,6 +1667,12 @@ public:
 			Told = true;
 			Message("gloss: first draw (%08x with %s, %d of the game's lights)", Hash, R->File.c_str(), (int)GlossLights.size());
 		}
+		static DWORD LastTold = 0;
+		if (GetTickCount() - LastTold > 20000)
+		{
+			LastTold = GetTickCount();
+			Message("gloss: %d decals known (drying), this one wet %.2f", (int)GlossDecals.size(), C[1][3]);
+		}
 		return true;
 	}
 	void GlossEnd(IDirect3DDevice9 *Dev)
@@ -1595,7 +1682,7 @@ public:
 			Dev->SetRenderState(RS[i], GlossOldRS[i]);
 		Dev->SetPixelShader(GlossOldPS);
 		if (GlossOldPS) { GlossOldPS->Release(); GlossOldPS = nullptr; }
-		Dev->SetPixelShaderConstantF(0, GlossOldConst[0], 16);
+		Dev->SetPixelShaderConstantF(0, GlossOldConst[0], 17);
 		for (DWORD s = 1; s <= 2; s++)
 		{
 			Dev->SetTextureStageState(s, D3DTSS_TEXCOORDINDEX, GlossOldTCI[s]);
