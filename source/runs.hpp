@@ -159,7 +159,7 @@ namespace U2Runs
 			if (!P.Live)
 				continue;
 			// speed along "down": gravity against a drag that a heavier drop overcomes better
-			const float top = 2.0f + 22.0f * P.Mass;
+			const float top = 1.5f + 12.0f * P.Mass;          // cells/s: a heavy run is quick, a thin one creeps
 			P.Along = fminf(top, P.Along + Gravity * dt * fminf(1.0f, P.Mass * 1.5f));
 			// a wobble across, and the side speed a branch was given dying away
 			P.Wobble += dt * (3.0f + Rnd() * 4.0f);
@@ -168,7 +168,7 @@ namespace U2Runs
 			const float dx = (S.Gx * P.Along - S.Gy * across) * dt, dy = (S.Gy * P.Along + S.Gx * across) * dt;
 			const float dist = sqrtf(dx * dx + dy * dy);
 			// the trail: some of the drop stays in every cell it crosses (half to each side for width)
-			const float leave = fminf(P.Mass, dist * (0.012f + 0.010f * P.Mass));
+			const float leave = fminf(P.Mass, dist * (0.015f + 0.010f * P.Mass));
 			const int steps = 1 + (int)dist;
 			for (int s = 0; s < steps; s++)
 			{
@@ -214,9 +214,9 @@ namespace U2Runs
 			for (int i = 0; i < N; i++)
 			{
 				const float t = S.T[j * N + i];
-				float cov = fmaxf(0.0f, fminf(1.0f, (t - 0.015f) / 0.05f));
+				float cov = fmaxf(0.0f, fminf(1.0f, (t - 0.004f) / 0.02f));    // thin trails show (tuned offline: a trail cell holds about 0.01)
 				cov = cov * cov * (3 - 2 * cov);
-				const float deep = fmaxf(0.0f, fminf(1.0f, t / 0.6f));
+				const float deep = fmaxf(0.0f, fminf(1.0f, t / 0.3f));
 				const float k = 1.0f - 0.55f * deep;
 				const float mix = S.Mix[j * N + i];
 				const float cr = 86.0f + (70.0f - 86.0f) * mix, cg = 12.0f + (22.0f - 12.0f) * mix, cb = 10.0f + (112.0f - 10.0f) * mix;
