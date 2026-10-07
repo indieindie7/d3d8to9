@@ -16,6 +16,9 @@ static U2Shaders U2;
 static void U2BloodLog(const char *S) { U2.Message("%s", S); }
 static int U2BloodLogSet = (U2Blood::Log = U2BloodLog, 0);
 extern "C" __declspec(dllexport) int __cdecl U2BloodCommand(const char *Cmd) { return U2Blood::Command(Cmd); }
+// a shotp from outside (AdventNative's "Capture"): the next presented frame saved as System\ShotP#####.bmp;
+// Mask 1 also saves the character mask beside it (shotmask), 0 not, -1 as U2Shaders.ini says
+extern "C" __declspec(dllexport) int __cdecl U2ShotP(int Mask) { if (Mask >= 0) U2.ShotMask = Mask != 0; U2.ShotPWant = true; return 1; }
 bool U2WantsBuffers()
 {
 	if (!U2.Loaded)
@@ -1339,6 +1342,15 @@ void Direct3DDevice8::U2CaptureDraw(D3DPRIMITIVETYPE Type, UINT PrimCount, const
 		U2Stages[0] ? U2Stages[0]->GetProxyInterface() : nullptr, U2Stages[0] ? &U2Stages[0]->U2Hash : nullptr,
 		U2Stages[1]->GetProxyInterface(), U2Stages[1]->U2Hash);
 }
+bool Direct3DDevice8::U2MaskBegin(UINT Prims)
+{
+	if (U2.MaskState != 1)
+		return false;
+	bool FixedFunction = CurrentVertexShaderHandle == 0;
+	if (!FixedFunction)
+		FixedFunction = reinterpret_cast<VertexShaderInfo *>(CurrentVertexShaderHandle << 1)->Shader == nullptr;
+	return U2.MaskBegin(ProxyInterface, FixedFunction, U2Stage0 != nullptr, U2Stage0 ? U2Stage0->U2Hash : 0, Prims);
+}
 bool Direct3DDevice8::U2GlossBegin()
 {
 	if (U2.GlossRules.empty() || U2Stage0 == nullptr)
@@ -1411,6 +1423,11 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawPrimitive(D3DPRIMITIVETYPE Primit
 		ProxyInterface->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
 		U2.GlossEnd(ProxyInterface);
 	}
+	if (U2MaskBegin(PrimitiveCount))                // shotmask=1: the same geometry into the character mask
+	{
+		ProxyInterface->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
+		U2.MaskEnd(ProxyInterface);
+	}
 	return D3D_OK;
 }
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawIndexedPrimitive(D3DPRIMITIVETYPE PrimitiveType, UINT MinIndex, UINT NumVertices, UINT StartIndex, UINT PrimitiveCount)
@@ -1469,6 +1486,11 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawIndexedPrimitive(D3DPRIMITIVETYPE
 		ProxyInterface->DrawIndexedPrimitive(PrimitiveType, CurrentBaseVertexIndex, MinIndex, NumVertices, StartIndex, PrimitiveCount);
 		U2.GlossEnd(ProxyInterface);
 	}
+	if (U2MaskBegin(PrimitiveCount))                // shotmask=1: the same geometry into the character mask
+	{
+		ProxyInterface->DrawIndexedPrimitive(PrimitiveType, CurrentBaseVertexIndex, MinIndex, NumVertices, StartIndex, PrimitiveCount);
+		U2.MaskEnd(ProxyInterface);
+	}
 	return D3D_OK;
 }
 // lightprobe: a user-pointer draw's vertices: the first one raw, and the average length of floats 3-5
@@ -1502,6 +1524,11 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawPrimitiveUP(D3DPRIMITIVETYPE Prim
 		ProxyInterface->DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride);
 		U2.GlossEnd(ProxyInterface);
 	}
+	if (U2MaskBegin(PrimitiveCount))                // shotmask=1: the same geometry into the character mask
+	{
+		ProxyInterface->DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride);
+		U2.MaskEnd(ProxyInterface);
+	}
 	return D3D_OK;
 }
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawIndexedPrimitiveUP(D3DPRIMITIVETYPE PrimitiveType, UINT MinVertexIndex, UINT NumVertexIndices, UINT PrimitiveCount, const void *pIndexData, D3DFORMAT IndexDataFormat, const void *pVertexStreamZeroData, UINT VertexStreamZeroStride)
@@ -1519,6 +1546,11 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawIndexedPrimitiveUP(D3DPRIMITIVETY
 	{
 		ProxyInterface->DrawIndexedPrimitiveUP(PrimitiveType, MinVertexIndex, NumVertexIndices, PrimitiveCount, pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride);
 		U2.GlossEnd(ProxyInterface);
+	}
+	if (U2MaskBegin(PrimitiveCount))                // shotmask=1: the same geometry into the character mask
+	{
+		ProxyInterface->DrawIndexedPrimitiveUP(PrimitiveType, MinVertexIndex, NumVertexIndices, PrimitiveCount, pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride);
+		U2.MaskEnd(ProxyInterface);
 	}
 	return D3D_OK;
 }

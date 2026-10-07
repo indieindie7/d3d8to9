@@ -164,6 +164,8 @@ public:
 			;
 		else if (sscanf_s(Line, " rtdump=%d", &RtDump) == 1)
 			;
+		else if (sscanf_s(Line, " shotmask=%u", &Hash) == 1)
+			ShotMask = Hash != 0;
 		else if (sscanf_s(Line, " live=%u", &Hash) == 1)
 			LiveOn = Hash != 0;
 		else if (sscanf_s(Line, " gloss=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
@@ -1958,6 +1960,170 @@ public:
 		}
 		if (!LiveQueue.empty() && LiveWnd != nullptr)
 			PostMessageW(LiveWnd, LiveMsg, 0, 0);
+	}
+
+	// ---- shotmask=1: a character mask with each shotp frame ---------------------------------
+	// For visual QA (tools/python/visualqa): figure-ground and silhouette checks need to know which
+	// pixels are characters. When a shotp is asked for, the frame after it is drawn with a mask
+	// pass: each lit, solid, textured draw on screen (characters, their weapons; the level is
+	// lightmapped and unlit) is drawn again in flat white into a screen-sized target, tested
+	// against the scene's depth so walls in front still hide it. That frame is saved as
+	// ShotP#####.bmp as usual and the mask beside it as ShotP#####_mask.bmp (white = character).
+	bool ShotMask = false;
+	int MaskState = 0;                       // 0 idle, 1 this frame draws the mask
+	bool MaskCleared = false;
+	IDirect3DSurface9 *MaskRT = nullptr, *MaskOldRT = nullptr;
+	IDirect3DPixelShader9 *MaskPS = nullptr, *MaskOldPS = nullptr;
+	DWORD MaskOldRS[6];
+	bool MaskBroken = false;
+	std::string LastShotPath;
+	std::set<std::string> MaskSeen;          // shotmask: each kind of draw taken into the mask, logged once
+	bool MaskBegin(IDirect3DDevice9 *Dev, bool FixedFunction, bool Textured, DWORD Hash, UINT Prims)
+	{
+		if (MaskState != 1 || MaskBroken || !FixedFunction || !Textured || Offscreen(Dev))
+			return false;
+		DWORD Lit = 0, Blend = 0, Z = 0;
+		Dev->GetRenderState(D3DRS_LIGHTING, &Lit);
+		Dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &Blend);
+		Dev->GetRenderState(D3DRS_ZENABLE, &Z);
+		if (!Lit || Blend || !Z)
+			return false;
+		{
+			// Advent draws its level's static meshes through vertex declarations (no FVF) and
+			// lights them like characters; characters and their weapons come with an FVF
+			// (position, normal, texture). Only those go into the mask
+			DWORD Fvf = 0, Vb = 0;
+			Dev->GetFVF(&Fvf);
+			if (Fvf == 0)
+				return false;
+			Dev->GetRenderState(D3DRS_VERTEXBLEND, &Vb);
+			char K[96];
+			sprintf_s(K, "%08x fvf %x vb %u", Hash, Fvf, Vb);
+			if (MaskSeen.size() < 80 && MaskSeen.insert(K).second)
+				Message("shotmask: draw %s, %u triangles", K, Prims);
+		}
+		if (MaskPS == nullptr)
+		{
+			static const char Src[] = "float4 main() : COLOR { return float4(1, 1, 1, 1); }";
+			ID3DBlob *Code = nullptr, *Err = nullptr;
+			if (FAILED(D3DCompile(Src, sizeof(Src) - 1, "mask", nullptr, nullptr, "main", "ps_2_0", 0, 0, &Code, &Err)) || Code == nullptr
+				|| FAILED(Dev->CreatePixelShader((const DWORD *)Code->GetBufferPointer(), &MaskPS)))
+				MaskBroken = true;
+			if (Code) Code->Release();
+			if (Err) Err->Release();
+			if (MaskBroken)
+				return false;
+		}
+		IDirect3DSurface9 *RT = nullptr;
+		if (FAILED(Dev->GetRenderTarget(0, &RT)) || RT == nullptr)
+			return false;
+		D3DSURFACE_DESC D = {};
+		RT->GetDesc(&D);
+		if (MaskRT != nullptr)
+		{
+			D3DSURFACE_DESC M = {};
+			MaskRT->GetDesc(&M);
+			if (M.Width != D.Width || M.Height != D.Height) { MaskRT->Release(); MaskRT = nullptr; MaskCleared = false; }
+		}
+		if (MaskRT == nullptr && FAILED(Dev->CreateRenderTarget(D.Width, D.Height, D3DFMT_A8R8G8B8, D.MultiSampleType, D.MultiSampleQuality, FALSE, &MaskRT, nullptr)))
+		{
+			RT->Release();
+			MaskBroken = true;
+			Message("shotmask: no %ux%u mask target", D.Width, D.Height);
+			return false;
+		}
+		MaskOldRT = RT;                      // keeps the reference until MaskEnd
+		D3DVIEWPORT9 VP = {};
+		Dev->GetViewport(&VP);
+		Dev->SetRenderTarget(0, MaskRT);
+		Dev->SetViewport(&VP);               // SetRenderTarget resets it
+		if (!MaskCleared)
+		{
+			Dev->Clear(0, nullptr, D3DCLEAR_TARGET, 0, 1.0f, 0);
+			MaskCleared = true;
+		}
+		static const D3DRENDERSTATETYPE RS[6] = { D3DRS_ZWRITEENABLE, D3DRS_ZFUNC, D3DRS_COLORWRITEENABLE, D3DRS_FOGENABLE, D3DRS_ALPHABLENDENABLE, D3DRS_SRGBWRITEENABLE };
+		for (int i = 0; i < 6; i++)
+			Dev->GetRenderState(RS[i], &MaskOldRS[i]);
+		Dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+		Dev->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+		Dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+		Dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
+		Dev->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
+		Dev->GetPixelShader(&MaskOldPS);
+		Dev->SetPixelShader(MaskPS);
+		return true;
+	}
+	void MaskEnd(IDirect3DDevice9 *Dev)
+	{
+		static const D3DRENDERSTATETYPE RS[6] = { D3DRS_ZWRITEENABLE, D3DRS_ZFUNC, D3DRS_COLORWRITEENABLE, D3DRS_FOGENABLE, D3DRS_ALPHABLENDENABLE, D3DRS_SRGBWRITEENABLE };
+		for (int i = 0; i < 6; i++)
+			Dev->SetRenderState(RS[i], MaskOldRS[i]);
+		Dev->SetPixelShader(MaskOldPS);
+		if (MaskOldPS) { MaskOldPS->Release(); MaskOldPS = nullptr; }
+		D3DVIEWPORT9 VP = {};
+		Dev->GetViewport(&VP);
+		Dev->SetRenderTarget(0, MaskOldRT);
+		Dev->SetViewport(&VP);
+		if (MaskOldRT) { MaskOldRT->Release(); MaskOldRT = nullptr; }
+	}
+	// after the frame's shot: the mask beside it
+	void MaskSave(IDirect3DDevice9 *Dev)
+	{
+		MaskState = 0;
+		const bool Drawn = MaskCleared;
+		MaskCleared = false;
+		if (LastShotPath.empty())
+			return;
+		std::string Path = LastShotPath.substr(0, LastShotPath.size() - 4) + "_mask.bmp";
+		if (!Drawn || MaskRT == nullptr)
+		{
+			// nothing lit on screen: an all-black mask, so the frame still has one
+			FILE *F = nullptr;
+			if (!fopen_s(&F, Path.c_str(), "wb") && F)
+			{
+				BITMAPFILEHEADER FH = {}; BITMAPINFOHEADER IH = {};
+				FH.bfType = 0x4D42; FH.bfOffBits = sizeof(FH) + sizeof(IH); FH.bfSize = FH.bfOffBits + 4;
+				IH.biSize = sizeof(IH); IH.biWidth = 1; IH.biHeight = 1; IH.biPlanes = 1; IH.biBitCount = 24; IH.biSizeImage = 4;
+				const BYTE Px[4] = {};
+				fwrite(&FH, sizeof(FH), 1, F); fwrite(&IH, sizeof(IH), 1, F); fwrite(Px, 1, 4, F);
+				fclose(F);
+			}
+			return;
+		}
+		D3DSURFACE_DESC D = {};
+		MaskRT->GetDesc(&D);
+		IDirect3DSurface9 *Src = MaskRT, *Plain = nullptr, *Sys = nullptr;
+		if (D.MultiSampleType != D3DMULTISAMPLE_NONE
+			&& SUCCEEDED(Dev->CreateRenderTarget(D.Width, D.Height, D.Format, D3DMULTISAMPLE_NONE, 0, FALSE, &Plain, nullptr))
+			&& SUCCEEDED(Dev->StretchRect(MaskRT, nullptr, Plain, nullptr, D3DTEXF_NONE)))
+			Src = Plain;
+		D3DLOCKED_RECT L = {};
+		if (SUCCEEDED(Dev->CreateOffscreenPlainSurface(D.Width, D.Height, D.Format, D3DPOOL_SYSTEMMEM, &Sys, nullptr))
+			&& SUCCEEDED(Dev->GetRenderTargetData(Src, Sys)) && SUCCEEDED(Sys->LockRect(&L, nullptr, D3DLOCK_READONLY)))
+		{
+			FILE *F = nullptr;
+			if (!fopen_s(&F, Path.c_str(), "wb") && F)
+			{
+				const DWORD Row = (D.Width * 3 + 3) & ~3u, Size = Row * D.Height;
+				BITMAPFILEHEADER FH = {}; BITMAPINFOHEADER IH = {};
+				FH.bfType = 0x4D42; FH.bfOffBits = sizeof(FH) + sizeof(IH); FH.bfSize = FH.bfOffBits + Size;
+				IH.biSize = sizeof(IH); IH.biWidth = (LONG)D.Width; IH.biHeight = (LONG)D.Height; IH.biPlanes = 1; IH.biBitCount = 24; IH.biSizeImage = Size;
+				fwrite(&FH, sizeof(FH), 1, F); fwrite(&IH, sizeof(IH), 1, F);
+				std::vector<BYTE> Out(Row, 0);
+				for (UINT y = D.Height; y-- > 0;)
+				{
+					const BYTE *In = static_cast<const BYTE *>(L.pBits) + (size_t)y * L.Pitch;
+					for (UINT x = 0; x < D.Width; x++)
+						Out[x * 3] = Out[x * 3 + 1] = Out[x * 3 + 2] = In[x * 4 + 1];
+					fwrite(Out.data(), 1, Row, F);
+				}
+				fclose(F);
+			}
+			Sys->UnlockRect();
+		}
+		if (Sys) Sys->Release();
+		if (Plain) Plain->Release();
 	}
 
 	// rtdump=N (testing): the first N times the game leaves a 512x512 render target (a
@@ -5583,6 +5749,7 @@ public:
 			do
 				snprintf(Path, sizeof(Path), "%sShotP%05u.bmp", Dir.c_str(), Next++);
 			while (GetFileAttributesA(Path) != INVALID_FILE_ATTRIBUTES && Next < 100000);
+			LastShotPath = Path;
 			FILE *F = nullptr;
 			if (!fopen_s(&F, Path, "wb") && F)
 			{
@@ -6061,7 +6228,17 @@ public:
 			LastDev->EndScene();
 		}
 		if (ShotPWant && Dev != nullptr)
-			ShotP(Dev);
+		{
+			if (ShotMask && MaskState == 0 && !MaskBroken)
+				MaskState = 1;               // shotmask: the next frame draws the mask too, and is the one saved
+			else
+			{
+				const bool WithMask = MaskState == 1;
+				ShotP(Dev);
+				if (WithMask)
+					MaskSave(Dev);
+			}
+		}
 		if (PostTrace > 0 && !PostTraceLine.empty())
 		{
 			static int frame = 0;
