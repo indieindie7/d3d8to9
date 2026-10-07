@@ -69,6 +69,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <map>
 #include <set>
 #include <string>
@@ -139,6 +140,207 @@ public:
 		fclose(F);
 	}
 
+	// one line of U2Shaders.ini: a setting or a rule (Load, and ReloadRules when the file changes
+	// while the game runs; Reload: lines that only make sense once are left alone)
+	void ParseLine(char *Line, bool Reload)
+	{
+		char Name[256] = {};
+		unsigned Hash = 0;
+		if (sscanf_s(Line, " log=%u", &Hash) == 1)
+		{
+			Log = Hash != 0;
+			LogSolid = Hash >= 2;      // log=2: solid textures too (to find a glass= hash)
+		}
+		else if (sscanf_s(Line, " pcss=%u", &Hash) == 1)
+		{
+			Pcss = Hash != 0;
+			MapRule.File = "pcss_map.hlsl";
+			ProjRule.File = "pcss_proj.hlsl";
+		}
+		else if (sscanf_s(Line, " pcssparams=%f %f %f %f", &PcssParams[0], &PcssParams[1], &PcssParams[2], &PcssParams[3]) == 4)
+			;
+		else if (sscanf_s(Line, " pcssdebug=%f", &PcssDebug) == 1)
+			;
+		else if (sscanf_s(Line, " rtdump=%d", &RtDump) == 1)
+			;
+		else if (sscanf_s(Line, " live=%u", &Hash) == 1)
+			LiveOn = Hash != 0;
+		else if (sscanf_s(Line, " gloss=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
+		{
+			U2Rule R;
+			R.Hash = Hash;
+			R.File = Name;
+			GlossRules.push_back(R);
+		}
+		else if (sscanf_s(Line, " glossfx=%f %f %f %f", &GlossFx[0], &GlossFx[1], &GlossFx[2], &GlossFx[3]) >= 1)
+			;
+		else if (sscanf_s(Line, " glossenv=%f %f %f %f", &GlossEnv[0], &GlossEnv[1], &GlossEnv[2], &GlossEnv[3]) >= 3)
+			;
+		else if (sscanf_s(Line, " glossdry=%f %f %f %f", &GlossDry[0], &GlossDry[1], &GlossDry[2], &GlossDry[3]) >= 2)
+			;
+		else if (sscanf_s(Line, " relight=%u", &Hash) == 1)
+			Relight = Hash != 0;
+		else if (sscanf_s(Line, " pcssprobe=%u", &Hash) == 1)
+			PcssProbe = (int)Hash;
+		else if (sscanf_s(Line, " psreplace=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
+		{
+			// a pixel shader the game made (D3D8 tokens, hashed in CreatePixelShader) drawn with
+			// ours instead: Advent's terrain (PS_Terrain3Layer/4Layer) -> terrain3/4.hlsl
+			U2Rule R;
+			R.Hash = Hash;
+			R.File = Name;
+			PsReplace[Hash] = R;
+		}
+		else if (sscanf_s(Line, " pslog=%u", &Hash) == 1 && (PsLogCode = Hash >= 2, true))
+			PsLog = Hash != 0;
+		else if (sscanf_s(Line, " shadowtint=%f %f %f", &ShadowTint[0], &ShadowTint[1], &ShadowTint[2]) == 3)
+			;
+		else if (sscanf_s(Line, " charprobe=%u", &Hash) == 1)
+			CharProbe = Hash != 0;
+		else if (sscanf_s(Line, " lmcapture=%u", &Hash) == 1)
+			Capture = Hash != 0;
+		else if (sscanf_s(Line, " charlight=%u", &Hash) == 1)
+		{
+			CharLight = Hash != 0;
+			CharRule.File = "char_light.hlsl";
+		}
+		else if (sscanf_s(Line, " post=%u", &Hash) == 1)
+		{
+			Post = Hash != 0;
+			PostBright.File = "post_bright.hlsl";
+			PostBlur.File = "post_blur.hlsl";
+			PostFinal.File = "post_final.hlsl";
+			PostDown.File = "post_down.hlsl";
+			PostUp.File = "post_up.hlsl";
+		}
+		else if (_strnicmp(Line + strspn(Line, " \t"), "posthud=z0", 10) == 0)
+			PostHudZ0 = true;
+		else if (sscanf_s(Line, " posttrace=%u", &Hash) == 1)
+			PostTrace = (int)Hash;
+		else if (sscanf_s(Line, " postdebug=%u", &Hash) == 1)
+			PostDebug = Hash != 0;
+		else if (sscanf_s(Line, " postsplit=%u", &Hash) == 1)
+			PostSplit = Hash != 0 ? 1.0f : 0.0f;
+		else if (sscanf_s(Line, " bloom=%f %f", &PostBloom[0], &PostBloom[1]) == 2)
+			;
+		else if (sscanf_s(Line, " colorblind=%f %f", &PostBloom[2], &PostBloom[3]) >= 1)
+			;  // post_final: c1.z = 1 protanopia, 2 deuteranopia, 3 tritanopia; c1.w = strength
+		else if (sscanf_s(Line, " grade=%f %f %f %f", &PostGrade[0], &PostGrade[1], &PostGrade[2], &PostGrade[3]) == 4)
+			;
+		else if (sscanf_s(Line, " colour=%f %f %f", &PostBalance[0], &PostBalance[1], &PostBalance[2]) == 3)
+			;
+		else if (sscanf_s(Line, " sharpen=%f", &PostBalance[3]) == 1)
+			;
+		else if (sscanf_s(Line, " postfx=%f %f %f %f", &PostFx[0], &PostFx[1], &PostFx[2], &PostFx[3]) >= 1)
+			;
+		else if (strncmp(Line + strspn(Line, " \t"), "lut=", 4) == 0)
+		{
+			char F[260] = "";
+			sscanf_s(Line + strspn(Line, " \t") + 4, "%259s", F, (unsigned)sizeof(F));
+			if (LutFile != F)
+			{
+				LutFile = F;
+				if (LutTex) { LutTex->Release(); LutTex = nullptr; }
+				LutTried = false;
+			}
+		}
+		else if (sscanf_s(Line, " tint=%x", &Hash) == 1)
+		{
+			U2Rule R;
+			R.Hash = Hash;
+			Rules.push_back(R);
+		}
+		else if (sscanf_s(Line, " shader=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
+		{
+			U2Rule R;
+			R.Hash = Hash;
+			R.File = Name;
+			Rules.push_back(R);
+		}
+		else if (sscanf_s(Line, " stagelog=%u", &Hash) == 1)
+			StageLog = Hash != 0;
+		else if (sscanf_s(Line, " stagetrace=%u", &Hash) == 1)
+		{
+			StageLog = Hash != 0;          // stagetrace=N: every draw of N frames (from frame 600)
+			StageTrace = (int)Hash;
+		}
+		else if (sscanf_s(Line, " pbr=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
+		{
+			// (after the map: highlight strength and normal map strength, 1 1 if left out)
+			float Spec = 1, Bump = 1;
+			char Shader[256] = "";
+			sscanf_s(Line, " pbr=%*x %*s %f %f %255s", &Spec, &Bump, Shader, (unsigned)sizeof(Shader));
+			// a character's (or weapon's) texture shaded as a physically based material:
+			// char_pbr.hlsl with the D3D lights the game set, and <Name> as its material map
+			U2Rule R;
+			R.Hash = Hash;
+			R.File = "char_pbr.hlsl";
+			// a fifth value names another shader with the same inputs (char_skin.hlsl); such a
+			// rule also takes the texture's alpha-blended draws, the shader returning its alpha
+			if (strstr(Shader, ".hlsl") != nullptr)
+			{
+				R.File = Shader;
+				R.PbrBlend = true;
+			}
+			R.MapFile = Name;
+			R.Pbr = true;
+			R.Levels[0] = Spec;
+			R.Levels[1] = Bump;
+			Rules.push_back(R);
+		}
+		else if (sscanf_s(Line, " glass=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
+		{
+			// like shader=, for things the game draws solid (the Bio Rifle's goo): the
+			// shader gets the frame behind in s1 and draws the whole surface itself
+			U2Rule R;
+			R.Hash = Hash;
+			R.File = Name;
+			R.Solid = true;
+			Rules.push_back(R);
+		}
+		else if (sscanf_s(Line, " layer=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
+		{
+			U2Rule R;
+			R.Hash = Hash;
+			R.File = Name;
+			R.Layer = true;
+			Rules.push_back(R);
+		}
+		else if (sscanf_s(Line, " decal=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
+		{
+			U2Rule R;
+			R.Hash = Hash;
+			R.File = Name;
+			R.KeepBlend = true;
+			Rules.push_back(R);
+		}
+		else if (sscanf_s(Line, " replace=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
+			Replacements[Hash].File = Name;
+		else if (strncmp(Line + strspn(Line, " \t"), "texgrade=", 9) == 0)
+		{
+			float g[5] = { 1, 0, 1, 1, 1 };
+			if (sscanf_s(Line, " texgrade=%x %f %f %f %f %f", &Hash, &g[0], &g[1], &g[2], &g[3], &g[4]) >= 2)
+			{
+				U2Replace &R = Replacements[Hash];
+				R.Grade = true;
+				memcpy(R.G, g, sizeof(g));
+			}
+		}
+		else if (sscanf_s(Line, " bloodlive=%x", &Hash) == 1)
+		{
+			if (!Reload)
+				U2Blood::AddHash(Hash);         // the slots are fixed once pools exist
+		}             // a live blood pool's placeholder texture (blood.hpp), slot order
+		else if (sscanf_s(Line, " surface=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
+		{
+			U2Rule R;
+			R.Hash = Hash;
+			R.File = Name;
+			R.Surface = true;
+			Rules.push_back(R);
+		}
+	}
+
 	void Load()
 	{
 		Loaded = true;
@@ -155,199 +357,10 @@ public:
 		if (fopen_s(&F, (Dir + "U2Shaders.ini").c_str(), "r") || F == nullptr)
 			return;
 		char Line[512];
+		bool InMap = false, MapHit = false;
 		while (fgets(Line, sizeof(Line), F))
-		{
-			char Name[256] = {};
-			unsigned Hash = 0;
-			if (sscanf_s(Line, " log=%u", &Hash) == 1)
-			{
-				Log = Hash != 0;
-				LogSolid = Hash >= 2;      // log=2: solid textures too (to find a glass= hash)
-			}
-			else if (sscanf_s(Line, " pcss=%u", &Hash) == 1)
-			{
-				Pcss = Hash != 0;
-				MapRule.File = "pcss_map.hlsl";
-				ProjRule.File = "pcss_proj.hlsl";
-			}
-			else if (sscanf_s(Line, " pcssparams=%f %f %f %f", &PcssParams[0], &PcssParams[1], &PcssParams[2], &PcssParams[3]) == 4)
-				;
-			else if (sscanf_s(Line, " pcssdebug=%f", &PcssDebug) == 1)
-				;
-			else if (sscanf_s(Line, " rtdump=%d", &RtDump) == 1)
-				;
-			else if (sscanf_s(Line, " gloss=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
-			{
-				U2Rule R;
-				R.Hash = Hash;
-				R.File = Name;
-				GlossRules.push_back(R);
-			}
-			else if (sscanf_s(Line, " glossfx=%f %f %f %f", &GlossFx[0], &GlossFx[1], &GlossFx[2], &GlossFx[3]) >= 1)
-				;
-			else if (sscanf_s(Line, " glossenv=%f %f %f %f", &GlossEnv[0], &GlossEnv[1], &GlossEnv[2], &GlossEnv[3]) >= 3)
-				;
-			else if (sscanf_s(Line, " glossdry=%f %f %f %f", &GlossDry[0], &GlossDry[1], &GlossDry[2], &GlossDry[3]) >= 2)
-				;
-			else if (sscanf_s(Line, " relight=%u", &Hash) == 1)
-				Relight = Hash != 0;
-			else if (sscanf_s(Line, " pcssprobe=%u", &Hash) == 1)
-				PcssProbe = (int)Hash;
-			else if (sscanf_s(Line, " psreplace=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
-			{
-				// a pixel shader the game made (D3D8 tokens, hashed in CreatePixelShader) drawn with
-				// ours instead: Advent's terrain (PS_Terrain3Layer/4Layer) -> terrain3/4.hlsl
-				U2Rule R;
-				R.Hash = Hash;
-				R.File = Name;
-				PsReplace[Hash] = R;
-			}
-			else if (sscanf_s(Line, " pslog=%u", &Hash) == 1 && (PsLogCode = Hash >= 2, true))
-				PsLog = Hash != 0;
-			else if (sscanf_s(Line, " shadowtint=%f %f %f", &ShadowTint[0], &ShadowTint[1], &ShadowTint[2]) == 3)
-				;
-			else if (sscanf_s(Line, " charprobe=%u", &Hash) == 1)
-				CharProbe = Hash != 0;
-			else if (sscanf_s(Line, " lmcapture=%u", &Hash) == 1)
-				Capture = Hash != 0;
-			else if (sscanf_s(Line, " charlight=%u", &Hash) == 1)
-			{
-				CharLight = Hash != 0;
-				CharRule.File = "char_light.hlsl";
-			}
-			else if (sscanf_s(Line, " post=%u", &Hash) == 1)
-			{
-				Post = Hash != 0;
-				PostBright.File = "post_bright.hlsl";
-				PostBlur.File = "post_blur.hlsl";
-				PostFinal.File = "post_final.hlsl";
-				PostDown.File = "post_down.hlsl";
-				PostUp.File = "post_up.hlsl";
-			}
-			else if (_strnicmp(Line + strspn(Line, " \t"), "posthud=z0", 10) == 0)
-				PostHudZ0 = true;
-			else if (sscanf_s(Line, " posttrace=%u", &Hash) == 1)
-				PostTrace = (int)Hash;
-			else if (sscanf_s(Line, " postdebug=%u", &Hash) == 1)
-				PostDebug = Hash != 0;
-			else if (sscanf_s(Line, " postsplit=%u", &Hash) == 1)
-				PostSplit = Hash != 0 ? 1.0f : 0.0f;
-			else if (sscanf_s(Line, " bloom=%f %f", &PostBloom[0], &PostBloom[1]) == 2)
-				;
-			else if (sscanf_s(Line, " colorblind=%f %f", &PostBloom[2], &PostBloom[3]) >= 1)
-				;  // post_final: c1.z = 1 protanopia, 2 deuteranopia, 3 tritanopia; c1.w = strength
-			else if (sscanf_s(Line, " grade=%f %f %f %f", &PostGrade[0], &PostGrade[1], &PostGrade[2], &PostGrade[3]) == 4)
-				;
-			else if (sscanf_s(Line, " colour=%f %f %f", &PostBalance[0], &PostBalance[1], &PostBalance[2]) == 3)
-				;
-			else if (sscanf_s(Line, " sharpen=%f", &PostBalance[3]) == 1)
-				;
-			else if (sscanf_s(Line, " postfx=%f %f %f %f", &PostFx[0], &PostFx[1], &PostFx[2], &PostFx[3]) >= 1)
-				;
-			else if (strncmp(Line + strspn(Line, " \t"), "lut=", 4) == 0)
-			{
-				char F[260] = "";
-				sscanf_s(Line + strspn(Line, " \t") + 4, "%259s", F, (unsigned)sizeof(F));
-				if (LutFile != F)
-				{
-					LutFile = F;
-					if (LutTex) { LutTex->Release(); LutTex = nullptr; }
-					LutTried = false;
-				}
-			}
-			else if (sscanf_s(Line, " tint=%x", &Hash) == 1)
-			{
-				U2Rule R;
-				R.Hash = Hash;
-				Rules.push_back(R);
-			}
-			else if (sscanf_s(Line, " shader=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
-			{
-				U2Rule R;
-				R.Hash = Hash;
-				R.File = Name;
-				Rules.push_back(R);
-			}
-			else if (sscanf_s(Line, " stagelog=%u", &Hash) == 1)
-				StageLog = Hash != 0;
-			else if (sscanf_s(Line, " stagetrace=%u", &Hash) == 1)
-			{
-				StageLog = Hash != 0;          // stagetrace=N: every draw of N frames (from frame 600)
-				StageTrace = (int)Hash;
-			}
-			else if (sscanf_s(Line, " pbr=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
-			{
-				// (after the map: highlight strength and normal map strength, 1 1 if left out)
-				float Spec = 1, Bump = 1;
-				char Shader[256] = "";
-				sscanf_s(Line, " pbr=%*x %*s %f %f %255s", &Spec, &Bump, Shader, (unsigned)sizeof(Shader));
-				// a character's (or weapon's) texture shaded as a physically based material:
-				// char_pbr.hlsl with the D3D lights the game set, and <Name> as its material map
-				U2Rule R;
-				R.Hash = Hash;
-				R.File = "char_pbr.hlsl";
-				// a fifth value names another shader with the same inputs (char_skin.hlsl); such a
-				// rule also takes the texture's alpha-blended draws, the shader returning its alpha
-				if (strstr(Shader, ".hlsl") != nullptr)
-				{
-					R.File = Shader;
-					R.PbrBlend = true;
-				}
-				R.MapFile = Name;
-				R.Pbr = true;
-				R.Levels[0] = Spec;
-				R.Levels[1] = Bump;
-				Rules.push_back(R);
-			}
-			else if (sscanf_s(Line, " glass=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
-			{
-				// like shader=, for things the game draws solid (the Bio Rifle's goo): the
-				// shader gets the frame behind in s1 and draws the whole surface itself
-				U2Rule R;
-				R.Hash = Hash;
-				R.File = Name;
-				R.Solid = true;
-				Rules.push_back(R);
-			}
-			else if (sscanf_s(Line, " layer=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
-			{
-				U2Rule R;
-				R.Hash = Hash;
-				R.File = Name;
-				R.Layer = true;
-				Rules.push_back(R);
-			}
-			else if (sscanf_s(Line, " decal=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
-			{
-				U2Rule R;
-				R.Hash = Hash;
-				R.File = Name;
-				R.KeepBlend = true;
-				Rules.push_back(R);
-			}
-			else if (sscanf_s(Line, " replace=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
-				Replacements[Hash].File = Name;
-			else if (strncmp(Line + strspn(Line, " \t"), "texgrade=", 9) == 0)
-			{
-				float g[5] = { 1, 0, 1, 1, 1 };
-				if (sscanf_s(Line, " texgrade=%x %f %f %f %f %f", &Hash, &g[0], &g[1], &g[2], &g[3], &g[4]) >= 2)
-				{
-					U2Replace &R = Replacements[Hash];
-					R.Grade = true;
-					memcpy(R.G, g, sizeof(g));
-				}
-			}
-			else if (sscanf_s(Line, " bloodlive=%x", &Hash) == 1)
-				U2Blood::AddHash(Hash);             // a live blood pool's placeholder texture (blood.hpp), slot order
-			else if (sscanf_s(Line, " surface=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
-			{
-				U2Rule R;
-				R.Hash = Hash;
-				R.File = Name;
-				R.Surface = true;
-				Rules.push_back(R);
-			}
-		}
+			if (!MapSkip(Line, InMap, MapHit))
+				ParseLine(Line, false);
 		fclose(F);
 		Message("U2Shaders: log %d, %u rule(s), %u replacement(s), pcss %d (%g %g %g %g), shadow tint %g %g %g", (int)Log, (unsigned)Rules.size(), (unsigned)Replacements.size(), (int)Pcss,
 			PcssParams[0], PcssParams[1], PcssParams[2], PcssParams[3], ShadowTint[0], ShadowTint[1], ShadowTint[2]);
@@ -1695,6 +1708,159 @@ public:
 			if (GlossOldTex0) { GlossOldTex0->Release(); GlossOldTex0 = nullptr; }
 			GlossSwapped0 = false;
 		}
+	}
+
+	// ---- live command channel: console commands from outside, run on the game's thread ---------
+	// A tool (U2Avalon's live.py, AdventMod's live tools) writes lines to System\U2Live.cmd
+	// (atomically: a temporary file renamed into place). At the next Present the fork reads the
+	// file, deletes it and runs each line as a console command of the player's viewport
+	// (UViewport::Exec, the path a typed command takes: exec functions of the player, its
+	// interactions and mutators' ExecManagers all see it). Blank lines and lines starting with
+	// # or ; are skipped. Replies go to the game's own log.
+	//   System\U2Live.ack     the last "<word> batch N" line run (N), written after each file
+	//   System\U2Live.status  "up <unix seconds> <exe> <map>", rewritten every 2 seconds while
+	//                         the game runs: the channel is up when it is fresh
+	// Off unless U2Shaders.ini has live=1 (any program that can write the game's System folder
+	// could run console commands through it); every command run is logged.
+	bool LiveOn = false, LiveBroken = false;
+	DWORD LiveStatusTick = 0;
+	void *LiveViewport = nullptr;
+	typedef int (__fastcall *ViewportExec_t)(void *This, void *Edx, const wchar_t *Cmd, void *Out);
+	typedef const wchar_t *(__fastcall *ObjGetName_t)(void *This, void *Edx);
+	typedef void *(__fastcall *ObjGetClass_t)(void *This, void *Edx);
+	struct ObjArray { void **Data; int Num, Max; };
+	ViewportExec_t LiveExec = nullptr;
+	ObjGetName_t LiveGetName = nullptr;
+	ObjGetClass_t LiveGetClass = nullptr;
+	ObjArray *LiveObjs = nullptr;
+	void **LiveLog = nullptr;
+	bool LiveBind()
+	{
+		if (LiveExec != nullptr)
+			return true;
+		HMODULE Core = GetModuleHandleA("Core.dll"), Engine = GetModuleHandleA("Engine.dll");
+		if (!Core || !Engine)
+			return false;
+		LiveObjs = (ObjArray *)GetProcAddress(Core, "?GObjObjects@UObject@@1V?$TArray@PAVUObject@@@@A");
+		LiveGetName = (ObjGetName_t)GetProcAddress(Core, "?GetName@UObject@@QBEPBGXZ");
+		LiveGetClass = (ObjGetClass_t)GetProcAddress(Core, "?GetClass@UObject@@QBEPAVUClass@@XZ");
+		LiveLog = (void **)GetProcAddress(Core, "?GLog@@3PAVFOutputDevice@@A");
+		LiveExec = (ViewportExec_t)GetProcAddress(Engine, "?Exec@UViewport@@UAEHPBGAAVFOutputDevice@@@Z");
+		if (!LiveObjs || !LiveGetName || !LiveGetClass || !LiveLog || !LiveExec)
+		{
+			Message("live: the engine's exports aren't there (Core/Engine.dll): no command channel");
+			LiveExec = nullptr;
+			LiveBroken = true;
+			return false;
+		}
+		return true;
+	}
+	// the player's viewport: the first object whose class is a Viewport (WindowsViewport)
+	void *LiveFindViewport()
+	{
+		if (LiveViewport != nullptr && Readable(LiveViewport, 64))
+		{
+			void *C = LiveGetClass(LiveViewport, nullptr);
+			const wchar_t *N = C ? LiveGetName(C, nullptr) : nullptr;
+			if (N && wcsstr(N, L"Viewport"))
+				return LiveViewport;
+		}
+		LiveViewport = nullptr;
+		for (int i = 0; i < LiveObjs->Num; i++)
+		{
+			void *O = LiveObjs->Data[i];
+			if (O == nullptr || !Readable(O, 64))
+				continue;
+			void *C = LiveGetClass(O, nullptr);
+			if (C == nullptr)
+				continue;
+			const wchar_t *CN = LiveGetName(C, nullptr);
+			if (CN == nullptr || wcscmp(CN, L"Class") == 0)
+				continue;
+			const size_t L = wcslen(CN);
+			if (L >= 8 && wcscmp(CN + L - 8, L"Viewport") == 0)
+			{
+				LiveViewport = O;
+				Message("live: player viewport %ls", LiveGetName(O, nullptr));
+				break;
+			}
+		}
+		return LiveViewport;
+	}
+	void LiveStatus()
+	{
+		if (GetTickCount() - LiveStatusTick < 2000)
+			return;
+		LiveStatusTick = GetTickCount();
+		char Exe[MAX_PATH] = {};
+		GetModuleFileNameA(nullptr, Exe, MAX_PATH);
+		const char *Base = strrchr(Exe, '\\') ? strrchr(Exe, '\\') + 1 : Exe;
+		FILE *F = nullptr;
+		if (!fopen_s(&F, (Dir + "U2Live.status").c_str(), "w") && F)
+		{
+			fprintf(F, "up %lld %s %s\n", (long long)time(nullptr), Base, CurMap.empty() ? "?" : CurMap.c_str());
+			fclose(F);
+		}
+	}
+	void LivePoll()
+	{
+		if (!LiveOn || LiveBroken || Dir.empty())
+			return;
+		LiveStatus();
+		const std::string Path = Dir + "U2Live.cmd";
+		if (GetFileAttributesA(Path.c_str()) == INVALID_FILE_ATTRIBUTES)
+			return;
+		std::string Text;
+		{
+			FILE *F = nullptr;
+			if (fopen_s(&F, Path.c_str(), "rb") || F == nullptr)
+				return;                         // still being written: the next frame
+			char Buf[4096];
+			size_t n;
+			while ((n = fread(Buf, 1, sizeof(Buf), F)) > 0)
+				Text.append(Buf, n);
+			fclose(F);
+		}
+		DeleteFileA(Path.c_str());
+		if (!LiveBind() || LiveFindViewport() == nullptr)
+		{
+			Message("live: commands arrived but there is no viewport yet; dropped");
+			return;
+		}
+		int Ran = 0;
+		long long Batch = -1;
+		size_t At = 0;
+		while (At < Text.size())
+		{
+			size_t End = Text.find('\n', At);
+			if (End == std::string::npos)
+				End = Text.size();
+			std::string L = Text.substr(At, End - At);
+			At = End + 1;
+			while (!L.empty() && (L.back() == '\r' || L.back() == ' ' || L.back() == '\t'))
+				L.pop_back();
+			const size_t S = L.find_first_not_of(" \t");
+			if (S == std::string::npos || L[S] == '#' || L[S] == ';')
+				continue;
+			L = L.substr(S);
+			{
+				char W1[64] = "", W2[64] = "";
+				long long N = 0;
+				if (sscanf_s(L.c_str(), "%63s %63s %lld", W1, (unsigned)sizeof(W1), W2, (unsigned)sizeof(W2), &N) == 3 && _stricmp(W2, "batch") == 0)
+					Batch = N;
+			}
+			Message("live: > %s", L.c_str());
+			std::wstring Cmd(L.begin(), L.end());
+			LiveExec(LiveViewport, nullptr, Cmd.c_str(), *LiveLog);
+			Ran++;
+		}
+		FILE *A = nullptr;
+		if (Batch >= 0 && !fopen_s(&A, (Dir + "U2Live.ack").c_str(), "w") && A)
+		{
+			fprintf(A, "%lld\n", Batch);
+			fclose(A);
+		}
+		Message("live: ran %d command(s)%s", Ran, Batch >= 0 ? (" (batch " + std::to_string(Batch) + ")").c_str() : "");
 	}
 
 	// rtdump=N (testing): the first N times the game leaves a 512x512 render target (a
@@ -5360,6 +5526,256 @@ public:
 		BB->Release();
 	}
 
+	// ---- live look edits: U2Shaders.ini and the shaders reload while the game runs -------------
+	// Every 10 frames the ini's time is checked (ReloadPost): when it changes, the post settings
+	// are read again and so are the rules (ReloadRules: shader/glass/layer/decal/surface/pbr/
+	// gloss/psreplace/replace/texgrade; compiled shaders and made textures are dropped and remade
+	// on their next draw). Every 30 frames each shader file a rule uses is checked
+	// (WatchShaders): an edited .hlsl is compiled again at its next draw.
+	// Per-map settings: a line "map=NAME" starts a part of the ini that applies only while the
+	// map's name contains NAME (case ignored); "map=*" ends it. The map's name is read from the
+	// game's own log (the last "Browse: " line, as Unreal-engine games log a level load), the
+	// log being <exe name>.log next to the exe unless maplog=FILE names another. So a level can
+	// have its own grade=, lut=, colour=, bloom=, rules... without changing the others.
+	std::string CurMap, MapLogFile;
+	long long MapLogSize = 0;
+	bool MapSkip(const char *Line, bool &InMap, bool &MapHit)
+	{
+		const char *L = Line + strspn(Line, " \t");
+		if (_strnicmp(L, "map=", 4) == 0)
+		{
+			char N[128] = "";
+			sscanf_s(L + 4, "%127s", N, (unsigned)sizeof(N));
+			for (char *c = N; *c; c++)
+				*c = (char)tolower((unsigned char)*c);
+			InMap = strcmp(N, "*") != 0 && N[0] != 0;
+			MapHit = InMap && !CurMap.empty() && CurMap.find(N) != std::string::npos;
+			return true;
+		}
+		if (_strnicmp(L, "maplog=", 7) == 0)
+		{
+			char N[260] = "";
+			sscanf_s(L + 7, "%259s", N, (unsigned)sizeof(N));
+			MapLogFile = N;
+			return true;
+		}
+		return InMap && !MapHit;
+	}
+	// The map's name from the engine itself (read only): the package holding the newest
+	// LevelInfo object (the level's own actor; menu and entry levels have one too), through
+	// Core.dll's exported object list. Checked every 60 frames; the log is the fallback.
+	typedef const wchar_t *(__fastcall *ObjName_t)(void *This, void *Edx);
+	typedef void *(__fastcall *ObjPtr_t)(void *This, void *Edx);
+	struct ObjList { void **Data; int Num, Max; };
+	ObjList *EngObjs = nullptr;
+	ObjName_t EngName = nullptr;
+	ObjPtr_t EngClass = nullptr, EngOuter = nullptr;
+	bool EngTried = false;
+	void *EngLevel = nullptr;
+	int EngLevelAt = -1;
+	static bool Readable(const void *P, SIZE_T N)
+	{
+		MEMORY_BASIC_INFORMATION Mi;
+		if (!P || !VirtualQuery(P, &Mi, sizeof(Mi)) || Mi.State != MEM_COMMIT || (Mi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+			return false;
+		return (const BYTE *)P + N <= (const BYTE *)Mi.BaseAddress + Mi.RegionSize;
+	}
+	std::string EngineMap()
+	{
+		if (!EngTried)
+		{
+			EngTried = true;
+			if (HMODULE Core = GetModuleHandleA("Core.dll"))
+			{
+				EngObjs = (ObjList *)GetProcAddress(Core, "?GObjObjects@UObject@@1V?$TArray@PAVUObject@@@@A");
+				EngName = (ObjName_t)GetProcAddress(Core, "?GetName@UObject@@QBEPBGXZ");
+				EngClass = (ObjPtr_t)GetProcAddress(Core, "?GetClass@UObject@@QBEPAVUClass@@XZ");
+				EngOuter = (ObjPtr_t)GetProcAddress(Core, "?GetOuter@UObject@@QBEPAV1@XZ");
+			}
+			if (!EngObjs || !EngName || !EngClass || !EngOuter)
+				EngObjs = nullptr;
+		}
+		if (EngObjs == nullptr || !Readable(EngObjs, sizeof(ObjList)))
+			return "";
+		// the one found last time still in its slot: the same map (a level change frees it)
+		if (EngLevelAt >= 0 && EngLevelAt < EngObjs->Num && EngObjs->Data[EngLevelAt] == EngLevel)
+			return CurMap;
+		EngLevel = nullptr;
+		EngLevelAt = -1;
+		std::string Found;
+		for (int i = EngObjs->Num - 1; i >= 0 && Found.empty(); i--)
+		{
+			void *O = EngObjs->Data[i];
+			if (O == nullptr)
+				continue;
+			void *C = EngClass(O, nullptr);
+			const wchar_t *CN = C ? EngName(C, nullptr) : nullptr;
+			if (CN == nullptr)
+				continue;
+			const size_t L = wcslen(CN);
+			if (L < 9 || wcscmp(CN + L - 9, L"LevelInfo") != 0)
+				continue;
+			// the outermost package is the map
+			void *Pkg = O;
+			for (int d = 0; d < 8; d++)
+			{
+				void *Up = EngOuter(Pkg, nullptr);
+				if (Up == nullptr)
+					break;
+				Pkg = Up;
+			}
+			const wchar_t *PN = EngName(Pkg, nullptr);
+			if (PN == nullptr || _wcsicmp(PN, L"Entry") == 0)
+				continue;
+			for (const wchar_t *c = PN; *c; c++)
+				Found += (char)towlower(*c);
+			EngLevel = O;
+			EngLevelAt = i;
+		}
+		return Found;
+	}
+	// true when the game has gone to another map since the last look
+	bool WatchMap()
+	{
+		if (Frame % 60 == 0)
+		{
+			std::string M = EngineMap();
+			if (!M.empty())
+			{
+				if (M == CurMap)
+					return false;
+				CurMap = M;
+				Message("live: map %s (from the engine; its map= parts of U2Shaders.ini apply)", CurMap.c_str());
+				return true;
+			}
+		}
+		else if (EngObjs != nullptr)
+			return false;
+		std::string Path = MapLogFile;
+		if (Path.empty())
+		{
+			char Exe[MAX_PATH] = {};
+			GetModuleFileNameA(nullptr, Exe, MAX_PATH);
+			Path = Exe;
+			Path = Path.substr(0, Path.find_last_of('.')) + ".log";
+		}
+		else if (Path.find(':') == std::string::npos)
+			Path = Dir + Path;
+		WIN32_FILE_ATTRIBUTE_DATA A = {};
+		if (!GetFileAttributesExA(Path.c_str(), GetFileExInfoStandard, &A))
+			return false;
+		const long long Size = ((long long)A.nFileSizeHigh << 32) | A.nFileSizeLow;
+		if (Size == MapLogSize)
+			return false;
+		const long long From = Size < MapLogSize ? 0 : MapLogSize;   // a new log: from the start
+		MapLogSize = Size;
+		HANDLE H = CreateFileA(Path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+		if (H == INVALID_HANDLE_VALUE)
+			return false;
+		const long long Want = (std::min)(Size - From, 262144LL);
+		LARGE_INTEGER At; At.QuadPart = Size - Want;
+		SetFilePointerEx(H, At, nullptr, FILE_BEGIN);
+		std::string Buf((size_t)Want, '\0');
+		DWORD Got = 0;
+		ReadFile(H, &Buf[0], (DWORD)Want, &Got, nullptr);
+		CloseHandle(H);
+		Buf.resize(Got);
+		// the log may be UTF-16 (Unreal Engine 2 logs often are): keep the low bytes
+		if (Buf.size() > 1 && Buf.find('\0') != std::string::npos)
+		{
+			std::string N;
+			for (char c : Buf)
+				if (c != '\0')
+					N += c;
+			Buf.swap(N);
+		}
+		const size_t B = Buf.rfind("Browse: ");
+		if (B == std::string::npos)
+			return false;
+		std::string Url = Buf.substr(B + 8, Buf.find_first_of("?\r\n \t", B + 8) - (B + 8));
+		const size_t Slash = Url.find_last_of("/\\");
+		if (Slash != std::string::npos)
+			Url = Url.substr(Slash + 1);
+		const size_t Dot = Url.find('.');
+		if (Dot != std::string::npos)
+			Url = Url.substr(0, Dot);
+		for (char &c : Url)
+			c = (char)tolower((unsigned char)c);
+		if (Url.empty() || Url == CurMap)
+			return false;
+		CurMap = Url;
+		Message("live: map %s (its map= parts of U2Shaders.ini apply)", CurMap.c_str());
+		return true;
+	}
+	static void DropShader(U2Rule &R)
+	{
+		if (R.PS) { R.PS->Release(); R.PS = nullptr; }
+		R.Tried = false;
+	}
+	void ReloadRules()
+	{
+		for (U2Rule &R : Rules)
+		{
+			DropShader(R);
+			if (R.Map) { R.Map->Release(); R.Map = nullptr; }
+		}
+		for (U2Rule &R : GlossRules)
+			DropShader(R);
+		for (auto &It : PsReplace)
+			DropShader(It.second);
+		for (auto &It : Replacements)
+			if (It.second.Tex) { It.second.Tex->Release(); It.second.Tex = nullptr; }
+		Rules.clear();
+		GlossRules.clear();
+		PsReplace.clear();
+		Replacements.clear();
+		FILE *F = nullptr;
+		if (fopen_s(&F, (Dir + "U2Shaders.ini").c_str(), "r") || F == nullptr)
+			return;
+		char Line[512];
+		bool InMap = false, MapHit = false;
+		while (fgets(Line, sizeof(Line), F))
+			if (!MapSkip(Line, InMap, MapHit))
+				ParseLine(Line, true);
+		fclose(F);
+		Message("live: U2Shaders.ini reloaded (%u rule(s), %u gloss, %u replacement(s), map %s)", (unsigned)Rules.size(), (unsigned)GlossRules.size(), (unsigned)Replacements.size(), CurMap.empty() ? "?" : CurMap.c_str());
+	}
+	// an edited shader file: every rule using it compiles it again at its next draw
+	std::map<std::string, FILETIME> ShaderTimes;
+	void WatchShaders()
+	{
+		std::vector<U2Rule *> All;
+		for (U2Rule &R : Rules) All.push_back(&R);
+		for (U2Rule &R : GlossRules) All.push_back(&R);
+		for (auto &It : PsReplace) All.push_back(&It.second);
+		U2Rule *Fixed[] = { &PostBright, &PostBlur, &PostFinal, &PostDown, &PostUp, &CharRule, &MapRule, &ProjRule };
+		for (U2Rule *R : Fixed) All.push_back(R);
+		std::set<std::string> Changed;
+		for (U2Rule *R : All)
+		{
+			if (R->File.empty() || Changed.count(R->File))
+				continue;
+			WIN32_FILE_ATTRIBUTE_DATA A = {};
+			if (!GetFileAttributesExA((Dir + "U2Shaders\\" + R->File).c_str(), GetFileExInfoStandard, &A))
+				continue;
+			auto It = ShaderTimes.find(R->File);
+			if (It == ShaderTimes.end())
+				ShaderTimes[R->File] = A.ftLastWriteTime;
+			else if (CompareFileTime(&It->second, &A.ftLastWriteTime) != 0)
+			{
+				It->second = A.ftLastWriteTime;
+				Changed.insert(R->File);
+			}
+		}
+		if (Changed.empty())
+			return;
+		for (U2Rule *R : All)
+			if (Changed.count(R->File))
+				DropShader(*R);
+		for (const std::string &F : Changed)
+			Message("live: %s changed, compiled again at its next draw", F.c_str());
+	}
+
 	void ReloadPost(bool Force)
 	{
 		WIN32_FILE_ATTRIBUTE_DATA A = {};
@@ -5375,14 +5791,18 @@ public:
 		if (Force)
 			Message("post: watching U2Shaders.ini for changes (frame %u)", Frame);
 		IniTime = A.ftLastWriteTime;
+		if (!Force)
+			ReloadRules();
 		FILE *F = nullptr;
 		if (fopen_s(&F, (Dir + "U2Shaders.ini").c_str(), "r") || F == nullptr)
 			return;
 		char Line[512];
-		bool Seen = false;
+		bool Seen = false, InMap = false, MapHit = false;
 		unsigned V = 0;
 		while (fgets(Line, sizeof(Line), F))
 		{
+			if (MapSkip(Line, InMap, MapHit))
+				continue;
 			for (char *c = Line; *c; c++)
 				*c = (char)tolower((unsigned char)*c);
 			if (sscanf_s(Line, " shotp=%u", &V) == 1)
@@ -5510,7 +5930,15 @@ public:
 	void OnPresent(IDirect3DDevice9 *Dev)
 	{
 		if (Loaded && Frame % 10 == 0)
-			ReloadPost(IniTime.dwLowDateTime == 0 && IniTime.dwHighDateTime == 0);
+		{
+			if (WatchMap())
+				IniTime = {};                  // a new map: its map= sections apply (post settings and rules)
+			ReloadPost(IniTime.dwLowDateTime == 0 && IniTime.dwHighDateTime == 0 && Frame < 20);
+		}
+		if (Loaded && Frame % 30 == 15)
+			WatchShaders();
+		if (Loaded)
+			LivePoll();
 		if (U2Blood::Count > 0)
 			U2Blood::Step(Dev);
 		DepthDirty = true;
