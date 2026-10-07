@@ -15,6 +15,11 @@
  *                                 the same, but the draw keeps its own blending (no frame
  *                                 copy in s1): the shader returns what the texture would
  *                                 have, so overlapping decals still layer
+ *     gloss=1a2b3c4d blood_gloss.hlsl
+ *                                 after the game draws that texture (a decal), the same
+ *                                 geometry is drawn once more with the shader, added on top
+ *                                 (ONE/ONE): wet highlights on blood that the game multiplies
+ *                                 into the floor. See GlossBegin; glossfx= / glossenv= tune it
  *     surface=1a2b3c4d world_parallax.hlsl
  *                                 a solid surface (wall, floor) drawn with parallax: the
  *                                 shader redoes the texture stages (texture x vertex colour
@@ -170,6 +175,17 @@ public:
 			else if (sscanf_s(Line, " pcssdebug=%f", &PcssDebug) == 1)
 				;
 			else if (sscanf_s(Line, " rtdump=%d", &RtDump) == 1)
+				;
+			else if (sscanf_s(Line, " gloss=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
+			{
+				U2Rule R;
+				R.Hash = Hash;
+				R.File = Name;
+				GlossRules.push_back(R);
+			}
+			else if (sscanf_s(Line, " glossfx=%f %f %f %f", &GlossFx[0], &GlossFx[1], &GlossFx[2], &GlossFx[3]) >= 1)
+				;
+			else if (sscanf_s(Line, " glossenv=%f %f %f %f", &GlossEnv[0], &GlossEnv[1], &GlossEnv[2], &GlossEnv[3]) >= 3)
 				;
 			else if (sscanf_s(Line, " relight=%u", &Hash) == 1)
 				Relight = Hash != 0;
@@ -1424,6 +1440,173 @@ public:
 				told[A.Width] = true;
 				Message("pcss copy %ux%u fmt %u -> %ux%u fmt %u usage %x pool %u\n", A.Width, A.Height, (unsigned)A.Format, B.Width, B.Height, (unsigned)B.Format, (unsigned)B.Usage, (unsigned)B.Pool);
 			}
+		}
+	}
+
+	// ---- gloss= : wet highlights added over a decal -----------------------------------------
+	// Advent's blood decals multiply the floor (twice the floor times the texture, mid-grey =
+	// unchanged), which can darken and redden but never shine. After such a draw the device
+	// draws the same geometry again (U2GlossBegin) with the rule's shader, blended ONE/ONE: what
+	// the shader returns is added. The shader gets what decal= shaders get (s0 the decal,
+	// TEXCOORD0 its coordinates, projected when c1.x = 1; TEXCOORD2 the camera-space position;
+	// c0 time, 1, 1/w, 1/h; c1.yz blend kind and neutral brightness; c4..c7 the projection) and:
+	//   c2  glossfx=  strength, highlight sharpness (Blinn exponent), light gain, sheen gain
+	//   c3  glossenv= the colour a grazing look reflects (r g b, and a multiplier)
+	//   c8..c15 up to 4 of the game's lights in camera space, nearest the camera first:
+	//       c8+2i = position (or the direction toward a directional light) and range (0:
+	//       directional), c9+2i = colour and 1 if used. The lights are the ones the game set for
+	//       lit draws (characters) in the frame before (gi's light gathering: gi=1 or ssao=1).
+	// Fog stays on with a black fog colour, so highlights fade with distance like the rest.
+	std::vector<U2Rule> GlossRules;
+	std::vector<D3DLIGHT9> GlossLights;
+	float GlossFx[4] = { 1.0f, 90.0f, 1.0f, 0.35f };
+	float GlossEnv[4] = { 0.55f, 0.6f, 0.68f, 1.0f };
+	IDirect3DPixelShader9 *GlossOldPS = nullptr;
+	IDirect3DBaseTexture9 *GlossOldTex0 = nullptr;
+	float GlossOldConst[16][4];
+	DWORD GlossOldRS[6], GlossOldTCI[3], GlossOldTTF[3];
+	D3DMATRIX GlossOldTexMat[3];
+	bool GlossSwapped0 = false;
+	// before the second draw: false = no gloss for this one
+	bool GlossBegin(IDirect3DDevice9 *Dev, IDirect3DTexture9 *Tex, DWORD Hash, bool FixedFunction)
+	{
+		U2Rule *R = nullptr;
+		for (U2Rule &G : GlossRules)
+			if (G.Hash == Hash)
+				R = &G;
+		if (R == nullptr || !FixedFunction || Offscreen(Dev))
+			return false;
+		DWORD Blending = 0;
+		Dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &Blending);
+		if (!Blending)
+			return false;
+		IDirect3DPixelShader9 *PS = Compile(Dev, *R);
+		if (PS == nullptr)
+			return false;
+		float C[16][4] = {};
+		// the decal's blending, as decal= rules read it (before ours replaces it)
+		{
+			DWORD Src = 0, Dst = 0;
+			Dev->GetRenderState(D3DRS_SRCBLEND, &Src);
+			Dev->GetRenderState(D3DRS_DESTBLEND, &Dst);
+			C[1][1] = 0; C[1][2] = 1;
+			if ((Src == D3DBLEND_DESTCOLOR && Dst == D3DBLEND_SRCCOLOR) || (Src == D3DBLEND_SRCCOLOR && Dst == D3DBLEND_DESTCOLOR)) { C[1][1] = 2; C[1][2] = 0.5f; }
+			else if ((Src == D3DBLEND_DESTCOLOR && Dst == D3DBLEND_ZERO) || (Src == D3DBLEND_ZERO && Dst == D3DBLEND_SRCCOLOR)) { C[1][1] = 1; C[1][2] = 1; }
+		}
+		static const D3DRENDERSTATETYPE RS[6] = { D3DRS_ALPHABLENDENABLE, D3DRS_SRCBLEND, D3DRS_DESTBLEND, D3DRS_BLENDOP, D3DRS_FOGCOLOR, D3DRS_ZWRITEENABLE };
+		for (int i = 0; i < 6; i++)
+			Dev->GetRenderState(RS[i], &GlossOldRS[i]);
+		Dev->GetPixelShader(&GlossOldPS);
+		Dev->GetPixelShaderConstantF(0, GlossOldConst[0], 16);
+		// the live blood pools' simulated sheet in place of their placeholder, as for the draw itself
+		GlossSwapped0 = false;
+		DWORD H = Hash;
+		if (IDirect3DTexture9 *Rep = Replacement(Dev, Tex, H))
+		{
+			Dev->GetTexture(0, &GlossOldTex0);
+			Dev->SetTexture(0, Rep);
+			GlossSwapped0 = true;
+		}
+		// camera-space normal and position from stages 1 and 2 (as Begin does)
+		static const D3DMATRIX Identity = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+		Dev->GetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, &GlossOldTTF[0]);
+		for (DWORD s = 1; s <= 2; s++)
+		{
+			Dev->GetTextureStageState(s, D3DTSS_TEXCOORDINDEX, &GlossOldTCI[s]);
+			Dev->GetTextureStageState(s, D3DTSS_TEXTURETRANSFORMFLAGS, &GlossOldTTF[s]);
+			Dev->GetTransform((D3DTRANSFORMSTATETYPE)(D3DTS_TEXTURE0 + s), &GlossOldTexMat[s]);
+			Dev->SetTextureStageState(s, D3DTSS_TEXCOORDINDEX, (s == 1 ? D3DTSS_TCI_CAMERASPACENORMAL : D3DTSS_TCI_CAMERASPACEPOSITION) | s);
+			Dev->SetTextureStageState(s, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT3);
+			Dev->SetTransform((D3DTRANSFORMSTATETYPE)(D3DTS_TEXTURE0 + s), &Identity);
+		}
+		C[0][0] = (GetTickCount() % 3600000) / 1000.0f;
+		C[0][1] = 1;
+		C[0][2] = SceneW ? 1.0f / SceneW : 0;
+		C[0][3] = SceneH ? 1.0f / SceneH : 0;
+		C[1][0] = (GlossOldTTF[0] & D3DTTFF_PROJECTED) ? 1.0f : 0.0f;
+		memcpy(C[2], GlossFx, sizeof(GlossFx));
+		memcpy(C[3], GlossEnv, sizeof(GlossEnv));
+		D3DMATRIX P, V;
+		Dev->GetTransform(D3DTS_PROJECTION, &P);
+		Dev->GetTransform(D3DTS_VIEW, &V);
+		for (int r = 0; r < 4; r++)
+			for (int c = 0; c < 4; c++)
+				C[4 + r][c] = P.m[r][c];
+		// the lights in camera space, the nearest four (directional ones count as nearest)
+		struct Near { float D; int I; };
+		std::vector<Near> Order;
+		for (size_t i = 0; i < GlossLights.size(); i++)
+		{
+			const D3DLIGHT9 &L = GlossLights[i];
+			float D = 0;
+			if (L.Type != D3DLIGHT_DIRECTIONAL)
+			{
+				const D3DVECTOR &p = L.Position;
+				const float cx = p.x * V._11 + p.y * V._21 + p.z * V._31 + V._41;
+				const float cy = p.x * V._12 + p.y * V._22 + p.z * V._32 + V._42;
+				const float cz = p.x * V._13 + p.y * V._23 + p.z * V._33 + V._43;
+				D = sqrtf(cx * cx + cy * cy + cz * cz);
+			}
+			Order.push_back({ D, (int)i });
+		}
+		std::sort(Order.begin(), Order.end(), [](const Near &A, const Near &B) { return A.D < B.D; });
+		for (size_t k = 0; k < Order.size() && k < 4; k++)
+		{
+			const D3DLIGHT9 &L = GlossLights[Order[k].I];
+			float *Pos = C[8 + 2 * k], *Col = C[9 + 2 * k];
+			if (L.Type == D3DLIGHT_DIRECTIONAL)
+			{
+				const D3DVECTOR &d = L.Direction;
+				Pos[0] = -(d.x * V._11 + d.y * V._21 + d.z * V._31);
+				Pos[1] = -(d.x * V._12 + d.y * V._22 + d.z * V._32);
+				Pos[2] = -(d.x * V._13 + d.y * V._23 + d.z * V._33);
+				Pos[3] = 0;
+			}
+			else
+			{
+				const D3DVECTOR &p = L.Position;
+				Pos[0] = p.x * V._11 + p.y * V._21 + p.z * V._31 + V._41;
+				Pos[1] = p.x * V._12 + p.y * V._22 + p.z * V._32 + V._42;
+				Pos[2] = p.x * V._13 + p.y * V._23 + p.z * V._33 + V._43;
+				Pos[3] = L.Range > 1 ? L.Range : 1000;
+			}
+			Col[0] = L.Diffuse.r; Col[1] = L.Diffuse.g; Col[2] = L.Diffuse.b; Col[3] = 1;
+		}
+		Dev->SetPixelShaderConstantF(0, C[0], 16);
+		Dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+		Dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);
+		Dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);
+		Dev->SetRenderState(D3DRS_BLENDOP, D3DBLENDOP_ADD);
+		Dev->SetRenderState(D3DRS_FOGCOLOR, 0);
+		Dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+		Dev->SetPixelShader(PS);
+		static bool Told = false;
+		if (!Told)
+		{
+			Told = true;
+			Message("gloss: first draw (%08x with %s, %d of the game's lights)", Hash, R->File.c_str(), (int)GlossLights.size());
+		}
+		return true;
+	}
+	void GlossEnd(IDirect3DDevice9 *Dev)
+	{
+		static const D3DRENDERSTATETYPE RS[6] = { D3DRS_ALPHABLENDENABLE, D3DRS_SRCBLEND, D3DRS_DESTBLEND, D3DRS_BLENDOP, D3DRS_FOGCOLOR, D3DRS_ZWRITEENABLE };
+		for (int i = 0; i < 6; i++)
+			Dev->SetRenderState(RS[i], GlossOldRS[i]);
+		Dev->SetPixelShader(GlossOldPS);
+		if (GlossOldPS) { GlossOldPS->Release(); GlossOldPS = nullptr; }
+		Dev->SetPixelShaderConstantF(0, GlossOldConst[0], 16);
+		for (DWORD s = 1; s <= 2; s++)
+		{
+			Dev->SetTextureStageState(s, D3DTSS_TEXCOORDINDEX, GlossOldTCI[s]);
+			Dev->SetTextureStageState(s, D3DTSS_TEXTURETRANSFORMFLAGS, GlossOldTTF[s]);
+			Dev->SetTransform((D3DTRANSFORMSTATETYPE)(D3DTS_TEXTURE0 + s), &GlossOldTexMat[s]);
+		}
+		if (GlossSwapped0)
+		{
+			Dev->SetTexture(0, GlossOldTex0);
+			if (GlossOldTex0) { GlossOldTex0->Release(); GlossOldTex0 = nullptr; }
+			GlossSwapped0 = false;
 		}
 	}
 
@@ -5245,6 +5428,7 @@ public:
 			U2Blood::Step(Dev);
 		DepthDirty = true;
 		SceneProjOk = false;
+		GlossLights = GiFrameLights;             // gloss=: the game's lights of the frame just shown
 		GiFrameLights.clear();
 		GiSlotDirty = true;
 		SegDraws = KeptDraws = 0;

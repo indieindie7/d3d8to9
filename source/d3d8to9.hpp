@@ -172,6 +172,7 @@ public:
 private:
 	bool U2Begin();
 	void U2After(bool Shaded);
+	bool U2GlossBegin();
 	DWORD U2Swapped = 0;
 	IDirect3DBaseTexture9 *U2Cube0 = nullptr;  // stage 0's cube map, while a rule draws a cube-mapped surface                  // stages whose texture replace= swapped for this draw
 	void U2CaptureDraw(D3DPRIMITIVETYPE Type, UINT PrimCount, const BYTE *Verts, size_t VertBytes, UINT Stride, INT BaseVertex,

@@ -1339,6 +1339,15 @@ void Direct3DDevice8::U2CaptureDraw(D3DPRIMITIVETYPE Type, UINT PrimCount, const
 		U2Stages[0] ? U2Stages[0]->GetProxyInterface() : nullptr, U2Stages[0] ? &U2Stages[0]->U2Hash : nullptr,
 		U2Stages[1]->GetProxyInterface(), U2Stages[1]->U2Hash);
 }
+bool Direct3DDevice8::U2GlossBegin()
+{
+	if (U2.GlossRules.empty() || U2Stage0 == nullptr)
+		return false;
+	bool FixedFunction = CurrentVertexShaderHandle == 0;
+	if (!FixedFunction)
+		FixedFunction = reinterpret_cast<VertexShaderInfo *>(CurrentVertexShaderHandle << 1)->Shader == nullptr;
+	return U2.GlossBegin(ProxyInterface, U2Stage0->GetProxyInterface(), U2Stage0->U2Hash, FixedFunction);
+}
 void Direct3DDevice8::U2After(bool Shaded)
 {
 	U2.RelightEnd(ProxyInterface);
@@ -1397,6 +1406,11 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawPrimitive(D3DPRIMITIVETYPE Primit
 		U2ProbeVB(ProxyInterface, U2Stream0->U2Shadow.data(), U2Stream0->U2Shadow.size(), U2Stride0, StartVertex,
 			PrimitiveType == D3DPT_TRIANGLELIST ? PrimitiveCount * 3 : PrimitiveCount + 2);
 	U2After(Shaded);
+	if (U2GlossBegin())                             // gloss=: the same geometry again, added on top
+	{
+		ProxyInterface->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
+		U2.GlossEnd(ProxyInterface);
+	}
 	return D3D_OK;
 }
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawIndexedPrimitive(D3DPRIMITIVETYPE PrimitiveType, UINT MinIndex, UINT NumVertices, UINT StartIndex, UINT PrimitiveCount)
@@ -1450,6 +1464,11 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawIndexedPrimitive(D3DPRIMITIVETYPE
 	const bool Shaded = U2Begin();
 	U2.LastDrawHR = ProxyInterface->DrawIndexedPrimitive(PrimitiveType, CurrentBaseVertexIndex, MinIndex, NumVertices, StartIndex, PrimitiveCount);
 	U2After(Shaded);
+	if (U2GlossBegin())                             // gloss=: the same geometry again, added on top
+	{
+		ProxyInterface->DrawIndexedPrimitive(PrimitiveType, CurrentBaseVertexIndex, MinIndex, NumVertices, StartIndex, PrimitiveCount);
+		U2.GlossEnd(ProxyInterface);
+	}
 	return D3D_OK;
 }
 // lightprobe: a user-pointer draw's vertices: the first one raw, and the average length of floats 3-5
@@ -1478,6 +1497,11 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawPrimitiveUP(D3DPRIMITIVETYPE Prim
 	U2.LastDrawHR = ProxyInterface->DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride);
 	U2ProbeVerts(pVertexStreamZeroData, VertexStreamZeroStride, 0, PrimitiveType == D3DPT_TRIANGLELIST ? PrimitiveCount * 3 : PrimitiveCount + 2);
 	U2After(Shaded);
+	if (U2GlossBegin())                             // gloss=: the same geometry again, added on top
+	{
+		ProxyInterface->DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride);
+		U2.GlossEnd(ProxyInterface);
+	}
 	return D3D_OK;
 }
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawIndexedPrimitiveUP(D3DPRIMITIVETYPE PrimitiveType, UINT MinVertexIndex, UINT NumVertexIndices, UINT PrimitiveCount, const void *pIndexData, D3DFORMAT IndexDataFormat, const void *pVertexStreamZeroData, UINT VertexStreamZeroStride)
@@ -1491,6 +1515,11 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawIndexedPrimitiveUP(D3DPRIMITIVETY
 	U2.LastDrawHR = ProxyInterface->DrawIndexedPrimitiveUP(PrimitiveType, MinVertexIndex, NumVertexIndices, PrimitiveCount, pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride);
 	U2ProbeVerts(pVertexStreamZeroData, VertexStreamZeroStride, MinVertexIndex, NumVertexIndices);
 	U2After(Shaded);
+	if (U2GlossBegin())                             // gloss=: the same geometry again, added on top
+	{
+		ProxyInterface->DrawIndexedPrimitiveUP(PrimitiveType, MinVertexIndex, NumVertexIndices, PrimitiveCount, pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride);
+		U2.GlossEnd(ProxyInterface);
+	}
 	return D3D_OK;
 }
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::ProcessVertices(UINT SrcStartIndex, UINT DestIndex, UINT VertexCount, IDirect3DVertexBuffer8 *pDestBuffer, DWORD Flags)
