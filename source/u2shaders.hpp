@@ -90,6 +90,7 @@ struct U2Rule
 	                           // transform, sampler and the blending stay the game's (terrain layers)
 	bool Surface = false;      // surface=: solid draws only, see SurfaceBegin
 	bool Solid = false;        // glass=: a shader= rule that also takes solid (unblended) draws
+	bool PbrBlend = false;     // pbr= with its own shader: alpha-blended draws too (Advent's faces, Seekers)
 	bool Pbr = false;          // pbr=: a lit solid draw shaded by char_pbr.hlsl with a material map
 	std::string MapFile;       // pbr=: the map (normal xy, roughness, metallic), a DDS in U2Shaders
 	IDirect3DTexture9 *Map = nullptr;
@@ -258,12 +259,20 @@ public:
 			{
 				// (after the map: highlight strength and normal map strength, 1 1 if left out)
 				float Spec = 1, Bump = 1;
-				sscanf_s(Line, " pbr=%*x %*s %f %f", &Spec, &Bump);
+				char Shader[256] = "";
+				sscanf_s(Line, " pbr=%*x %*s %f %f %255s", &Spec, &Bump, Shader, (unsigned)sizeof(Shader));
 				// a character's (or weapon's) texture shaded as a physically based material:
 				// char_pbr.hlsl with the D3D lights the game set, and <Name> as its material map
 				U2Rule R;
 				R.Hash = Hash;
 				R.File = "char_pbr.hlsl";
+				// a fifth value names another shader with the same inputs (char_skin.hlsl); such a
+				// rule also takes the texture's alpha-blended draws, the shader returning its alpha
+				if (strstr(Shader, ".hlsl") != nullptr)
+				{
+					R.File = Shader;
+					R.PbrBlend = true;
+				}
 				R.MapFile = Name;
 				R.Pbr = true;
 				R.Levels[0] = Spec;
@@ -1973,7 +1982,7 @@ public:
 		DWORD Blending = 0, Lighting = 0, DiffSrc = 0, AmbSrc = 0, ColorVertex = 0;
 		Dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &Blending);
 		Dev->GetRenderState(D3DRS_LIGHTING, &Lighting);
-		if (Blending || !Lighting || !FixedFunction || Offscreen(Dev))
+		if ((Blending && !(Pbr != nullptr && Pbr->PbrBlend)) || !Lighting || !FixedFunction || Offscreen(Dev))
 			return false;
 		Dev->GetRenderState(D3DRS_COLORVERTEX, &ColorVertex);
 		Dev->GetRenderState(D3DRS_DIFFUSEMATERIALSOURCE, &DiffSrc);
