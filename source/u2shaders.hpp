@@ -181,6 +181,8 @@ public:
 			;
 		else if (sscanf_s(Line, " glossdry=%f %f %f %f", &GlossDry[0], &GlossDry[1], &GlossDry[2], &GlossDry[3]) >= 2)
 			;
+		else if (sscanf_s(Line, " glossreflect=%f %f", &GlossReflect[0], &GlossReflect[1]) >= 1)
+			;
 		else if (sscanf_s(Line, " relight=%u", &Hash) == 1)
 			Relight = Hash != 0;
 		else if (sscanf_s(Line, " pcssprobe=%u", &Hash) == 1)
@@ -1485,6 +1487,15 @@ public:
 	// matched to the nearest known one, so it stays fresh while it spreads and ages from then.
 	// glossdry= seconds wet, seconds until dry, how much a dry decal darkens (0-1).
 	float GlossDry[4] = { 60.0f, 240.0f, 0.4f, 0.0f };
+	// Puddle reflections: glossreflect= strength, reach (world units). With a strength above 0
+	// the pass also gets the frame drawn so far in s1 (CopyScene, once a frame: decals come
+	// after the level, so it holds what stands around the pool) and c16.yz = strength, reach;
+	// the shader follows the reflected view ray a few steps and samples the frame where they
+	// land on screen: a soft reflection of what is above the pool.
+	float GlossReflect[2] = { 0.0f, 300.0f };
+	IDirect3DBaseTexture9 *GlossOldTex1 = nullptr;
+	DWORD GlossOldSamp1[5] = {};
+	bool GlossBound1 = false;
 	struct GlossDecal { float M[16]; DWORD Born, Seen; };
 	std::vector<GlossDecal> GlossDecals;
 	float GlossAge(IDirect3DDevice9 *Dev)
@@ -1668,7 +1679,21 @@ public:
 			Col[0] = L.Diffuse.r; Col[1] = L.Diffuse.g; Col[2] = L.Diffuse.b; Col[3] = 1;
 		}
 		Dev->SetPixelShaderConstantF(0, C[0], 16);
-		const float DryC[4] = { GlossDry[2], 0, 0, 0 };
+		GlossBound1 = false;
+		if (GlossReflect[0] > 0 && CopyScene(Dev) && SceneTex != nullptr)
+		{
+			static const D3DSAMPLERSTATETYPE Samp[5] = { D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER };
+			static const DWORD Val[5] = { D3DTADDRESS_CLAMP, D3DTADDRESS_CLAMP, D3DTEXF_LINEAR, D3DTEXF_LINEAR, D3DTEXF_NONE };
+			Dev->GetTexture(1, &GlossOldTex1);
+			for (int i = 0; i < 5; i++)
+			{
+				Dev->GetSamplerState(1, Samp[i], &GlossOldSamp1[i]);
+				Dev->SetSamplerState(1, Samp[i], Val[i]);
+			}
+			Dev->SetTexture(1, SceneTex);
+			GlossBound1 = true;
+		}
+		const float DryC[4] = { GlossDry[2], GlossBound1 ? GlossReflect[0] : 0.0f, GlossReflect[1], 0 };
 		Dev->SetPixelShaderConstantF(16, DryC, 1);     // c16.x: how much a dry decal darkens
 		Dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
 		Dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);
@@ -1704,6 +1729,15 @@ public:
 			Dev->SetTextureStageState(s, D3DTSS_TEXCOORDINDEX, GlossOldTCI[s]);
 			Dev->SetTextureStageState(s, D3DTSS_TEXTURETRANSFORMFLAGS, GlossOldTTF[s]);
 			Dev->SetTransform((D3DTRANSFORMSTATETYPE)(D3DTS_TEXTURE0 + s), &GlossOldTexMat[s]);
+		}
+		if (GlossBound1)
+		{
+			static const D3DSAMPLERSTATETYPE Samp[5] = { D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER };
+			Dev->SetTexture(1, GlossOldTex1);
+			for (int i = 0; i < 5; i++)
+				Dev->SetSamplerState(1, Samp[i], GlossOldSamp1[i]);
+			if (GlossOldTex1) { GlossOldTex1->Release(); GlossOldTex1 = nullptr; }
+			GlossBound1 = false;
 		}
 		if (GlossSwapped0)
 		{
