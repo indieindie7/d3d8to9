@@ -286,6 +286,16 @@ public:
 			}
 			else if (sscanf_s(Line, " replace=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
 				Replacements[Hash].File = Name;
+			else if (strncmp(Line + strspn(Line, " \t"), "texgrade=", 9) == 0)
+			{
+				float g[5] = { 1, 0, 1, 1, 1 };
+				if (sscanf_s(Line, " texgrade=%x %f %f %f %f %f", &Hash, &g[0], &g[1], &g[2], &g[3], &g[4]) >= 2)
+				{
+					U2Replace &R = Replacements[Hash];
+					R.Grade = true;
+					memcpy(R.G, g, sizeof(g));
+				}
+			}
 			else if (sscanf_s(Line, " bloodlive=%x", &Hash) == 1)
 				U2Blood::AddHash(Hash);             // a live blood pool's placeholder texture (blood.hpp), slot order
 			else if (sscanf_s(Line, " surface=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
@@ -565,7 +575,126 @@ public:
 		std::string File;
 		IDirect3DTexture9 *Tex = nullptr;
 		bool Tried = false;
+		bool Grade = false;            // texgrade=: a graded copy of the game's own texture, made in memory
+		float G[5] = { 1, 0, 1, 1, 1 };  // lift, desaturate 0..1, tint r g b
 	};
+
+	// texgrade=HASH lift desat r g b: the texture's colours lifted, desaturated toward grey and
+	// tinted, in a copy made in memory the first time it is drawn (nothing is read from or written
+	// to disk). Works under any stage setup, since only the texture changes. 32-bit textures per
+	// pixel; DXT1/3/5 per block, by grading the two endpoint colours (the interpolated ones follow,
+	// as the grade is linear until it clips); a DXT1 block's endpoint order decides whether it has
+	// a transparent colour, so the order is kept and the indices remapped where the grade swaps it.
+	static void GradeRGB(const float G[5], float &r, float &g, float &b)
+	{
+		const float l = 0.30f * r + 0.59f * g + 0.11f * b;
+		r = (r + (l - r) * G[1]) * G[2] * G[0];
+		g = (g + (l - g) * G[1]) * G[3] * G[0];
+		b = (b + (l - b) * G[1]) * G[4] * G[0];
+		r = r < 0 ? 0 : r > 1 ? 1 : r; g = g < 0 ? 0 : g > 1 ? 1 : g; b = b < 0 ? 0 : b > 1 ? 1 : b;
+	}
+	static WORD Grade565(const float G[5], WORD v)
+	{
+		float r = ((v >> 11) & 31) / 31.0f, g = ((v >> 5) & 63) / 63.0f, b = (v & 31) / 31.0f;
+		GradeRGB(G, r, g, b);
+		return (WORD)(((int)(r * 31 + 0.5f) << 11) | ((int)(g * 63 + 0.5f) << 5) | (int)(b * 31 + 0.5f));
+	}
+	static void GradeDXT1Block(const float G[5], BYTE *B, bool Alone)
+	{
+		WORD &c0 = *reinterpret_cast<WORD *>(B), &c1 = *reinterpret_cast<WORD *>(B + 2);
+		DWORD &ix = *reinterpret_cast<DWORD *>(B + 4);
+		const bool Four = !Alone || c0 > c1;      // DXT3/5 colour blocks are always four-colour
+		WORD n0 = Grade565(G, c0), n1 = Grade565(G, c1);
+		if (!Alone)
+		{
+			c0 = n0; c1 = n1;
+			return;
+		}
+		if (Four)
+		{
+			if (n0 < n1)
+			{
+				WORD t = n0; n0 = n1; n1 = t;
+				ix ^= 0x55555555;                  // 0<->1, 2<->3
+			}
+			else if (n0 == n1)
+			{
+				ix = 0;                            // one colour: all texels take c0
+				if (n0 < 0xFFFF) n0++; else n1--;
+			}
+		}
+		else if (n0 > n1)
+		{
+			WORD t = n0; n0 = n1; n1 = t;
+			DWORD out = 0;                         // 0<->1; 2 (the middle) and 3 (transparent) stay
+			for (int k = 0; k < 16; k++)
+			{
+				DWORD i = (ix >> (2 * k)) & 3;
+				if (i < 2) i ^= 1;
+				out |= i << (2 * k);
+			}
+			ix = out;
+		}
+		c0 = n0; c1 = n1;
+	}
+	IDirect3DTexture9 *GradeCopy(IDirect3DDevice9 *Dev, IDirect3DTexture9 *Src, DWORD Hash, const float G[5])
+	{
+		D3DSURFACE_DESC D;
+		if (Src == nullptr || FAILED(Src->GetLevelDesc(0, &D)))
+			return nullptr;
+		const bool Dxt = D.Format == D3DFMT_DXT1 || D.Format == D3DFMT_DXT3 || D.Format == D3DFMT_DXT5;
+		if (!Dxt && D.Format != D3DFMT_A8R8G8B8 && D.Format != D3DFMT_X8R8G8B8)
+		{
+			Message("grade %08x: format %u not graded", Hash, (unsigned)D.Format);
+			return nullptr;
+		}
+		const UINT Levels = Src->GetLevelCount();
+		IDirect3DTexture9 *Out = nullptr;
+		if (FAILED(Dev->CreateTexture(D.Width, D.Height, Levels, 0, D.Format, D3DPOOL_MANAGED, &Out, nullptr)))
+			return nullptr;
+		for (UINT lv = 0; lv < Levels; lv++)
+		{
+			D3DSURFACE_DESC L;
+			D3DLOCKED_RECT A, B;
+			Src->GetLevelDesc(lv, &L);
+			if (FAILED(Src->LockRect(lv, &A, nullptr, D3DLOCK_READONLY)))
+			{
+				Out->Release();
+				Message("grade %08x: level %u not readable", Hash, lv);
+				return nullptr;
+			}
+			if (FAILED(Out->LockRect(lv, &B, nullptr, 0)))
+			{
+				Src->UnlockRect(lv);
+				Out->Release();
+				return nullptr;
+			}
+			const UINT Block = D.Format == D3DFMT_DXT1 ? 8 : 16;
+			const UINT Rows = Dxt ? (std::max)(1u, (L.Height + 3) / 4) : L.Height;
+			const UINT Bytes = Dxt ? (std::max)(1u, (L.Width + 3) / 4) * Block : L.Width * 4;
+			for (UINT y = 0; y < Rows; y++)
+			{
+				const BYTE *s = static_cast<const BYTE *>(A.pBits) + y * A.Pitch;
+				BYTE *d = static_cast<BYTE *>(B.pBits) + y * B.Pitch;
+				memcpy(d, s, Bytes);
+				if (Dxt)
+					for (UINT x = 0; x < Bytes; x += Block)
+						GradeDXT1Block(G, d + x + (Block == 16 ? 8 : 0), Block == 8);
+				else
+					for (UINT x = 0; x < Bytes; x += 4)
+					{
+						float r = d[x + 2] / 255.0f, g = d[x + 1] / 255.0f, b = d[x] / 255.0f;
+						GradeRGB(G, r, g, b);
+						d[x + 2] = (BYTE)(r * 255 + 0.5f); d[x + 1] = (BYTE)(g * 255 + 0.5f); d[x] = (BYTE)(b * 255 + 0.5f);
+					}
+			}
+			Out->UnlockRect(lv);
+			Src->UnlockRect(lv);
+		}
+		Message("grade %08x: graded copy made (%ux%u, %u levels, lift %.2f desaturate %.2f tint %.2f %.2f %.2f)",
+			Hash, D.Width, D.Height, Levels, G[0], G[1], G[2], G[3], G[4]);
+		return Out;
+	}
 	std::map<DWORD, U2Replace> Replacements;
 
 	IDirect3DTexture9 *Replacement(IDirect3DDevice9 *Dev, IDirect3DTexture9 *Tex, DWORD &Hash)
@@ -590,9 +719,14 @@ public:
 		if (!R.Tried)
 		{
 			R.Tried = true;
-			R.Tex = LoadDDS(Dev, R.File);
-			if (R.Tex != nullptr)
-				Message("replace %08x: %s loaded", Hash, R.File.c_str());
+			if (R.Grade)
+				R.Tex = GradeCopy(Dev, Tex, Hash, R.G);
+			else
+			{
+				R.Tex = LoadDDS(Dev, R.File);
+				if (R.Tex != nullptr)
+					Message("replace %08x: %s loaded", Hash, R.File.c_str());
+			}
 		}
 		return R.Tex;
 	}
@@ -1608,7 +1742,12 @@ public:
 		DWORD Blending = 0;
 		Dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &Blending);
 		if (Blending || !FixedFunction || Offscreen(Dev))
+		{
+			if (!R.Refused && !Offscreen(Dev))
+				Message("surface %08x: not drawn by this rule (%s)", R.Hash, Blending ? "alpha-blended draw" : "vertex-shader draw");
+			R.Refused = true;
 			return false;
+		}
 		DWORD op[3] = {}, a1[3] = {}, a2[3] = {};
 		for (DWORD st = 0; st < 3; st++)
 		{
@@ -1616,7 +1755,7 @@ public:
 			Dev->GetTextureStageState(st, D3DTSS_COLORARG1, &a1[st]);
 			Dev->GetTextureStageState(st, D3DTSS_COLORARG2, &a2[st]);
 		}
-		float Vert = -1, Second = -1;
+		float Vert = -1, Second = -1, Factor = 0;
 		if (op[0] == D3DTOP_SELECTARG1 && a1[0] == D3DTA_TEXTURE)
 			Vert = 0;
 		else if (ModulateFactor(op[0]) > 0 && (ArgsAre(a1[0], a2[0], D3DTA_TEXTURE, D3DTA_DIFFUSE) || ArgsAre(a1[0], a2[0], D3DTA_TEXTURE, D3DTA_CURRENT)))
@@ -1625,6 +1764,14 @@ public:
 			Second = 0;
 		else if (ModulateFactor(op[1]) > 0 && ArgsAre(a1[1], a2[1], D3DTA_TEXTURE, D3DTA_CURRENT) && op[2] == D3DTOP_DISABLE)
 			Second = ModulateFactor(op[1]);
+		else if (ModulateFactor(op[1]) > 0 && ArgsAre(a1[1], a2[1], D3DTA_TFACTOR, D3DTA_CURRENT) && op[2] == D3DTOP_DISABLE
+			&& R.File.find("_tone") != std::string::npos)
+		{
+			// stage 1 multiplies by the texture factor (a constant colour; Advent's rock meshes):
+			// only for shaders that read it (*_tone.hlsl: c1 = the colour, c2.z = 1)
+			Second = ModulateFactor(op[1]);
+			Factor = 1;
+		}
 		if (Vert < 0 || Second < 0)
 		{
 			if (!R.Refused)
@@ -1670,6 +1817,14 @@ public:
 		Const[0][3] = SceneH ? 1.0f / SceneH : 0;
 		Const[2][0] = Vert;
 		Const[2][1] = Second;
+		Const[2][2] = Factor;
+		if (Factor > 0)
+		{
+			DWORD Tf = 0xffffffff;
+			Dev->GetRenderState(D3DRS_TEXTUREFACTOR, &Tf);
+			Const[1][0] = ((Tf >> 16) & 255) / 255.0f; Const[1][1] = ((Tf >> 8) & 255) / 255.0f;
+			Const[1][2] = (Tf & 255) / 255.0f; Const[1][3] = (Tf >> 24) / 255.0f;
+		}
 		memcpy(Const[3], R.Levels, sizeof(R.Levels));
 		Dev->SetPixelShaderConstantF(0, Const[0], 4);
 		Dev->SetPixelShader(PS);
