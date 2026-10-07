@@ -107,6 +107,7 @@ struct U2Rule
 	bool Tried = false;
 };
 
+class U2Shaders;
 class U2Shaders
 {
 public:
@@ -1713,7 +1714,10 @@ public:
 	// ---- live command channel: console commands from outside, run on the game's thread ---------
 	// A tool (U2Avalon's live.py, AdventMod's live tools) writes lines to System\U2Live.cmd
 	// (atomically: a temporary file renamed into place). At the next Present the fork reads the
-	// file, deletes it and runs each line as a console command of the player's viewport
+	// file and deletes it; the lines are run from the game window's message loop (a message
+	// posted to it, handled by a hook on its window procedure), outside rendering: run from
+	// Present itself, the first command hung Advent (the viewport is locked mid-frame). Each
+	// line runs as a console command of the player's viewport
 	// (UViewport::Exec, the path a typed command takes: exec functions of the player, its
 	// interactions and mutators' ExecManagers all see it). Blank lines and lines starting with
 	// # or ; are skipped. Replies go to the game's own log.
@@ -1722,7 +1726,7 @@ public:
 	//                         the game runs: the channel is up when it is fresh
 	// Off unless U2Shaders.ini has live=1 (any program that can write the game's System folder
 	// could run console commands through it); every command run is logged.
-	bool LiveOn = false, LiveBroken = false;
+	bool LiveOn = false, LiveBroken = false, LiveTold = false;
 	DWORD LiveStatusTick = 0;
 	void *LiveViewport = nullptr;
 	typedef int (__fastcall *ViewportExec_t)(void *This, void *Edx, const wchar_t *Cmd, void *Out);
@@ -1787,6 +1791,112 @@ public:
 		}
 		return LiveViewport;
 	}
+	std::vector<std::string> LiveQueue;
+	long long LiveQueueBatch = -1;
+	HWND LiveWnd = nullptr;
+	WNDPROC LiveOldProc = nullptr;
+	static const UINT LiveMsg = WM_APP + 0x75;
+	static U2Shaders *&LiveSelf() { static U2Shaders *P = nullptr; return P; }
+	static LRESULT CALLBACK LiveWndProc(HWND W, UINT M, WPARAM A, LPARAM B)
+	{
+		if (M == LiveMsg && LiveSelf() != nullptr)
+		{
+			LiveSelf()->LiveRun();
+			return 0;
+		}
+		return CallWindowProcW(LiveSelf() ? LiveSelf()->LiveOldProc : DefWindowProcW, W, M, A, B);
+	}
+	bool LiveHook(IDirect3DDevice9 *Dev)
+	{
+		if (LiveOldProc != nullptr)
+			return true;
+		D3DDEVICE_CREATION_PARAMETERS P = {};
+		if (FAILED(Dev->GetCreationParameters(&P)) || P.hFocusWindow == nullptr)
+			return false;
+		LiveSelf() = this;
+		LiveWnd = P.hFocusWindow;
+		LiveOldProc = (WNDPROC)SetWindowLongPtrW(LiveWnd, GWLP_WNDPROC, (LONG_PTR)LiveWndProc);
+		if (LiveOldProc == nullptr)
+			return false;
+		Message("live: commands run from window %p's message loop", (void *)LiveWnd);
+		return true;
+	}
+	// in the message loop: the queued lines through the console
+	void LiveRun()
+	{
+		if (LiveQueue.empty())
+			return;
+		std::vector<std::string> Lines;
+		Lines.swap(LiveQueue);
+		if (!LiveBind() || LiveFindViewport() == nullptr)
+		{
+			Message("live: commands arrived but there is no viewport yet; dropped");
+			return;
+		}
+		// UViewport::Exec overrides FExec's: MSVC hands it the object's FExec part, not its start,
+		// and calls go through that part's table (WindowsViewport overrides it in WinDrv.dll).
+		// The FExec part is found by proof, not by layout: a table pointer in the object whose
+		// first entry IS the exported UViewport::Exec, or calls or jumps to it (an override ends
+		// by handing unknown commands to its base). Candidates that don't pass are never called.
+		void *Self = nullptr;
+		ViewportExec_t Call = nullptr;
+		{
+			char Seen[200] = "";
+			for (int Off = 4; Off <= 0x80 && Self == nullptr; Off += 4)
+			{
+				void **Slot = (void **)((BYTE *)LiveViewport + Off);
+				if (!Readable(Slot, 4) || !Readable(*Slot, 8))
+					continue;
+				BYTE *Fn = (BYTE *)((void **)*Slot)[0];
+				HMODULE FnMod = nullptr;
+				if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)Fn, &FnMod) || FnMod == nullptr)
+					continue;
+				bool Proven = Fn == (BYTE *)LiveExec;
+				for (int i = 0; !Proven && i < 4096 && Readable(Fn + i, 6); i++)
+				{
+					if ((Fn[i] == 0xE8 || Fn[i] == 0xE9) && Fn + i + 5 + *(INT32 *)(Fn + i + 1) == (BYTE *)LiveExec)
+						Proven = true;                       // call / jmp rel32
+					else if (Fn[i] == 0xFF && (Fn[i + 1] == 0x15 || Fn[i + 1] == 0x25))
+					{
+						void **Imp = *(void ***)(Fn + i + 2);  // call / jmp [import]
+						if (Readable(Imp, 4) && *Imp == (void *)LiveExec)
+							Proven = true;
+					}
+				}
+				snprintf(Seen + strlen(Seen), sizeof(Seen) - strlen(Seen), " +0x%x%s", Off, Proven ? "(Exec)" : "");
+				if (Proven)
+				{
+					Self = Slot;
+					Call = (ViewportExec_t)Fn;
+				}
+			}
+			if (!LiveTold)
+			{
+				LiveTold = true;
+				Message("live: table pointers in the viewport:%s", Seen);
+			}
+		}
+		if (Self == nullptr || Call == nullptr)
+		{
+			Message("live: the viewport's Exec part wasn't found: commands not run (no guessing)");
+			LiveBroken = true;
+			return;
+		}
+		for (const std::string &L : Lines)
+		{
+			Message("live: > %s", L.c_str());
+			std::wstring Cmd(L.begin(), L.end());
+			Call(Self, nullptr, Cmd.c_str(), *LiveLog);
+		}
+		FILE *A = nullptr;
+		if (LiveQueueBatch >= 0 && !fopen_s(&A, (Dir + "U2Live.ack").c_str(), "w") && A)
+		{
+			fprintf(A, "%lld\n", LiveQueueBatch);
+			fclose(A);
+		}
+		Message("live: ran %d command(s)%s", (int)Lines.size(), LiveQueueBatch >= 0 ? (" (batch " + std::to_string(LiveQueueBatch) + ")").c_str() : "");
+		LiveQueueBatch = -1;
+	}
 	void LiveStatus()
 	{
 		if (GetTickCount() - LiveStatusTick < 2000)
@@ -1802,9 +1912,11 @@ public:
 			fclose(F);
 		}
 	}
-	void LivePoll()
+	void LivePoll(IDirect3DDevice9 *Dev)
 	{
 		if (!LiveOn || LiveBroken || Dir.empty())
+			return;
+		if (!LiveHook(Dev))
 			return;
 		LiveStatus();
 		const std::string Path = Dir + "U2Live.cmd";
@@ -1822,13 +1934,6 @@ public:
 			fclose(F);
 		}
 		DeleteFileA(Path.c_str());
-		if (!LiveBind() || LiveFindViewport() == nullptr)
-		{
-			Message("live: commands arrived but there is no viewport yet; dropped");
-			return;
-		}
-		int Ran = 0;
-		long long Batch = -1;
 		size_t At = 0;
 		while (At < Text.size())
 		{
@@ -1847,20 +1952,12 @@ public:
 				char W1[64] = "", W2[64] = "";
 				long long N = 0;
 				if (sscanf_s(L.c_str(), "%63s %63s %lld", W1, (unsigned)sizeof(W1), W2, (unsigned)sizeof(W2), &N) == 3 && _stricmp(W2, "batch") == 0)
-					Batch = N;
+					LiveQueueBatch = N;
 			}
-			Message("live: > %s", L.c_str());
-			std::wstring Cmd(L.begin(), L.end());
-			LiveExec(LiveViewport, nullptr, Cmd.c_str(), *LiveLog);
-			Ran++;
+			LiveQueue.push_back(L);
 		}
-		FILE *A = nullptr;
-		if (Batch >= 0 && !fopen_s(&A, (Dir + "U2Live.ack").c_str(), "w") && A)
-		{
-			fprintf(A, "%lld\n", Batch);
-			fclose(A);
-		}
-		Message("live: ran %d command(s)%s", Ran, Batch >= 0 ? (" (batch " + std::to_string(Batch) + ")").c_str() : "");
+		if (!LiveQueue.empty() && LiveWnd != nullptr)
+			PostMessageW(LiveWnd, LiveMsg, 0, 0);
 	}
 
 	// rtdump=N (testing): the first N times the game leaves a 512x512 render target (a
@@ -5938,7 +6035,7 @@ public:
 		if (Loaded && Frame % 30 == 15)
 			WatchShaders();
 		if (Loaded)
-			LivePoll();
+			LivePoll(Dev);
 		if (U2Blood::Count > 0)
 			U2Blood::Step(Dev);
 		DepthDirty = true;
