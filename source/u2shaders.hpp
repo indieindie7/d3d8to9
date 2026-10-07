@@ -169,6 +169,8 @@ public:
 				;
 			else if (sscanf_s(Line, " pcssdebug=%f", &PcssDebug) == 1)
 				;
+			else if (sscanf_s(Line, " rtdump=%d", &RtDump) == 1)
+				;
 			else if (sscanf_s(Line, " relight=%u", &Hash) == 1)
 				Relight = Hash != 0;
 			else if (sscanf_s(Line, " pcssprobe=%u", &Hash) == 1)
@@ -1423,6 +1425,88 @@ public:
 				Message("pcss copy %ux%u fmt %u -> %ux%u fmt %u usage %x pool %u\n", A.Width, A.Height, (unsigned)A.Format, B.Width, B.Height, (unsigned)B.Format, (unsigned)B.Usage, (unsigned)B.Pool);
 			}
 		}
+	}
+
+	// rtdump=N (testing): the first N times the game leaves a 512x512 render target (a
+	// ScriptedTexture, e.g. AdventMod's gib card atlas), what it holds goes to
+	// System\RtDump##.bmp, and the clears made into it are logged
+	int RtDump = 0, RtDumped = 0;
+	bool RtIs512(IDirect3DDevice9 *Dev)
+	{
+		IDirect3DSurface9 *T = nullptr;
+		D3DSURFACE_DESC D = {};
+		if (FAILED(Dev->GetRenderTarget(0, &T)) || T == nullptr)
+			return false;
+		T->GetDesc(&D);
+		T->Release();
+		return D.Width == 512 && D.Height == 512;
+	}
+	void RtClear(IDirect3DDevice9 *Dev, DWORD Count, DWORD Flags, D3DCOLOR Color)
+	{
+		if (RtDumped < RtDump && RtIs512(Dev))
+		{
+			D3DVIEWPORT9 V = {};
+			Dev->GetViewport(&V);
+			Message("rtdump: clear %u rects flags %x colour %08x, viewport %u,%u %ux%u (frame %u)", Count, Flags, Color, V.X, V.Y, V.Width, V.Height, Frame);
+		}
+	}
+	void RtLeave(IDirect3DDevice9 *Dev)
+	{
+		if (RtDumped >= RtDump || !RtIs512(Dev))
+			return;
+		IDirect3DSurface9 *T = nullptr, *Sys = nullptr;
+		Dev->GetRenderTarget(0, &T);
+		D3DSURFACE_DESC D = {};
+		T->GetDesc(&D);
+		D3DLOCKED_RECT L = {};
+		HRESULT hr = Dev->CreateOffscreenPlainSurface(D.Width, D.Height, D.Format, D3DPOOL_SYSTEMMEM, &Sys, nullptr);
+		if (SUCCEEDED(hr))
+			hr = Dev->GetRenderTargetData(T, Sys);
+		if (SUCCEEDED(hr))
+			hr = Sys->LockRect(&L, nullptr, D3DLOCK_READONLY);
+		if (SUCCEEDED(hr) && (D.Format == D3DFMT_A8R8G8B8 || D.Format == D3DFMT_X8R8G8B8))
+		{
+			char Path[MAX_PATH];
+			snprintf(Path, sizeof(Path), "%sRtDump%02d.bmp", Dir.c_str(), RtDumped);
+			FILE *F = nullptr;
+			if (!fopen_s(&F, Path, "wb") && F)
+			{
+				const DWORD Row = D.Width * 3, Size = Row * D.Height;
+				BITMAPFILEHEADER FH = {};
+				BITMAPINFOHEADER IH = {};
+				FH.bfType = 0x4D42;
+				FH.bfOffBits = sizeof(FH) + sizeof(IH);
+				FH.bfSize = FH.bfOffBits + Size;
+				IH.biSize = sizeof(IH);
+				IH.biWidth = (LONG)D.Width;
+				IH.biHeight = (LONG)D.Height;
+				IH.biPlanes = 1;
+				IH.biBitCount = 24;
+				IH.biSizeImage = Size;
+				fwrite(&FH, sizeof(FH), 1, F);
+				fwrite(&IH, sizeof(IH), 1, F);
+				std::vector<BYTE> Out(Row, 0);
+				double Sum = 0;
+				for (UINT y = D.Height; y-- > 0;)
+				{
+					const BYTE *In = static_cast<const BYTE *>(L.pBits) + (size_t)y * L.Pitch;
+					for (UINT x = 0; x < D.Width; x++)
+					{
+						Out[x * 3] = In[x * 4]; Out[x * 3 + 1] = In[x * 4 + 1]; Out[x * 3 + 2] = In[x * 4 + 2];
+						Sum += In[x * 4] + In[x * 4 + 1] + In[x * 4 + 2];
+					}
+					fwrite(Out.data(), 1, Row, F);
+				}
+				fclose(F);
+				Message("rtdump: %s (format %u, mean brightness %.1f, frame %u)", Path, (unsigned)D.Format, Sum / (3.0 * D.Width * D.Height), Frame);
+			}
+			Sys->UnlockRect();
+		}
+		else
+			Message("rtdump: couldn't read the target (%08x, format %u)", (unsigned)hr, (unsigned)D.Format);
+		if (Sys) Sys->Release();
+		T->Release();
+		RtDumped++;
 	}
 
 	bool Offscreen(IDirect3DDevice9 *Dev)
