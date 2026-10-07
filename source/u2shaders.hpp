@@ -2171,6 +2171,8 @@ public:
 			Message("pbr %08x: %d lights on (%d used), ambient %.2f %.2f %.2f, texture factor %.0f", (unsigned)Pbr->Hash, LightsOn, Count, C[3][0], C[3][1], C[3][2], Factor);
 		}
 		Dev->SetPixelShader(PS);
+		if (Pbr != nullptr && Pbr->PbrBlend)
+			SkinMaskBegin(Dev);
 		Mode = 6;
 		return true;
 	}
@@ -2207,6 +2209,7 @@ public:
 				if (OldPbrTex) { OldPbrTex->Release(); OldPbrTex = nullptr; }
 				PbrBound = false;
 			}
+			SkinMaskEnd(Dev);
 			Dev->SetPixelShader(OldPS);
 			Dev->SetPixelShaderConstantF(0, OldCharConst[0], 32);
 			for (DWORD s = CharGen; s <= CharGen + 1; s++)
@@ -2904,6 +2907,7 @@ public:
 			Dev->SetTexture(1, nullptr);
 			RunGi(Dev, Saved.DS);
 			RunSsao(Dev, Saved.DS);
+			RunSss(Dev, Saved.DS);
 			IDirect3DTexture9 *AAFrame = RunSmaa(Dev);
 
 			float c[6][4] = {};
@@ -3765,7 +3769,7 @@ public:
 	IDirect3DTexture9 *SsaoGBuf = nullptr, *SsaoA = nullptr, *SsaoB = nullptr, *SsaoOut = nullptr;
 	IDirect3DVertexBuffer9 *SsaoVB = nullptr;
 
-	bool NeedDepth() const { return Gi || Ssao; }
+	bool NeedDepth() const { return Gi || Ssao || Sss; }
 
 	void SsaoReleaseTargets()
 	{
@@ -3970,6 +3974,205 @@ public:
 		if (OldTex3) OldTex3->Release();
 		for (int i = 0; i < 6; i++)
 			Dev->SetSamplerState(3, Samp3[i], Old3[i]);
+	}
+
+	// ---- subsurface scattering for skin (sss=1) -------------------------------------------
+	// sss.hlsl on the frame copy, after ssao and before SMAA: a separable blur of the lit frame
+	// under the skin. The skin is whatever a pbr= rule with its own shader (char_skin.hlsl,
+	// PbrBlend) draws: while it draws, SkinMask is bound as render target 1 and the shader
+	// writes 1 there (COLOR1), blended like the colour; the mask is cleared after each use.
+	// sssfx=width strength falloff debug (default 1.2 0.7 1 0; width in world units).
+	bool Sss = false, SssBroken = false;
+	float SssFx[4] = { 1.2f, 0.7f, 1.0f, 0.0f };
+	IDirect3DVertexShader9 *SssVS = nullptr;
+	IDirect3DPixelShader9 *SssPS = nullptr;
+	IDirect3DTexture9 *SkinMask = nullptr, *SssTmp = nullptr, *SssOut = nullptr;
+	UINT SssW = 0, SssH = 0;
+	bool SkinMaskBound = false, SkinMaskUsed = false;
+	IDirect3DSurface9 *OldRT1 = nullptr;
+
+	void SssReleaseTargets()
+	{
+		IDirect3DTexture9 **All[] = { &SkinMask, &SssTmp, &SssOut };
+		for (IDirect3DTexture9 **T : All)
+			if (*T) { (*T)->Release(); *T = nullptr; }
+		SssW = SssH = 0;
+	}
+	void SssReleaseAll()
+	{
+		SssReleaseTargets();
+		if (SssVS) { SssVS->Release(); SssVS = nullptr; }
+		if (SssPS) { SssPS->Release(); SssPS = nullptr; }
+	}
+	bool SssBuild(IDirect3DDevice9 *Dev)
+	{
+		if (SssBroken)
+			return false;
+		if (SssPS != nullptr)
+			return true;
+		const std::string Src = ReadShaderFile("sss.hlsl");
+		if (Src.empty())
+		{
+			Message("sss: sss.hlsl missing in U2Shaders, subsurface scattering off");
+			SssBroken = true;
+			return false;
+		}
+		static const char *Names[2] = { "SssVS", "SssPS" };
+		for (int i = 0; i < 2; i++)
+		{
+			ID3DBlob *Code = nullptr, *Errors = nullptr;
+			const HRESULT hr = D3DCompile(Src.data(), Src.size(), "sss", nullptr, nullptr, Names[i], i == 0 ? "vs_3_0" : "ps_3_0",
+				D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &Code, &Errors);
+			if (FAILED(hr) || Code == nullptr)
+			{
+				Message("sss: %s failed: %s", Names[i], Errors ? (const char *)Errors->GetBufferPointer() : "?");
+				if (Errors) Errors->Release();
+				SssBroken = true;
+				return false;
+			}
+			if (Errors) Errors->Release();
+			const HRESULT cr = i == 0 ? Dev->CreateVertexShader((const DWORD *)Code->GetBufferPointer(), &SssVS)
+				: Dev->CreatePixelShader((const DWORD *)Code->GetBufferPointer(), &SssPS);
+			Code->Release();
+			if (FAILED(cr))
+			{
+				Message("sss: the card refused %s (%08x)", Names[i], (unsigned)cr);
+				SssBroken = true;
+				return false;
+			}
+		}
+		Message("sss: ready");
+		return true;
+	}
+
+	// the skin mask as render target 1 for a skin draw (CharBegin)
+	void SkinMaskBegin(IDirect3DDevice9 *Dev)
+	{
+		if (!Sss || SssBroken || SkinMask == nullptr || SkinMaskBound)
+			return;
+		IDirect3DSurface9 *RT0 = nullptr, *M = nullptr;
+		D3DSURFACE_DESC D0 = {};
+		if (FAILED(Dev->GetRenderTarget(0, &RT0)) || RT0 == nullptr)
+			return;
+		RT0->GetDesc(&D0);
+		RT0->Release();
+		if (D0.Width != SssW || D0.Height != SssH || D0.MultiSampleType != D3DMULTISAMPLE_NONE)
+			return;
+		if (FAILED(SkinMask->GetSurfaceLevel(0, &M)) || M == nullptr)
+			return;
+		OldRT1 = nullptr;
+		Dev->GetRenderTarget(1, &OldRT1);
+		if (SUCCEEDED(Dev->SetRenderTarget(1, M)))
+		{
+			SkinMaskBound = true;
+			SkinMaskUsed = true;
+		}
+		else if (OldRT1) { OldRT1->Release(); OldRT1 = nullptr; }
+		M->Release();
+	}
+	void SkinMaskEnd(IDirect3DDevice9 *Dev)
+	{
+		if (!SkinMaskBound)
+			return;
+		Dev->SetRenderTarget(1, OldRT1);
+		if (OldRT1) { OldRT1->Release(); OldRT1 = nullptr; }
+		SkinMaskBound = false;
+	}
+
+	void RunSss(IDirect3DDevice9 *Dev, IDirect3DSurface9 *BoundDepth)
+	{
+		if (!Sss || SssBroken || SceneTex == nullptr)
+			return;
+		// the targets first (the mask has to exist before the next frame's skin draws)
+		if (SkinMask == nullptr || SssW != SceneW || SssH != SceneH)
+		{
+			SssReleaseTargets();
+			const bool Ok = SUCCEEDED(Dev->CreateTexture(SceneW, SceneH, 1, D3DUSAGE_RENDERTARGET, SceneFmt, D3DPOOL_DEFAULT, &SkinMask, nullptr))
+				&& SUCCEEDED(Dev->CreateTexture(SceneW, SceneH, 1, D3DUSAGE_RENDERTARGET, SceneFmt, D3DPOOL_DEFAULT, &SssTmp, nullptr))
+				&& SUCCEEDED(Dev->CreateTexture(SceneW, SceneH, 1, D3DUSAGE_RENDERTARGET, SceneFmt, D3DPOOL_DEFAULT, &SssOut, nullptr));
+			if (!Ok)
+			{
+				Message("sss: targets couldn't be made (%ux%u), subsurface scattering off", SceneW, SceneH);
+				SssReleaseTargets();
+				SssBroken = true;
+				return;
+			}
+			SssW = SceneW;
+			SssH = SceneH;
+			IDirect3DSurface9 *M = nullptr;
+			if (SUCCEEDED(SkinMask->GetSurfaceLevel(0, &M)) && M) { Dev->ColorFill(M, nullptr, 0); M->Release(); }
+			return;
+		}
+		IDirect3DTexture9 *Depth = DepthTexOf(BoundDepth);
+		if (Depth != nullptr && KeptDepth != nullptr && KeptDepth != Depth && KeptDraws > SegDraws)
+			Depth = KeptDepth;
+		if (SsaoVB == nullptr && SkinMaskUsed)
+		{
+			// the clip-space quad (ssao's, made here when ssao is off)
+			const SmaaVertex q[4] = { { -1, 1, 0, 0, 0 }, { 1, 1, 0, 1, 0 }, { -1, -1, 0, 0, 1 }, { 1, -1, 0, 1, 1 } };
+			void *Mem = nullptr;
+			if (SUCCEEDED(Dev->CreateVertexBuffer(sizeof(q), D3DUSAGE_WRITEONLY, D3DFVF_XYZ | D3DFVF_TEX1, D3DPOOL_MANAGED, &SsaoVB, nullptr))
+				&& SUCCEEDED(SsaoVB->Lock(0, sizeof(q), &Mem, 0)))
+			{
+				memcpy(Mem, q, sizeof(q));
+				SsaoVB->Unlock();
+			}
+			else if (SsaoVB) { SsaoVB->Release(); SsaoVB = nullptr; }
+		}
+		const bool Go = SkinMaskUsed && Depth != nullptr && SceneProjOk && SsaoVB != nullptr && SssBuild(Dev);
+		if (Go)
+		{
+			const float full[4] = { 1.0f / SceneW, 1.0f / SceneH, (float)SceneW, (float)SceneH };
+			const float proj[4] = { SceneProj._11, SceneProj._22, SceneProj._33, SceneProj._43 };
+			const float across[4] = { 1, 0, 0, 0 }, down[4] = { 0, 1, 0, 0 };
+			Dev->SetFVF(D3DFVF_XYZ | D3DFVF_TEX1);
+			Dev->SetStreamSource(0, SsaoVB, 0, sizeof(SmaaVertex));
+			Dev->SetVertexShader(SssVS);
+			Dev->SetVertexShaderConstantF(0, full, 1);
+			Dev->SetPixelShaderConstantF(0, full, 1);
+			Dev->SetPixelShaderConstantF(1, proj, 1);
+			Dev->SetPixelShaderConstantF(3, SssFx, 1);
+			Dev->SetPixelShader(SssPS);
+			SmaaSampler(Dev, 0, D3DTEXF_LINEAR);
+			SmaaSampler(Dev, 1, D3DTEXF_POINT);
+			SmaaSampler(Dev, 2, D3DTEXF_POINT);
+			Target(Dev, SssTmp);
+			Dev->SetTexture(0, SceneTex);
+			Dev->SetTexture(1, Depth);
+			Dev->SetTexture(2, SkinMask);
+			Dev->SetPixelShaderConstantF(2, across, 1);
+			Dev->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
+			Target(Dev, SssOut);
+			Dev->SetTexture(0, SssTmp);
+			Dev->SetPixelShaderConstantF(2, down, 1);
+			Dev->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
+			std::swap(SceneTex, SssOut);
+			static int Ran = 0;
+			if (Ran++ < 1)
+				Message("sss: running (%ux%u, width %.2f, strength %.2f, falloff %.2f)", SceneW, SceneH, SssFx[0], SssFx[1], SssFx[2]);
+			// back to the post chain's setup
+			Dev->SetVertexShader(nullptr);
+			Dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+			Dev->SetStreamSource(0, PostQuadVB, 0, sizeof(U2QuadVertex));
+			for (DWORD t = 0; t < 3; t++)
+				SmaaSampler(Dev, t, D3DTEXF_LINEAR);
+			Dev->SetTexture(0, nullptr);
+			Dev->SetTexture(1, nullptr);
+			Dev->SetTexture(2, nullptr);
+		}
+		else if (SkinMaskUsed)
+		{
+			static int Told = 0;
+			if (Told++ < 3)
+				Message("sss: skipped (%s)", Depth == nullptr ? "no readable depth" : SsaoVB == nullptr ? "needs ssao=1 for its quad" : "no projection / shader");
+		}
+		// the mask starts empty for the next frame
+		if (SkinMaskUsed)
+		{
+			IDirect3DSurface9 *M = nullptr;
+			if (SUCCEEDED(SkinMask->GetSurfaceLevel(0, &M)) && M) { Dev->ColorFill(M, nullptr, 0); M->Release(); }
+			SkinMaskUsed = false;
+		}
 	}
 
 	// ---- SMAA 1x (smaa=1 by default, smaa=0 off) -------------------------------------------
@@ -4864,6 +5067,14 @@ public:
 				SsaoFx[1] = (std::max)(SsaoFx[1], 4.0f);
 			else if (sscanf_s(Line, " ssaores=%u", &V) == 1)
 				SsaoRes = V >= 2 ? 2 : 1;
+			else if (sscanf_s(Line, " sss=%u", &V) == 1)
+			{
+				if ((V != 0) != Sss)
+					DepthDirty = true;
+				Sss = V != 0;
+			}
+			else if (sscanf_s(Line, " sssfx=%f %f %f %f", &SssFx[0], &SssFx[1], &SssFx[2], &SssFx[3]) >= 1)
+				;
 			else if (sscanf_s(Line, " gires=%u", &V) == 1)
 				GiRes = V >= 2 ? 2 : 1;
 			else if (sscanf_s(Line, " gilights=%f %d", &GiLightGain, &GiLightMax) >= 1)
@@ -5064,6 +5275,8 @@ public:
 		SmaaBroken = false;
 		GiReleaseAll();
 		SsaoReleaseAll();
+		SssReleaseAll();
+		SssBroken = false;
 		GiBroken = false;
 		DepthBroken = false;
 		// managed textures survive a reset but belong to this device: the game makes a new device
