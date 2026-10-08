@@ -1,0 +1,3 @@
+Dear ImGui v1.92.9b (https://github.com/ocornut/imgui, tag v1.92.9b), MIT licence (LICENSE.txt).
+Vendored unchanged: the core files and the dx9 + win32 backends (backends/ moved next to the core).
+Used by the GM panel (gmpanel=1, U2Shaders::GmPanel*).

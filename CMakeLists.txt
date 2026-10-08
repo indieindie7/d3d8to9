@@ -18,6 +18,12 @@ set(D3D8TO9_SOURCE
   source/d3dx9.hpp
   source/interface_query.cpp
   source/interface_query.hpp
+  source/imgui/imgui.cpp
+  source/imgui/imgui_draw.cpp
+  source/imgui/imgui_tables.cpp
+  source/imgui/imgui_widgets.cpp
+  source/imgui/imgui_impl_dx9.cpp
+  source/imgui/imgui_impl_win32.cpp
   res/d3d8.def
   res/d3d8to9.rc
 )

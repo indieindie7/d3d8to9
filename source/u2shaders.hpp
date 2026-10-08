@@ -65,6 +65,9 @@
 #include "runs.hpp"
 #include <d3dcompiler.h>
 #include "fakefull.hpp"
+#include "imgui/imgui.h"
+#include "imgui/imgui_impl_dx9.h"
+#include "imgui/imgui_impl_win32.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdarg>
@@ -78,6 +81,9 @@
 #include <vector>
 
 #pragma comment(lib, "d3dcompiler.lib")
+
+// gmpanel=1 (the GM panel): ImGui's win32 backend takes the game window's messages through this
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 struct U2TexInfo
 {
@@ -171,6 +177,10 @@ public:
 			LiveOn = Hash != 0;
 		else if (sscanf_s(Line, " gmterrain=%u", &Hash) == 1)
 			GmTerrainOn = Hash != 0;
+		else if (sscanf_s(Line, " gmpanelscale=%f", &GmPanelScale) == 1)
+			;
+		else if (sscanf_s(Line, " gmpanel=%u", &Hash) == 1)
+			GmPanelMode = (int)Hash;
 		else if (sscanf_s(Line, " gloss=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
 		{
 			U2Rule R;
@@ -582,6 +592,7 @@ public:
 		if (!Loaded)
 			Load();
 		PostCheck(Dev);
+		GmCaptureView(Dev);                  // gmpanel=1, while shown: the scene's view for the gizmo
 		if (CharProbe && !HasTex0 && Offscreen(Dev))
 		{
 			DWORD blend = 0, op0 = 0, arg1 = 0;
@@ -1845,6 +1856,12 @@ public:
 	static U2Shaders *&LiveSelf() { static U2Shaders *P = nullptr; return P; }
 	static LRESULT CALLBACK LiveWndProc(HWND W, UINT M, WPARAM A, LPARAM B)
 	{
+		if (LiveSelf() != nullptr && LiveSelf()->GmPanelMode != 0)
+		{
+			LRESULT R = 0;
+			if (LiveSelf()->GmPanelInput(W, M, A, B, R))
+				return R;
+		}
 		if (M == LiveMsg && LiveSelf() != nullptr)
 		{
 			LiveSelf()->LiveRun();
@@ -2195,20 +2212,19 @@ public:
 			F = F.substr(0, L);
 		return F;
 	}
-	// this map family's terrain lines from U2GM.ini, in slot order ("raise X Y R H")
-	std::vector<std::string> GmReadLines()
+	// System\U2GM.ini as text (UTF-16: the low bytes)
+	std::string GmIniText()
 	{
-		std::vector<std::string> Out;
 		std::string Text;
 		FILE *F = nullptr;
 		if (fopen_s(&F, (Dir + "U2GM.ini").c_str(), "rb") || F == nullptr)
-			return Out;
+			return Text;
 		char Buf[4096];
 		size_t n;
 		while ((n = fread(Buf, 1, sizeof(Buf), F)) > 0)
 			Text.append(Buf, n);
 		fclose(F);
-		if (Text.find('\0') != std::string::npos)     // UTF-16: the low bytes
+		if (Text.find('\0') != std::string::npos)
 		{
 			std::string N;
 			for (char c : Text)
@@ -2216,6 +2232,15 @@ public:
 					N += c;
 			Text.swap(N);
 		}
+		return Text;
+	}
+	// this map family's terrain lines from U2GM.ini, in slot order ("raise X Y R H")
+	std::vector<std::string> GmReadLines()
+	{
+		std::vector<std::string> Out;
+		std::string Text = GmIniText();
+		if (Text.empty())
+			return Out;
 		const std::string Tag = "@" + GmFamily() + " ";
 		std::map<int, std::string> BySlot;
 		bool InSec = false;
@@ -2517,6 +2542,944 @@ public:
 			Message("gm terrain: %s on %s: %d line(s) applied, %d height(s) changed, rebuilt x %d..%d y %d..%d in %u ms",
 				Name.c_str(), GmMap.c_str(), Applied, Changed, UX1, UX2, UY1, UY2, (unsigned)(GetTickCount() - T0));
 		}
+	}
+
+	// ---- gmpanel=1: the GM panel and gizmo (Dear ImGui), drawn over the game ---------------------
+	// U2GM (script) does the editing; this is its front end. F7 (seen by the game window's message
+	// hook, LiveWndProc) shows or hides a panel drawn at Present, after the HUD, on the back buffer.
+	//   - Shown, the game's mouse is held by U2Input (System\dinput8.dll, its exported
+	//     U2InputHoldMouse): the DirectInput mouse is unacquired, so the OS cursor is free and the
+	//     game gets no look or fire. Key presses and mouse messages go to the panel only; key
+	//     releases still reach the game, so nothing held sticks. Without U2Input the messages are
+	//     still kept from the game, but the mouse keeps turning the view (the game reads the mouse
+	//     through DirectInput, not window messages).
+	//   - Buttons send "gm ..." commands as lines "gm q SESSION K CMD" in System\U2GMPanel.txt
+	//     (written whole and renamed into place). GMMaster execs that file every 2 s, 0.25 s while
+	//     the panel is open ("gm panel 1"), and runs each line once (K above its last). Its
+	//     PanelState line in U2GM.ini says which K it reached and what is picked; lines it has
+	//     taken leave the file. Only commands made of [A-Za-z0-9 ._-#:,+] are ever written.
+	//   - The picked actor gets a gizmo: X/Y/Z arrows and a yaw ring, projected with the scene's
+	//     view and projection (the last perspective draw of the frame on the back buffer with an
+	//     identity world matrix, else the last perspective draw). Dragging previews the change
+	//     ("gm preview", at most every 150 ms) and the release sends "gm moveto X Y Z" or
+	//     "gm turn DEG", snapped to U2GM.ini's GridSize / YawStep (Escape cancels).
+	//   - A click in the world (not on the panel or gizmo) sends "gm ray" (the line under the mouse)
+	//     and the chosen action aimed along it: pick, spawn, move here, or a terrain brush.
+	// gmpanel=2: the same with the cursor drawn by ImGui; gmpanelscale=F sizes the panel. The panel's
+	// window place is kept in System\U2GMPanel.imgui.ini. Never in UnrealEd.
+	int GmPanelMode = 0;
+	float GmPanelScale = 1.0f;
+	bool GmPanelShown = false, GmPanelBroken = false, GmPanelStarted = false;
+	bool GmImReady = false;
+	IDirect3DDevice9 *GmImDev = nullptr;
+	std::string GmImIni;
+	int GmCursorShows = 0;
+	typedef int (WINAPI *GmHold_t)(int);
+	GmHold_t GmHold = nullptr;
+	bool GmHoldLooked = false;
+	unsigned GmSession = 0;
+	long GmOutK = 0;
+	struct GmOutLine { long K; std::string Cmd; bool Preview; };
+	std::vector<GmOutLine> GmOut;
+	std::string GmOutWritten;
+	struct GmStateT
+	{
+		bool Valid = false, On = false, Poss = false, Frz = false, CamOk = false;
+		unsigned Session = 0;
+		long Seq = 0;
+		std::string Pick = "-", Cls = "-", Mesh = "-";
+		float Loc[3] = { 0, 0, 0 }, Yaw = 0, Scale = 1, Cam[3] = { 0, 0, 0 };
+	};
+	GmStateT GmSt;
+	std::vector<std::pair<int, std::string>> GmPalette, GmJournal;
+	float GmGrid = 32;
+	int GmYawStep = 15;
+	FILETIME GmPanelIniTime = {};
+	std::string GmPanelMap;
+	D3DMATRIX GmView = {}, GmProj = {}, GmViewNext = {}, GmProjNext = {};
+	bool GmViewOk = false, GmViewNextOk = false, GmViewNextIdent = false;
+	float GmVP[16] = {}, GmInvVP[16] = {}, GmCam[3] = {};
+	float GmDispW = 0, GmDispH = 0;
+	float GmStep = 32, GmRadius = 512, GmHeight = 128;
+	int GmPaletteSel = 0, GmClickMode = 0, GmHot = -1;
+	bool GmGizmoOn = true, GmPreviewOn = true, GmSnapOn = true;
+	struct GmDragT
+	{
+		int Axis = -1;                     // 0..2 move along X/Y/Z, 3 the yaw ring
+		float Start[3] = { 0, 0, 0 }, Now[3] = { 0, 0, 0 };
+		float StartYaw = 0, NowYaw = 0, Amount = 0, Previewed = 0, L = 0;
+		float M0[2] = { 0, 0 }, AnglePrev = 0, AngleAcc = 0;
+		DWORD LastPreview = 0;
+	};
+	GmDragT GmDrag;
+	float GmPoseLoc[3] = { 0, 0, 0 }, GmPoseYaw = 0;   // where the last drag left it, until the game says so
+	long GmPoseK = 0;
+
+	long GmAcked() const { return (GmSt.Valid && GmSt.Session == GmSession) ? GmSt.Seq : 0; }
+
+	// one "gm" command for the game (printf-style); returns its K, 0 if refused
+	long GmSend(const char *Fmt, ...)
+	{
+		char Buf[256];
+		va_list Args;
+		va_start(Args, Fmt);
+		vsnprintf(Buf, sizeof(Buf), Fmt, Args);
+		va_end(Args);
+		Buf[sizeof(Buf) - 1] = 0;
+		for (const char *c = Buf; *c; c++)
+			if (!isalnum((unsigned char)*c) && strchr(" ._-#:,+", *c) == nullptr)
+			{
+				Message("gm panel: not sent (only letters, digits and ._-#:,+): %s", Buf);
+				return 0;
+			}
+		const bool Preview = strncmp(Buf, "preview ", 8) == 0;
+		if (Preview)                         // a newer preview makes the waiting ones pointless
+			GmOut.erase(std::remove_if(GmOut.begin(), GmOut.end(), [](const GmOutLine &L) { return L.Preview; }), GmOut.end());
+		if (GmOut.size() >= 200)
+			GmOut.erase(GmOut.begin());      // the game isn't taking them (U2GM not loaded?)
+		GmOutLine L;
+		L.K = ++GmOutK;
+		L.Cmd = Buf;
+		L.Preview = Preview;
+		GmOut.push_back(L);
+		return L.K;
+	}
+	// the lines the game hasn't taken yet, into System\U2GMPanel.txt (whole, renamed into place)
+	void GmFlushOut()
+	{
+		const long Ack = GmAcked();
+		GmOut.erase(std::remove_if(GmOut.begin(), GmOut.end(), [Ack](const GmOutLine &L) { return L.K <= Ack; }), GmOut.end());
+		std::string Text;
+		for (const GmOutLine &L : GmOut)
+			Text += "gm q " + std::to_string(GmSession) + " " + std::to_string(L.K) + " " + L.Cmd + "\r\n";
+		if (Text == GmOutWritten)
+			return;
+		const std::string Tmp = Dir + "U2GMPanel.tmp", Path = Dir + "U2GMPanel.txt";
+		FILE *F = nullptr;
+		if (fopen_s(&F, Tmp.c_str(), "wb") || F == nullptr)
+			return;
+		const bool Ok = fwrite(Text.data(), 1, Text.size(), F) == Text.size();
+		fclose(F);
+		if (Ok && MoveFileExA(Tmp.c_str(), Path.c_str(), MOVEFILE_REPLACE_EXISTING))
+			GmOutWritten = Text;            // else (the game reading it): the next frame
+		else
+			DeleteFileA(Tmp.c_str());
+	}
+
+	void GmParseState(const std::string &V)
+	{
+		GmStateT S;
+		S.Valid = true;
+		size_t At = 0;
+		while (At < V.size())
+		{
+			size_t End = V.find(' ', At);
+			if (End == std::string::npos)
+				End = V.size();
+			const std::string T = V.substr(At, End - At);
+			At = End + 1;
+			const size_t Eq = T.find('=');
+			if (Eq == std::string::npos)
+				continue;
+			const std::string K = T.substr(0, Eq), X = T.substr(Eq + 1);
+			if (K == "seq")
+			{
+				unsigned Se = 0;
+				long Sq = 0;
+				if (sscanf_s(X.c_str(), "%u:%ld", &Se, &Sq) == 2)
+				{
+					S.Session = Se;
+					S.Seq = Sq;
+				}
+			}
+			else if (K == "on") S.On = atoi(X.c_str()) != 0;
+			else if (K == "poss") S.Poss = atoi(X.c_str()) != 0;
+			else if (K == "frz") S.Frz = atoi(X.c_str()) != 0;
+			else if (K == "pick") S.Pick = X;
+			else if (K == "cls") S.Cls = X;
+			else if (K == "mesh") S.Mesh = X;
+			else if (K == "loc") sscanf_s(X.c_str(), "%f,%f,%f", &S.Loc[0], &S.Loc[1], &S.Loc[2]);
+			else if (K == "yaw") S.Yaw = (float)atof(X.c_str());
+			else if (K == "scale") S.Scale = (float)atof(X.c_str());
+			else if (K == "cam") S.CamOk = sscanf_s(X.c_str(), "%f,%f,%f", &S.Cam[0], &S.Cam[1], &S.Cam[2]) == 3;
+		}
+		if (S.Pick.empty())
+			S.Pick = "-";
+		GmSt = S;
+	}
+	// U2GM.ini when it changed: PanelState, the palette, the grid, this map's journal
+	void GmPanelReadIni()
+	{
+		WIN32_FILE_ATTRIBUTE_DATA A = {};
+		if (!GetFileAttributesExA((Dir + "U2GM.ini").c_str(), GetFileExInfoStandard, &A))
+			return;
+		if (GmPanelMap == CurMap && CompareFileTime(&A.ftLastWriteTime, &GmPanelIniTime) == 0)
+			return;
+		const std::string Text = GmIniText();
+		if (Text.empty())
+			return;                         // being written: the next look
+		GmPanelIniTime = A.ftLastWriteTime;
+		GmPanelMap = CurMap;
+		GmPalette.clear();
+		GmJournal.clear();
+		const std::string Tag = "@" + GmFamily() + " ";
+		bool InSec = false;
+		size_t At = 0;
+		while (At < Text.size())
+		{
+			size_t End = Text.find('\n', At);
+			if (End == std::string::npos)
+				End = Text.size();
+			std::string L = Text.substr(At, End - At);
+			At = End + 1;
+			while (!L.empty() && (L.back() == '\r' || L.back() == ' ' || L.back() == '\t'))
+				L.pop_back();
+			const size_t S = L.find_first_not_of(" \t");
+			if (S == std::string::npos)
+				continue;
+			L = L.substr(S);
+			if (L[0] == '[')
+			{
+				InSec = _stricmp(L.c_str(), "[U2GM.GMMaster]") == 0;
+				continue;
+			}
+			const size_t Eq = L.find('=');
+			if (!InSec || Eq == std::string::npos)
+				continue;
+			const std::string Key = L.substr(0, Eq);
+			std::string V = L.substr(Eq + 1);
+			if (V.size() >= 2 && V.front() == '"' && V.back() == '"')
+				V = V.substr(1, V.size() - 2);
+			if (_stricmp(Key.c_str(), "PanelState") == 0)
+				GmParseState(V);
+			else if (_stricmp(Key.c_str(), "GridSize") == 0)
+				GmGrid = (float)atof(V.c_str());
+			else if (_stricmp(Key.c_str(), "YawStep") == 0)
+				GmYawStep = atoi(V.c_str());
+			else if (_strnicmp(Key.c_str(), "Palette[", 8) == 0 && !V.empty())
+				GmPalette.push_back(std::make_pair(atoi(Key.c_str() + 8), V));
+			else if (_strnicmp(Key.c_str(), "Ops[", 4) == 0 && V.size() > Tag.size() && _strnicmp(V.c_str(), Tag.c_str(), Tag.size()) == 0)
+				GmJournal.push_back(std::make_pair(atoi(Key.c_str() + 4), V.substr(Tag.size())));
+		}
+		std::sort(GmPalette.begin(), GmPalette.end());
+		std::sort(GmJournal.begin(), GmJournal.end());
+	}
+
+	// ---- the view: world (Unreal units) -> screen, and back
+	static bool GmInvert(const float m[16], float out[16])
+	{
+		float inv[16];
+		inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+		inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+		inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+		inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+		inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+		inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+		inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+		inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+		inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+		inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+		inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+		inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+		inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+		inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+		inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+		inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+		const float det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+		if (det == 0 || !_finite(det))
+			return false;
+		for (int i = 0; i < 16; i++)
+			out[i] = inv[i] / det;
+		return true;
+	}
+	// per draw (LogTargetDraw), only while the panel is shown: the scene's view and projection
+	void GmCaptureView(IDirect3DDevice9 *Dev)
+	{
+		if (!GmPanelShown)
+			return;
+		D3DMATRIX P;
+		if (FAILED(Dev->GetTransform(D3DTS_PROJECTION, &P)) || P._34 != 1.0f || P._44 != 0.0f)
+			return;
+		DWORD Fvf = 0;
+		Dev->GetFVF(&Fvf);
+		if ((Fvf & D3DFVF_POSITION_MASK) == D3DFVF_XYZRHW)
+			return;
+		IDirect3DVertexShader9 *VS = nullptr;
+		Dev->GetVertexShader(&VS);
+		if (VS != nullptr)
+		{
+			VS->Release();
+			return;
+		}
+		D3DMATRIX W;
+		Dev->GetTransform(D3DTS_WORLD, &W);
+		bool Ident = true;
+		for (int r = 0; r < 4 && Ident; r++)
+			for (int c = 0; c < 4; c++)
+				if (fabsf(W.m[r][c] - (r == c ? 1.0f : 0.0f)) > 1e-4f)
+				{
+					Ident = false;
+					break;
+				}
+		if (!Ident && GmViewNextIdent)
+			return;                          // this frame's world draws already gave the view
+		if (Offscreen(Dev))
+			return;
+		GmProjNext = P;
+		Dev->GetTransform(D3DTS_VIEW, &GmViewNext);
+		GmViewNextOk = true;
+		GmViewNextIdent = GmViewNextIdent || Ident;
+	}
+	void GmTakeView()
+	{
+		if (GmViewNextOk)
+		{
+			GmView = GmViewNext;
+			GmProj = GmProjNext;
+			for (int r = 0; r < 4; r++)
+				for (int c = 0; c < 4; c++)
+				{
+					float x = 0;
+					for (int k = 0; k < 4; k++)
+						x += GmView.m[r][k] * GmProj.m[k][c];
+					GmVP[r * 4 + c] = x;
+				}
+			GmViewOk = GmInvert(GmVP, GmInvVP);
+			const D3DMATRIX Inv = InvView(GmView);
+			for (int k = 0; k < 3; k++)
+				GmCam[k] = Inv.m[3][k];
+		}
+		GmViewNextOk = GmViewNextIdent = false;
+	}
+	bool GmProject(const float P[3], ImVec2 &Out) const
+	{
+		float c[4];
+		for (int k = 0; k < 4; k++)
+			c[k] = P[0] * GmVP[k] + P[1] * GmVP[4 + k] + P[2] * GmVP[8 + k] + GmVP[12 + k];
+		if (c[3] < 1.0f)
+			return false;                    // behind the camera
+		Out.x = (c[0] / c[3] * 0.5f + 0.5f) * GmDispW;
+		Out.y = (0.5f - c[1] / c[3] * 0.5f) * GmDispH;
+		return _finite(Out.x) && _finite(Out.y);
+	}
+	// the line under a screen point: from the camera, unit direction
+	bool GmMouseRay(const ImVec2 &M, float S[3], float D[3]) const
+	{
+		const float x = M.x / GmDispW * 2 - 1, y = 1 - M.y / GmDispH * 2;
+		float p[4];
+		for (int k = 0; k < 4; k++)
+			p[k] = x * GmInvVP[k] + y * GmInvVP[4 + k] + GmInvVP[12 + k];   // (x, y, 0, 1): the near plane
+		if (fabsf(p[3]) < 1e-12f)
+			return false;
+		float Len = 0;
+		for (int k = 0; k < 3; k++)
+		{
+			S[k] = GmCam[k];
+			D[k] = p[k] / p[3] - GmCam[k];
+			Len += D[k] * D[k];
+		}
+		Len = sqrtf(Len);
+		if (!(Len > 1e-6f))
+			return false;
+		for (int k = 0; k < 3; k++)
+			D[k] /= Len;
+		return true;
+	}
+	// where the line under M meets the horizontal plane through C: its angle round C (degrees)
+	bool GmRingAngle(const ImVec2 &M, const float C[3], float &Deg) const
+	{
+		float S[3], D[3];
+		if (!GmMouseRay(M, S, D) || fabsf(D[2]) < 1e-4f)
+			return false;
+		const float t = (C[2] - S[2]) / D[2];
+		if (t <= 0)
+			return false;
+		Deg = atan2f(S[1] + D[1] * t - C[1], S[0] + D[0] * t - C[0]) * 57.2957795f;
+		return true;
+	}
+	static float GmSegDist(const ImVec2 &P, const ImVec2 &A, const ImVec2 &B)
+	{
+		const float dx = B.x - A.x, dy = B.y - A.y, L2 = dx * dx + dy * dy;
+		float t = L2 > 0 ? ((P.x - A.x) * dx + (P.y - A.y) * dy) / L2 : 0;
+		t = t < 0 ? 0 : t > 1 ? 1 : t;
+		const float ex = A.x + dx * t - P.x, ey = A.y + dy * t - P.y;
+		return sqrtf(ex * ex + ey * ey);
+	}
+	// the picked actor's place: mid-drag, just dropped (the game hasn't said yet), or the game's
+	void GmPose(float P[3], float &Yaw) const
+	{
+		const float *L = GmSt.Loc;
+		Yaw = GmSt.Yaw;
+		if (GmDrag.Axis >= 0)
+		{
+			L = GmDrag.Now;
+			Yaw = GmDrag.NowYaw;
+		}
+		else if (GmPoseK > GmAcked())
+		{
+			L = GmPoseLoc;
+			Yaw = GmPoseYaw;
+		}
+		for (int k = 0; k < 3; k++)
+			P[k] = L[k];
+	}
+
+	// ---- the gizmo
+	void GmDragCancel()
+	{
+		if (GmDrag.Axis >= 0 && GmDrag.Previewed != 0)
+			GmSend("preview %.1f %.1f %.1f %.1f", GmDrag.Start[0], GmDrag.Start[1], GmDrag.Start[2], GmDrag.StartYaw);
+		GmDrag.Axis = -1;
+	}
+	void GmDragEnd()
+	{
+		const GmDragT D = GmDrag;
+		GmDrag.Axis = -1;
+		if (D.Axis < 3)
+		{
+			if (D.Amount != 0)
+			{
+				GmPoseK = GmSend("moveto %.1f %.1f %.1f", D.Now[0], D.Now[1], D.Now[2]);
+				memcpy(GmPoseLoc, D.Now, sizeof(GmPoseLoc));
+				GmPoseYaw = D.StartYaw;
+			}
+			else if (D.Previewed != 0)
+				GmSend("preview %.1f %.1f %.1f %.1f", D.Start[0], D.Start[1], D.Start[2], D.StartYaw);
+			return;
+		}
+		if (D.Previewed != 0)                // back where it was, then one journalled turn
+			GmSend("preview %.1f %.1f %.1f %.1f", D.Start[0], D.Start[1], D.Start[2], D.StartYaw);
+		if (D.Amount != 0)
+		{
+			GmPoseK = GmSend("turn %g", D.Amount);
+			memcpy(GmPoseLoc, D.Start, sizeof(GmPoseLoc));
+			GmPoseYaw = D.StartYaw + D.Amount;
+		}
+	}
+	void GmGizmo()
+	{
+		GmHot = -1;
+		if (!GmGizmoOn || !GmViewOk || GmSt.Pick == "-")
+		{
+			if (GmDrag.Axis >= 0)
+				GmDragCancel();
+			return;
+		}
+		ImDrawList *DL = ImGui::GetBackgroundDrawList();
+		ImGuiIO &io = ImGui::GetIO();
+		const ImVec2 M = io.MousePos;
+		float P[3], Yaw;
+		GmPose(P, Yaw);
+		ImVec2 C;
+		if (!GmProject(P, C))
+			return;
+		float L = GmDrag.L;
+		if (GmDrag.Axis < 0)
+		{
+			const float dx = P[0] - GmCam[0], dy = P[1] - GmCam[1], dz = P[2] - GmCam[2];
+			L = (std::max)(sqrtf(dx * dx + dy * dy + dz * dz) * 0.15f, 8.0f);
+		}
+		static const ImU32 Col[4] = { IM_COL32(235, 70, 70, 255), IM_COL32(70, 215, 70, 255), IM_COL32(80, 130, 255, 255), IM_COL32(245, 205, 50, 255) };
+		static const ImU32 White = IM_COL32(255, 255, 255, 255);
+		ImVec2 E[3];
+		bool EOk[3];
+		for (int a = 0; a < 3; a++)
+		{
+			float Q[3] = { P[0], P[1], P[2] };
+			Q[a] += L;
+			EOk[a] = GmProject(Q, E[a]) && fabsf(E[a].x - C.x) + fabsf(E[a].y - C.y) > 6;
+		}
+		const int N = 48;
+		ImVec2 Ring[N];
+		bool RingOk = true;
+		for (int i = 0; i < N && RingOk; i++)
+		{
+			const float t = i * 6.2831853f / N;
+			const float Q[3] = { P[0] + cosf(t) * L * 0.75f, P[1] + sinf(t) * L * 0.75f, P[2] };
+			RingOk = GmProject(Q, Ring[i]);
+		}
+		if (GmDrag.Axis < 0 && !io.WantCaptureMouse)
+		{
+			float Best = 9;
+			for (int a = 0; a < 3; a++)
+				if (EOk[a] && GmSegDist(M, C, E[a]) < Best)
+				{
+					Best = GmSegDist(M, C, E[a]);
+					GmHot = a;
+				}
+			for (int i = 0; i < N && RingOk; i++)
+				if (GmSegDist(M, Ring[i], Ring[(i + 1) % N]) < Best)
+				{
+					Best = GmSegDist(M, Ring[i], Ring[(i + 1) % N]);
+					GmHot = 3;
+				}
+		}
+		const int Lit = GmDrag.Axis >= 0 ? GmDrag.Axis : GmHot;
+		if (RingOk)
+		{
+			DL->AddPolyline(Ring, N, Lit == 3 ? White : Col[3], ImDrawFlags_Closed, 2.0f);
+			const float Q[3] = { P[0] + cosf(Yaw / 57.2957795f) * L * 0.75f, P[1] + sinf(Yaw / 57.2957795f) * L * 0.75f, P[2] };
+			ImVec2 T;
+			if (GmProject(Q, T))
+				DL->AddCircleFilled(T, 5, Lit == 3 ? White : Col[3]);     // the way it faces
+		}
+		for (int a = 0; a < 3; a++)
+			if (EOk[a])
+			{
+				const ImU32 K = Lit == a ? White : Col[a];
+				DL->AddLine(C, E[a], K, 3.0f);
+				DL->AddCircleFilled(E[a], 6, K);
+				const char Name[2] = { "XYZ"[a], 0 };
+				DL->AddText(ImVec2(E[a].x + 8, E[a].y - 16), K, Name);
+			}
+		DL->AddCircleFilled(C, 4, IM_COL32(255, 255, 255, 220));
+		if (GmHot >= 0 && ImGui::IsMouseClicked(0))
+		{
+			GmDrag = GmDragT();
+			GmDrag.Axis = GmHot;
+			memcpy(GmDrag.Start, P, sizeof(GmDrag.Start));
+			memcpy(GmDrag.Now, P, sizeof(GmDrag.Now));
+			GmDrag.StartYaw = GmDrag.NowYaw = Yaw;
+			GmDrag.M0[0] = M.x;
+			GmDrag.M0[1] = M.y;
+			GmDrag.L = L;
+			float A0 = 0;
+			if (GmHot == 3 && GmRingAngle(M, P, A0))
+				GmDrag.AnglePrev = A0;
+			return;
+		}
+		if (GmDrag.Axis < 0)
+			return;
+		if (ImGui::IsKeyPressed(ImGuiKey_Escape))
+		{
+			GmDragCancel();
+			return;
+		}
+		const int a = GmDrag.Axis;
+		const float Was = GmDrag.Amount;
+		char Label[64];
+		if (a < 3)
+		{
+			ImVec2 C0, E0;
+			float Q[3] = { GmDrag.Start[0], GmDrag.Start[1], GmDrag.Start[2] };
+			Q[a] += GmDrag.L;
+			if (GmProject(GmDrag.Start, C0) && GmProject(Q, E0))
+			{
+				const float dx = E0.x - C0.x, dy = E0.y - C0.y, Len = sqrtf(dx * dx + dy * dy);
+				if (Len > 1)
+				{
+					float W = ((M.x - GmDrag.M0[0]) * dx + (M.y - GmDrag.M0[1]) * dy) / Len / Len * GmDrag.L;
+					if (GmSnapOn && GmGrid > 0)
+						W = GmGrid * floorf(W / GmGrid + 0.5f);
+					GmDrag.Amount = W;
+					memcpy(GmDrag.Now, GmDrag.Start, sizeof(GmDrag.Now));
+					GmDrag.Now[a] += W;
+				}
+			}
+			snprintf(Label, sizeof(Label), "%c %+.0f", "XYZ"[a], GmDrag.Amount);
+			ImVec2 S0, N0;
+			if (GmProject(GmDrag.Start, S0) && GmProject(GmDrag.Now, N0))
+				DL->AddLine(S0, N0, IM_COL32(255, 255, 255, 110), 1.5f);
+		}
+		else
+		{
+			float Ang = 0;
+			if (GmRingAngle(M, GmDrag.Start, Ang))
+			{
+				float d = Ang - GmDrag.AnglePrev;
+				while (d > 180) d -= 360;
+				while (d < -180) d += 360;
+				GmDrag.AngleAcc += d;
+				GmDrag.AnglePrev = Ang;
+			}
+			float T = GmDrag.AngleAcc;
+			if (GmSnapOn && GmYawStep > 0)
+				T = GmYawStep * floorf(T / GmYawStep + 0.5f);
+			GmDrag.Amount = T;
+			GmDrag.NowYaw = GmDrag.StartYaw + T;
+			snprintf(Label, sizeof(Label), "turn %+.0f", T);
+		}
+		DL->AddText(ImVec2(M.x + 16, M.y + 10), White, Label);
+		if (GmPreviewOn && GmDrag.Amount != Was && GetTickCount() - GmDrag.LastPreview > 150)
+		{
+			GmDrag.LastPreview = GetTickCount();
+			GmSend("preview %.1f %.1f %.1f %.1f", GmDrag.Now[0], GmDrag.Now[1], GmDrag.Now[2], GmDrag.NowYaw);
+			GmDrag.Previewed = 1;
+		}
+		if (ImGui::IsMouseReleased(0))
+			GmDragEnd();
+	}
+	// a click in the world: the line under the mouse, then the chosen action along it
+	void GmWorldClick()
+	{
+		ImGuiIO &io = ImGui::GetIO();
+		if (!ImGui::IsMouseClicked(0) || io.WantCaptureMouse || GmHot >= 0 || GmDrag.Axis >= 0 || !GmViewOk)
+			return;
+		float S[3], D[3];
+		if (!GmMouseRay(io.MousePos, S, D))
+			return;
+		GmSend("ray %.1f %.1f %.1f %.1f %.1f %.1f", S[0], S[1], S[2], S[0] + D[0] * 60000, S[1] + D[1] * 60000, S[2] + D[2] * 60000);
+		switch (GmClickMode)
+		{
+		case 0: GmSend("pick"); break;
+		case 1: GmSend("spawn %d", GmPaletteSel); break;
+		case 2: GmSend("moveto here"); break;
+		case 3: GmSend("raise %.0f %.0f", GmRadius, GmHeight); break;
+		case 4: GmSend("lower %.0f %.0f", GmRadius, GmHeight); break;
+		case 5: GmSend("flatten %.0f", GmRadius); break;
+		default: GmSend("smooth %.0f", GmRadius); break;
+		}
+	}
+
+	// ---- the panel
+	void GmPanelUi()
+	{
+		const ImVec4 Warn(1.0f, 0.65f, 0.25f, 1.0f);
+		ImGui::SetNextWindowPos(ImVec2(16, 16), ImGuiCond_FirstUseEver);
+		ImGui::SetNextWindowSize(ImVec2(380, 0), ImGuiCond_FirstUseEver);
+		if (!ImGui::Begin("Game master   (F7 hides)"))
+		{
+			ImGui::End();
+			return;
+		}
+		ImGui::TextDisabled("%s | game took line %ld, %d waiting", CurMap.empty() ? "?" : GmFamily().c_str(), GmAcked(), (int)GmOut.size());
+		if (!GmSt.Valid)
+			ImGui::TextColored(Warn, "no PanelState in U2GM.ini yet: is U2GM loaded?");
+		if (GmHold == nullptr)
+			ImGui::TextColored(Warn, "U2Input not found: the mouse still turns the view");
+		if (!GmViewOk)
+			ImGui::TextColored(Warn, "no scene view yet: no gizmo, no world clicks");
+		bool On = GmSt.On;
+		if (ImGui::Checkbox("GM mode", &On))
+			GmSend(On ? "on" : "off");
+		ImGui::SameLine();
+		bool Frz = GmSt.Frz;
+		if (ImGui::Checkbox("Freeze", &Frz))
+			GmSend("freeze");
+		ImGui::SameLine();
+		if (GmSt.Poss ? ImGui::Button("Release") : ImGui::Button("Possess"))
+			GmSend(GmSt.Poss ? "release" : "possess");
+		ImGui::SameLine();
+		if (ImGui::Button("Undo"))
+			GmSend("undo");
+		ImGui::SameLine();
+		if (ImGui::Button("Redo"))
+			GmSend("redo");
+
+		ImGui::SeparatorText("Picked");
+		if (GmSt.Pick == "-")
+			ImGui::TextDisabled("nothing: Pick (crosshair) or click the world");
+		else
+		{
+			ImGui::Text("%s  (%s)", GmSt.Pick.c_str(), GmSt.Cls.c_str());
+			ImGui::TextWrapped("mesh %s", GmSt.Mesh.c_str());
+			ImGui::Text("at %.0f %.0f %.0f   yaw %.1f   scale %.2f", GmSt.Loc[0], GmSt.Loc[1], GmSt.Loc[2], GmSt.Yaw, GmSt.Scale);
+		}
+		if (ImGui::Button("Pick (crosshair)"))
+			GmSend("pick");
+		ImGui::SameLine();
+		if (ImGui::Button("Hide"))
+			GmSend("hide");
+		ImGui::SetNextItemWidth(200);
+		ImGui::Combo("click in world", &GmClickMode, "pick\0spawn the palette entry\0move the picked here\0raise terrain\0lower terrain\0flatten terrain\0smooth terrain\0\0");
+
+		ImGui::SeparatorText("Move / turn / scale");
+		ImGui::SetNextItemWidth(90);
+		ImGui::InputFloat("step", &GmStep, 0, 0, "%.0f");
+		for (int a = 0; a < 3; a++)
+			for (int s = -1; s <= 1; s += 2)
+			{
+				char B[16];
+				snprintf(B, sizeof(B), "%c%c", s < 0 ? '-' : '+', "XYZ"[a]);
+				if (a != 0 || s > 0)
+					ImGui::SameLine();
+				if (ImGui::Button(B, ImVec2(40, 0)))
+					GmSend("move %g %g %g", a == 0 ? s * GmStep : 0.0f, a == 1 ? s * GmStep : 0.0f, a == 2 ? s * GmStep : 0.0f);
+			}
+		if (ImGui::Button("Turn -15"))
+			GmSend("turn -15");
+		ImGui::SameLine();
+		if (ImGui::Button("Turn +15"))
+			GmSend("turn 15");
+		ImGui::SameLine();
+		if (ImGui::Button("Scale -10%"))
+			GmSend("scale %.3f", GmSt.Scale * 0.9f);
+		ImGui::SameLine();
+		if (ImGui::Button("Scale +10%"))
+			GmSend("scale %.3f", GmSt.Scale * 1.1f);
+		ImGui::Checkbox("gizmo", &GmGizmoOn);
+		ImGui::SameLine();
+		ImGui::Checkbox("live preview", &GmPreviewOn);
+		ImGui::SameLine();
+		ImGui::Checkbox("snap", &GmSnapOn);
+		ImGui::TextDisabled("grid %g, yaw step %d (gm snap / gm yawstep)", GmGrid, GmYawStep);
+
+		ImGui::SeparatorText("Spawn");
+		if (GmPalette.empty())
+			ImGui::TextDisabled("palette empty: gm palette add Package.Group.Mesh");
+		else
+		{
+			ImGui::BeginChild("palette", ImVec2(0, 90), ImGuiChildFlags_Borders);
+			for (const auto &It : GmPalette)
+			{
+				char B[300];
+				snprintf(B, sizeof(B), "%d: %s", It.first, It.second.c_str());
+				if (ImGui::Selectable(B, GmPaletteSel == It.first))
+					GmPaletteSel = It.first;
+			}
+			ImGui::EndChild();
+		}
+		if (ImGui::Button("Spawn at crosshair"))
+			GmSend("spawn %d", GmPaletteSel);
+
+		ImGui::SeparatorText("Terrain (at the crosshair)");
+		ImGui::SetNextItemWidth(90);
+		ImGui::InputFloat("radius", &GmRadius, 0, 0, "%.0f");
+		ImGui::SameLine();
+		ImGui::SetNextItemWidth(90);
+		ImGui::InputFloat("height", &GmHeight, 0, 0, "%.0f");
+		if (ImGui::Button("Raise"))
+			GmSend("raise %.0f %.0f", GmRadius, GmHeight);
+		ImGui::SameLine();
+		if (ImGui::Button("Lower"))
+			GmSend("lower %.0f %.0f", GmRadius, GmHeight);
+		ImGui::SameLine();
+		if (ImGui::Button("Flatten"))
+			GmSend("flatten %.0f", GmRadius);
+		ImGui::SameLine();
+		if (ImGui::Button("Smooth"))
+			GmSend("smooth %.0f", GmRadius);
+
+		ImGui::SeparatorText("Journal (this map)");
+		ImGui::BeginChild("journal", ImVec2(0, 140), ImGuiChildFlags_Borders);
+		if (GmJournal.empty())
+			ImGui::TextDisabled("no lines");
+		for (const auto &It : GmJournal)
+			ImGui::Text("%d: %s", It.first, It.second.c_str());
+		ImGui::EndChild();
+		if (GmViewOk && GmSt.CamOk)
+			ImGui::TextDisabled("view check: camera %.0f %.0f %.0f, game eye %.0f %.0f %.0f", GmCam[0], GmCam[1], GmCam[2], GmSt.Cam[0], GmSt.Cam[1], GmSt.Cam[2]);
+		ImGui::End();
+	}
+
+	// ---- show / hide, input
+	void GmSetShown(bool S)
+	{
+		if (S == GmPanelShown)
+			return;
+		GmPanelShown = S;
+		if (!GmHoldLooked)
+		{
+			GmHoldLooked = true;
+			if (HMODULE U2I = GetModuleHandleA((Dir + "dinput8.dll").c_str()))
+				GmHold = (GmHold_t)GetProcAddress(U2I, "U2InputHoldMouse");
+			Message("gm panel: U2Input's U2InputHoldMouse %s", GmHold ? "found: the game's mouse is held while the panel is open" : "not found (System\\dinput8.dll missing or older): mouse look isn't held");
+		}
+		if (GmHold != nullptr)
+			GmHold(S ? 1 : 0);
+		if (S)
+		{
+			ClipCursor(nullptr);
+			int n = ShowCursor(TRUE);
+			GmCursorShows = 1;
+			while (n < 0 && GmCursorShows < 64)
+			{
+				n = ShowCursor(TRUE);
+				GmCursorShows++;
+			}
+			RECT R;
+			if (LiveWnd != nullptr && GetClientRect(LiveWnd, &R))
+			{
+				POINT C = { R.right / 2, R.bottom / 2 };
+				ClientToScreen(LiveWnd, &C);
+				SetCursorPos(C.x, C.y);
+			}
+		}
+		else
+		{
+			GmDragCancel();
+			for (; GmCursorShows > 0; GmCursorShows--)
+				ShowCursor(FALSE);
+		}
+		if (GmImReady)
+			ImGui::GetIO().AddFocusEvent(S);
+		GmSend(S ? "panel 1" : "panel 0");
+		Message("gm panel: %s", S ? "shown" : "hidden");
+	}
+	// from LiveWndProc (the game window's messages): F7, and while shown the input goes to ImGui
+	bool GmPanelInput(HWND W, UINT M, WPARAM A, LPARAM B, LRESULT &R)
+	{
+		R = 0;
+		if (GmPanelMode == 0 || GmPanelBroken)
+			return false;
+		if ((M == WM_KEYDOWN || M == WM_SYSKEYDOWN) && A == VK_F7)
+		{
+			if (!(B & (1 << 30)))                // not a repeat
+				GmSetShown(!GmPanelShown);
+			return true;
+		}
+		if ((M == WM_KEYUP || M == WM_SYSKEYUP) && A == VK_F7)
+			return true;
+		if (!GmPanelShown)
+			return false;
+		const bool Im = GmImReady;
+		switch (M)
+		{
+		case WM_SETCURSOR:
+			if (LOWORD(B) != HTCLIENT)
+				return false;
+			if (!(Im && ImGui_ImplWin32_WndProcHandler(W, M, A, B)))
+				SetCursor(GmPanelMode == 2 ? nullptr : LoadCursor(nullptr, IDC_ARROW));
+			R = TRUE;
+			return true;
+		case WM_KEYUP:
+		case WM_SYSKEYUP:
+			if (Im)
+				ImGui_ImplWin32_WndProcHandler(W, M, A, B);
+			return false;                    // the game sees releases: nothing stays held
+		case WM_SYSKEYDOWN:
+			if (Im)
+				ImGui_ImplWin32_WndProcHandler(W, M, A, B);
+			return A != VK_F4;               // Alt+F4 still closes the game
+		case WM_KEYDOWN:
+		case WM_CHAR:
+		case WM_SYSCHAR:
+		case WM_MOUSEMOVE:
+		case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_LBUTTONDBLCLK:
+		case WM_RBUTTONDOWN: case WM_RBUTTONUP: case WM_RBUTTONDBLCLK:
+		case WM_MBUTTONDOWN: case WM_MBUTTONUP: case WM_MBUTTONDBLCLK:
+		case WM_XBUTTONDOWN: case WM_XBUTTONUP: case WM_XBUTTONDBLCLK:
+		case WM_MOUSEWHEEL:
+		case WM_MOUSEHWHEEL:
+			if (Im)
+				ImGui_ImplWin32_WndProcHandler(W, M, A, B);
+			return true;                     // the panel's only
+		default:
+			if (Im)
+				ImGui_ImplWin32_WndProcHandler(W, M, A, B);   // focus, mouse leave...: both see it
+			return false;
+		}
+	}
+
+	bool GmImSetup(IDirect3DDevice9 *Dev)
+	{
+		if (!GmImReady)
+		{
+			IMGUI_CHECKVERSION();
+			ImGui::CreateContext();
+			ImGuiIO &io = ImGui::GetIO();
+			GmImIni = Dir + "U2GMPanel.imgui.ini";
+			io.IniFilename = GmImIni.c_str();
+			io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+			io.MouseDrawCursor = GmPanelMode == 2;
+			ImGui::StyleColorsDark();
+			ImGuiStyle &St = ImGui::GetStyle();
+			St.WindowRounding = 4;
+			St.Colors[ImGuiCol_WindowBg].w = 0.92f;
+			if (GmPanelScale > 0.5f && GmPanelScale < 4 && GmPanelScale != 1)
+			{
+				St.ScaleAllSizes(GmPanelScale);
+				St.FontScaleMain = GmPanelScale;
+			}
+			if (!ImGui_ImplWin32_Init(LiveWnd))
+			{
+				Message("gm panel: ImGui's win32 backend didn't start: off");
+				GmPanelBroken = true;
+				return false;
+			}
+			GmImReady = true;
+		}
+		if (GmImDev != Dev)
+		{
+			if (GmImDev != nullptr)
+				ImGui_ImplDX9_Shutdown();
+			GmImDev = nullptr;
+			if (!ImGui_ImplDX9_Init(Dev))
+			{
+				Message("gm panel: ImGui's dx9 backend didn't start: off");
+				GmPanelBroken = true;
+				return false;
+			}
+			GmImDev = Dev;
+		}
+		return true;
+	}
+	void GmPanelDraw(IDirect3DDevice9 *Dev)
+	{
+		ImGui_ImplDX9_NewFrame();
+		ImGui_ImplWin32_NewFrame();
+		ImGuiIO &io = ImGui::GetIO();
+		GmDispW = io.DisplaySize.x;
+		GmDispH = io.DisplaySize.y;
+		ImGui::NewFrame();
+		GmPanelUi();
+		if (GmDispW >= 16 && GmDispH >= 16)
+		{
+			GmGizmo();
+			GmWorldClick();
+		}
+		ImGui::Render();
+		IDirect3DSurface9 *OldRT = nullptr, *OldDS = nullptr, *BB = nullptr;
+		D3DVIEWPORT9 OldVp = {};
+		Dev->GetViewport(&OldVp);
+		Dev->GetRenderTarget(0, &OldRT);
+		Dev->GetDepthStencilSurface(&OldDS);
+		Dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &BB);
+		if (BB != nullptr)
+		{
+			static bool Told = false;
+			D3DSURFACE_DESC D = {};
+			BB->GetDesc(&D);
+			if (!Told && (fabsf(D.Width - GmDispW) > 1 || fabsf(D.Height - GmDispH) > 1))
+			{
+				Told = true;
+				Message("gm panel: back buffer %ux%u but the window is %.0fx%.0f: the panel's mouse may be off", D.Width, D.Height, GmDispW, GmDispH);
+			}
+			if (BB != OldRT)
+				Dev->SetRenderTarget(0, BB);
+			Dev->SetDepthStencilSurface(nullptr);
+			if (SUCCEEDED(Dev->BeginScene()))
+			{
+				ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
+				Dev->EndScene();
+			}
+			if (OldRT != nullptr && BB != OldRT)
+				Dev->SetRenderTarget(0, OldRT);
+			Dev->SetDepthStencilSurface(OldDS);
+			Dev->SetViewport(&OldVp);
+		}
+		if (BB) BB->Release();
+		if (OldRT) OldRT->Release();
+		if (OldDS) OldDS->Release();
+	}
+	// every Present while gmpanel is on
+	void GmPanelFrame(IDirect3DDevice9 *Dev)
+	{
+		if (GmPanelBroken || Dir.empty() || (GmPanelMode == 0 && !GmPanelShown))
+			return;
+		if (!GmPanelStarted)
+		{
+			GmPanelStarted = true;
+			if (GmExeIsEditor())
+			{
+				Message("gm panel: not in UnrealEd: off");
+				GmPanelBroken = true;
+				return;
+			}
+			GmSession = ((GetTickCount() ^ (GetCurrentProcessId() << 12)) & 0x3fffffff) | 1;
+			DeleteFileA((Dir + "U2GMPanel.txt").c_str());   // an old session's lines must not run
+			Message("gm panel: on (F7), session %u, commands through %sU2GMPanel.txt", GmSession, Dir.c_str());
+		}
+		if (GmPanelMode == 0)
+			GmSetShown(false);               // switched off in U2Shaders.ini while open
+		if (!LiveHook(Dev))
+			return;
+		if (Frame % 10 == 7 || (GmPanelShown && Frame % 3 == 0))
+			GmPanelReadIni();
+		GmTakeView();
+		if (GmPanelShown && GmImSetup(Dev))
+			GmPanelDraw(Dev);
+		GmFlushOut();
 	}
 
 	// ---- shotmask=1: a character mask with each shotp frame ---------------------------------
@@ -6826,6 +7789,8 @@ public:
 					MaskSave(Dev);
 			}
 		}
+		if (Loaded && Dev != nullptr)
+			GmPanelFrame(Dev);                   // gmpanel=1: after the HUD and the shot, before Present
 		if (PostTrace > 0 && !PostTraceLine.empty())
 		{
 			static int frame = 0;
@@ -6892,6 +7857,8 @@ public:
 	// Before the device is reset or destroyed: default-pool objects must go
 	void OnLost()
 	{
+		if (GmImDev != nullptr)
+			ImGui_ImplDX9_InvalidateDeviceObjects();   // gmpanel: its buffers and font are default-pool
 		U2Blood::Release();
 		U2Runs::Release();
 		MapViews.clear();
@@ -6935,6 +7902,11 @@ public:
 			It.second.Tried = false;
 		}
 		if (PostQuadVB) { PostQuadVB->Release(); PostQuadVB = nullptr; }
+		if (GmImDev != nullptr)
+		{
+			ImGui_ImplDX9_Shutdown();            // it holds a reference to the device
+			GmImDev = nullptr;
+		}
 		LastDev = nullptr;
 	}
 
