@@ -233,6 +233,7 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::Reset(D3DPRESENT_PARAMETERS8 *pPresen
 
 	CurrentZBiasRenderState = 0;
 	U2.OnLost();
+	TexEd().OnLost();                    // texedit: its render targets (bakes, pick target) are DEFAULT pool
 
 	const HRESULT deviceState = ProxyInterface->TestCooperativeLevel();
 
@@ -280,6 +281,7 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::Present(const RECT *pSourceRect, cons
 	U2.MsaaResolve(ProxyInterface);
 	if (!U2.MsaaTested && U2Msaa::Wanted() != 0 && U2.Loaded && U2.Frame > 200)
 		U2.MsaaSelfTest(ProxyInterface);
+	TexEd().OnPresent(U2, ProxyInterface);   // texedit: pick readback, ini/journal watch, adjust bakes
 	U2.OnPresent(ProxyInterface);
 	U2Crash::Where("the driver's Present");
 	const HRESULT Hr = ProxyInterface->Present(pSourceRect, pDestRect, hDestWindowOverride, nullptr);
@@ -1437,6 +1439,11 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawPrimitive(D3DPRIMITIVETYPE Primit
 		ProxyInterface->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
 		U2.MaskEnd(ProxyInterface);
 	}
+	if (TexEd().PickBegin(U2, ProxyInterface, U2Stages))   // texedit: the click frame's pick pass
+	{
+		ProxyInterface->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
+		TexEd().PickEnd(ProxyInterface);
+	}
 	return D3D_OK;
 }
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawIndexedPrimitive(D3DPRIMITIVETYPE PrimitiveType, UINT MinIndex, UINT NumVertices, UINT StartIndex, UINT PrimitiveCount)
@@ -1500,6 +1507,11 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawIndexedPrimitive(D3DPRIMITIVETYPE
 		ProxyInterface->DrawIndexedPrimitive(PrimitiveType, CurrentBaseVertexIndex, MinIndex, NumVertices, StartIndex, PrimitiveCount);
 		U2.MaskEnd(ProxyInterface);
 	}
+	if (TexEd().PickBegin(U2, ProxyInterface, U2Stages))   // texedit: the click frame's pick pass
+	{
+		ProxyInterface->DrawIndexedPrimitive(PrimitiveType, CurrentBaseVertexIndex, MinIndex, NumVertices, StartIndex, PrimitiveCount);
+		TexEd().PickEnd(ProxyInterface);
+	}
 	return D3D_OK;
 }
 // lightprobe: a user-pointer draw's vertices: the first one raw, and the average length of floats 3-5
@@ -1538,6 +1550,11 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawPrimitiveUP(D3DPRIMITIVETYPE Prim
 		ProxyInterface->DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride);
 		U2.MaskEnd(ProxyInterface);
 	}
+	if (TexEd().PickBegin(U2, ProxyInterface, U2Stages))   // texedit: the click frame's pick pass
+	{
+		ProxyInterface->DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride);
+		TexEd().PickEnd(ProxyInterface);
+	}
 	return D3D_OK;
 }
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawIndexedPrimitiveUP(D3DPRIMITIVETYPE PrimitiveType, UINT MinVertexIndex, UINT NumVertexIndices, UINT PrimitiveCount, const void *pIndexData, D3DFORMAT IndexDataFormat, const void *pVertexStreamZeroData, UINT VertexStreamZeroStride)
@@ -1560,6 +1577,11 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawIndexedPrimitiveUP(D3DPRIMITIVETY
 	{
 		ProxyInterface->DrawIndexedPrimitiveUP(PrimitiveType, MinVertexIndex, NumVertexIndices, PrimitiveCount, pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride);
 		U2.MaskEnd(ProxyInterface);
+	}
+	if (TexEd().PickBegin(U2, ProxyInterface, U2Stages))   // texedit: the click frame's pick pass
+	{
+		ProxyInterface->DrawIndexedPrimitiveUP(PrimitiveType, MinVertexIndex, NumVertexIndices, PrimitiveCount, pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride);
+		TexEd().PickEnd(ProxyInterface);
 	}
 	return D3D_OK;
 }

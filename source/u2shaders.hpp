@@ -66,6 +66,7 @@
 #include <d3dcompiler.h>
 #include "fakefull.hpp"
 #include "crash.hpp"
+#include "texedit.hpp"
 #include "imgui/imgui.h"
 #include "imgui/imgui_impl_dx9.h"
 #include "imgui/imgui_impl_win32.h"
@@ -809,7 +810,7 @@ public:
 	{
 		if (!Loaded)
 			Load();
-		if (Tex == nullptr || (Replacements.empty() && U2Blood::Count == 0 && U2Runs::Count == 0))
+		if (Tex == nullptr || (Replacements.empty() && U2Blood::Count == 0 && U2Runs::Count == 0 && !TexEd().Active()))
 			return nullptr;
 		Known(Tex, Hash);
 		if (U2Blood::Count > 0 && Seen.count(Hash) && Seen[Hash].W == 64 && Seen[Hash].H == 64)
@@ -824,7 +825,7 @@ public:
 			return Run;                         // blood running down a wall (runs.hpp)
 		const auto It = Replacements.find(Hash);
 		if (It == Replacements.end())
-			return nullptr;
+			return TexEd().Adjusted(Dev, Tex, Hash, nullptr);       // texadjust: the game's texture adjusted
 		U2Replace &R = It->second;
 		if (!R.Tried)
 		{
@@ -838,7 +839,7 @@ public:
 					Message("replace %08x: %s loaded", Hash, R.File.c_str());
 			}
 		}
-		return R.Tex;
+		return TexEd().Adjusted(Dev, R.Tex ? R.Tex : Tex, Hash, R.Tex);   // texadjust on top of replace= / texgrade=
 	}
 
 	// A DDS file as a managed texture (survives device resets): 32-bit (A8R8G8B8/X8R8G8B8) or
@@ -3454,6 +3455,7 @@ public:
 				ImGui::TextColored(Warn, "no watcher answered: run U2GM/tools/gm_commit.py --watch");
 		}
 
+		TexEd().PanelUi(*this);              // texedit.hpp: pick a texture, sliders, Save to the journal
 		ImGui::SeparatorText("Journal (this map)");
 		ImGui::BeginChild("journal", ImVec2(0, 140), ImGuiChildFlags_Borders);
 		if (GmJournal.empty())
@@ -3669,7 +3671,8 @@ public:
 				{
 					GmGizmo();
 					GmDrawLines();
-					GmWorldClick();
+					if (!TexEd().WorldClick())   // texedit: a pick waiting for its click (Esc cancels)
+						GmWorldClick();
 				}
 			}
 			SketchStrip();
