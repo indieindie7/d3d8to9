@@ -169,6 +169,8 @@ public:
 			ShotMask = Hash != 0;
 		else if (sscanf_s(Line, " live=%u", &Hash) == 1)
 			LiveOn = Hash != 0;
+		else if (sscanf_s(Line, " gmterrain=%u", &Hash) == 1)
+			GmTerrainOn = Hash != 0;
 		else if (sscanf_s(Line, " gloss=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
 		{
 			U2Rule R;
@@ -1848,6 +1850,11 @@ public:
 			LiveSelf()->LiveRun();
 			return 0;
 		}
+		if (M == GmMsg && LiveSelf() != nullptr)
+		{
+			LiveSelf()->GmRun();
+			return 0;
+		}
 		return CallWindowProcW(LiveSelf() ? LiveSelf()->LiveOldProc : DefWindowProcW, W, M, A, B);
 	}
 	bool LiveHook(IDirect3DDevice9 *Dev)
@@ -2004,6 +2011,512 @@ public:
 		}
 		if (!LiveQueue.empty() && LiveWnd != nullptr)
 			PostMessageW(LiveWnd, LiveMsg, 0, 0);
+	}
+
+	// ---- gmterrain=1: the GM journal's terrain lines, applied to the level's terrain ---------------
+	// U2GM (script) writes "terrain raise|lower|flatten|smooth X Y R H" lines into its journal
+	// (System\U2GM.ini, [U2GM.GMMaster] Ops[k]=@family terrain ...); script can't reach the
+	// heightmap, so the fork applies them. Every 10 frames the ini's time is checked; on a change
+	// or a new map the current map family's terrain lines are read (in slot order) and handed to
+	// the game window's message loop (the live channel's window hook), where:
+	//   - the level's TerrainInfo objects are found through GObjObjects (class TerrainInfo, the
+	//     outermost package = the current map), each checked (readable, G16 heightmap of the
+	//     terrain's own size, resident);
+	//   - the first time a terrain is touched its heightmap is copied (the original);
+	//   - the result = the original + every line in order (so undo/redo just work), with a
+	//     cosine falloff; it is compared with what the engine holds and only the changed heights
+	//     are written (ATerrainInfo::SetHeightmap);
+	//   - the changed rectangle (+1 quad of normals round it) is rebuilt as UnrealEd's brushes do
+	//     (Update = CalcVertices + UpdateVertexBuffers(..., relight 1)), but without Update's
+	//     game-only tail, which unloads the heightmap's lazy array (the next touch would re-read
+	//     it from the map file). CalcVertices rebuilds the Vertices array that LineCheck and
+	//     PointCheck collide with, so collision follows; UpdateVertexBuffer recomputes the sectors'
+	//     bounds and bumps their revision; StaticLight relights them with the baked light visibility.
+	// Off unless U2Shaders.ini has gmterrain=1; never in UnrealEd (it would bake into a saved map).
+	bool GmTerrainOn = false, GmBroken = false, GmTold = false;
+	FILETIME GmIniTime = {};
+	std::string GmMap, GmLastText;
+	std::vector<std::string> GmPending;
+	bool GmHasPending = false;
+	static const UINT GmMsg = WM_APP + 0x76;
+	struct GmTerrain { void *Obj; int W, H; std::vector<WORD> Orig; std::string Name; };
+	std::vector<GmTerrain> GmTerrains;
+	typedef WORD (__fastcall *GmGetH_t)(void *This, void *Edx, int X, int Y);
+	typedef void (__fastcall *GmSetH_t)(void *This, void *Edx, int X, int Y, WORD H);
+	typedef void (__fastcall *GmCalc_t)(void *This, void *Edx, float T, int X1, int Y1, int X2, int Y2);
+	typedef void (__fastcall *GmVB_t)(void *This, void *Edx, int X1, int Y1, int X2, int Y2, int Relight);
+	typedef float *(__fastcall *GmXform_t)(void *This, void *Edx, float *Ret, float X, float Y, float Z);
+	typedef void (__fastcall *GmLoad_t)(void *This, void *Edx);
+	GmGetH_t GmGetH = nullptr;
+	GmSetH_t GmSetH = nullptr;
+	GmCalc_t GmCalc = nullptr;
+	GmVB_t GmVB = nullptr;
+	GmXform_t GmToWorld = nullptr, GmToHeight = nullptr;
+	bool GmBound = false;
+	bool GmBind()
+	{
+		if (GmBound)
+			return true;
+		HMODULE Engine = GetModuleHandleA("Engine.dll");
+		if (Engine == nullptr)
+			return false;
+		GmGetH = (GmGetH_t)GetProcAddress(Engine, "?GetHeightmap@ATerrainInfo@@QAEGHH@Z");
+		GmSetH = (GmSetH_t)GetProcAddress(Engine, "?SetHeightmap@ATerrainInfo@@QAEXHHG@Z");
+		GmCalc = (GmCalc_t)GetProcAddress(Engine, "?CalcVertices@ATerrainInfo@@QAEXMHHHH@Z");
+		GmVB = (GmVB_t)GetProcAddress(Engine, "?UpdateVertexBuffers@ATerrainInfo@@QAEXHHHHH@Z");
+		GmToWorld = (GmXform_t)GetProcAddress(Engine, "?HeightmapToWorld@ATerrainInfo@@QAE?AVFVector@@V2@@Z");
+		GmToHeight = (GmXform_t)GetProcAddress(Engine, "?WorldToHeightmap@ATerrainInfo@@QAE?AVFVector@@V2@@Z");
+		if (!GmGetH || !GmSetH || !GmCalc || !GmVB || !GmToWorld || !GmToHeight)
+		{
+			Message("gm terrain: Engine.dll's ATerrainInfo exports aren't there: off");
+			GmBroken = true;
+			return false;
+		}
+		GmBound = true;
+		return true;
+	}
+	// engine calls under a structured exception guard (no C++ objects in these frames)
+	static bool GmSafeXform(GmXform_t F, void *T, float X, float Y, float Z, float Out[3])
+	{
+		__try
+		{
+			float R[3] = { 0, 0, 0 };
+			F(T, nullptr, R, X, Y, Z);
+			Out[0] = R[0]; Out[1] = R[1]; Out[2] = R[2];
+			return _finite(R[0]) && _finite(R[1]) && _finite(R[2]);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+	}
+	static bool GmSafeRead(GmGetH_t F, void *T, int W, int H, WORD *Out)
+	{
+		__try
+		{
+			for (int y = 0; y < H; y++)
+				for (int x = 0; x < W; x++)
+					Out[y * W + x] = F(T, nullptr, x, y);
+			return true;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+	}
+	static bool GmSafeWrite(GmSetH_t F, void *T, int W, const WORD *Want, const WORD *Have, int X1, int Y1, int X2, int Y2)
+	{
+		__try
+		{
+			for (int y = Y1; y <= Y2; y++)
+				for (int x = X1; x <= X2; x++)
+					if (Want[y * W + x] != Have[y * W + x])
+						F(T, nullptr, x, y, Want[y * W + x]);
+			return true;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+	}
+	static bool GmSafeUpdate(GmCalc_t C, GmVB_t V, void *T, int X1, int Y1, int X2, int Y2)
+	{
+		__try
+		{
+			C(T, nullptr, 0.0f, X1, Y1, X2, Y2);
+			V(T, nullptr, X1, Y1, X2, Y2, 1);
+			return true;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+	}
+	static bool GmSafeLoad(void *Lazy)
+	{
+		__try
+		{
+			void **Vt = *(void ***)Lazy;
+			((GmLoad_t)Vt[0])(Lazy, nullptr);
+			return true;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+	}
+	static bool InModule(const void *P)
+	{
+		HMODULE M = nullptr;
+		return P != nullptr && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)P, &M) && M != nullptr;
+	}
+	// ATerrainInfo fields (from the Engine.dll decompile: SetupSectors, CalcVertices, GetHeightmap):
+	// TerrainMap 0x3a0, Sectors (TArray) 0x114c, HeightmapX 0x1164, HeightmapY 0x1168.
+	// UTexture: Format (BYTE) 0x3c, USize 0x44, VSize 0x48, Mips (TArray<FMipmap>) 0xa0.
+	// FMipmap: 0x10 bytes of base, then TLazyArray<BYTE> DataArray: vtable (Load, Unload), SavedAr,
+	// SavedPos, then its TArray (Data at 0x1c, Num at 0x20 from the mip's start)
+	// A terrain's heightmap, checked: G16, the terrain's own size, resident (loaded if it can be)
+	const char *GmCheck(void *T, int &W, int &H)
+	{
+		if (!Readable(T, 0x1210))
+			return "object not readable";
+		W = *(int *)((BYTE *)T + 0x1164);
+		H = *(int *)((BYTE *)T + 0x1168);
+		if (W < 2 || H < 2 || W > 4096 || H > 4096)
+			return "heightmap size out of range";
+		BYTE *Tex = *(BYTE **)((BYTE *)T + 0x3a0);
+		if (!Readable(Tex, 0xac))
+			return "no TerrainMap";
+		if (Tex[0x3c] != 10)
+			return "TerrainMap isn't G16 (P8 heightmaps aren't handled)";
+		if (*(int *)(Tex + 0x44) != W || *(int *)(Tex + 0x48) != H)
+			return "TerrainMap size isn't the terrain's";
+		BYTE *Mip = *(BYTE **)(Tex + 0xa0);
+		if (*(int *)(Tex + 0xa4) < 1 || !Readable(Mip, 0x24))
+			return "TerrainMap has no mip 0";
+		const int Bytes = W * H * 2;
+		if (*(int *)(Mip + 0x20) < Bytes || !Readable(*(BYTE **)(Mip + 0x1c), Bytes))
+		{
+			// not resident: the lazy array loads itself (as CalcVertices does first thing), only
+			// when it still has a loader and a place in the file
+			void *Lazy = Mip + 0x10;
+			void **Vt = *(void ***)Lazy;
+			if (!Readable(Vt, 8) || !InModule(Vt[0]) || *(int *)(Mip + 0x18) <= 0 || !Readable(*(void **)(Mip + 0x14), 8))
+				return "heightmap not resident and can't be loaded";
+			if (!GmSafeLoad(Lazy))
+				return "heightmap load faulted";
+			if (*(int *)(Mip + 0x20) < Bytes || !Readable(*(BYTE **)(Mip + 0x1c), Bytes))
+				return "heightmap still not resident after loading";
+			Message("gm terrain: loaded the heightmap's lazy array");
+		}
+		if (*(int *)((BYTE *)T + 0x114c + 4) < 1)
+			return "no sectors";
+		return nullptr;
+	}
+	static bool GmExeIsEditor()
+	{
+		char Exe[MAX_PATH] = {};
+		GetModuleFileNameA(nullptr, Exe, MAX_PATH);
+		for (char *c = Exe; *c; c++)
+			*c = (char)tolower((unsigned char)*c);
+		return strstr(Exe, "unrealed") != nullptr;
+	}
+	// the map's name without "_liveN", as GMMaster.Family()
+	std::string GmFamily() const
+	{
+		std::string F = CurMap;
+		const size_t L = F.find("_live");
+		if (L != std::string::npos)
+			F = F.substr(0, L);
+		return F;
+	}
+	// this map family's terrain lines from U2GM.ini, in slot order ("raise X Y R H")
+	std::vector<std::string> GmReadLines()
+	{
+		std::vector<std::string> Out;
+		std::string Text;
+		FILE *F = nullptr;
+		if (fopen_s(&F, (Dir + "U2GM.ini").c_str(), "rb") || F == nullptr)
+			return Out;
+		char Buf[4096];
+		size_t n;
+		while ((n = fread(Buf, 1, sizeof(Buf), F)) > 0)
+			Text.append(Buf, n);
+		fclose(F);
+		if (Text.find('\0') != std::string::npos)     // UTF-16: the low bytes
+		{
+			std::string N;
+			for (char c : Text)
+				if (c != '\0' && (unsigned char)c != 0xff && (unsigned char)c != 0xfe)
+					N += c;
+			Text.swap(N);
+		}
+		const std::string Tag = "@" + GmFamily() + " ";
+		std::map<int, std::string> BySlot;
+		bool InSec = false;
+		size_t At = 0;
+		while (At < Text.size())
+		{
+			size_t End = Text.find('\n', At);
+			if (End == std::string::npos)
+				End = Text.size();
+			std::string L = Text.substr(At, End - At);
+			At = End + 1;
+			while (!L.empty() && (L.back() == '\r' || L.back() == ' ' || L.back() == '\t'))
+				L.pop_back();
+			const size_t S = L.find_first_not_of(" \t");
+			if (S == std::string::npos)
+				continue;
+			L = L.substr(S);
+			if (L[0] == '[')
+			{
+				InSec = _stricmp(L.c_str(), "[U2GM.GMMaster]") == 0;
+				continue;
+			}
+			if (!InSec || _strnicmp(L.c_str(), "ops[", 4) != 0)
+				continue;
+			const size_t Close = L.find("]=");
+			if (Close == std::string::npos || Close <= 4)
+				continue;
+			const int K = atoi(L.c_str() + 4);
+			std::string V = L.substr(Close + 2);
+			if (V.size() >= 2 && V.front() == '"' && V.back() == '"')
+				V = V.substr(1, V.size() - 2);
+			if (K < 0 || V.size() <= Tag.size() || _strnicmp(V.c_str(), Tag.c_str(), Tag.size()) != 0)
+				continue;
+			V = V.substr(Tag.size());
+			if (_strnicmp(V.c_str(), "terrain ", 8) != 0)
+				continue;
+			BySlot[K] = V.substr(8);
+		}
+		for (const auto &It : BySlot)
+			Out.push_back(It.second);
+		return Out;
+	}
+	// every 10 frames (OnPresent): the journal or the map changed -> the message loop applies it
+	void GmPoll(IDirect3DDevice9 *Dev)
+	{
+		if (!GmTerrainOn || GmBroken || Dir.empty() || CurMap.empty())
+			return;
+		if (!GmTold)
+		{
+			GmTold = true;
+			if (GmExeIsEditor())
+			{
+				Message("gm terrain: not in UnrealEd (the edits would be saved into the map): off");
+				GmBroken = true;
+				return;
+			}
+			Message("gm terrain: on, watching %sU2GM.ini", Dir.c_str());
+		}
+		bool NewMap = false;
+		if (GmMap != CurMap)
+		{
+			GmMap = CurMap;
+			GmTerrains.clear();             // a new level: new objects, new originals
+			GmLastText.clear();
+			NewMap = true;
+		}
+		WIN32_FILE_ATTRIBUTE_DATA A = {};
+		if (!GetFileAttributesExA((Dir + "U2GM.ini").c_str(), GetFileExInfoStandard, &A))
+			return;
+		if (!NewMap && CompareFileTime(&A.ftLastWriteTime, &GmIniTime) == 0)
+			return;
+		GmIniTime = A.ftLastWriteTime;
+		std::vector<std::string> Lines = GmReadLines();
+		std::string Text;
+		for (const std::string &L : Lines)
+			Text += L + "\n";
+		if (!NewMap && Text == GmLastText)
+			return;                         // the game saved something else (moves, palette...)
+		GmLastText = Text;
+		if (Lines.empty() && GmTerrains.empty())
+			return;                         // nothing journalled, nothing touched
+		if (!LiveHook(Dev))
+			return;
+		GmPending = Lines;
+		GmHasPending = true;
+		Message("gm terrain: %d terrain line(s) for %s%s", (int)Lines.size(), GmFamily().c_str(), NewMap ? " (map loaded)" : "");
+		PostMessageW(LiveWnd, GmMsg, 0, 0);
+	}
+	struct GmBrush { char Kind[16]; float X, Y, R, H; };
+	// in the message loop: the original + every line, written where it differs, rebuilt there
+	void GmRun()
+	{
+		if (!GmHasPending)
+			return;
+		GmHasPending = false;
+		std::vector<std::string> Lines;
+		Lines.swap(GmPending);
+		if (!GmBind())
+			return;
+		EngineMap();                        // binds the object list
+		if (EngObjs == nullptr || !Readable(EngObjs, sizeof(ObjList)))
+		{
+			Message("gm terrain: the engine's object list isn't there: not applied");
+			return;
+		}
+		std::vector<GmBrush> Brushes;
+		for (const std::string &L : Lines)
+		{
+			GmBrush B = {};
+			if (sscanf_s(L.c_str(), "%15s %f %f %f %f", B.Kind, (unsigned)sizeof(B.Kind), &B.X, &B.Y, &B.R, &B.H) < 4 || !(B.R > 0 && B.R <= 65536))
+			{
+				Message("gm terrain: skipped '%s' (want raise|lower|flatten|smooth X Y R H)", L.c_str());
+				continue;
+			}
+			if (strcmp(B.Kind, "raise") && strcmp(B.Kind, "lower") && strcmp(B.Kind, "flatten") && strcmp(B.Kind, "smooth"))
+			{
+				Message("gm terrain: skipped '%s' (unknown brush)", L.c_str());
+				continue;
+			}
+			if (strcmp(B.Kind, "smooth") == 0 && B.H == 0)
+				B.H = 1;
+			Brushes.push_back(B);
+		}
+		// the level's terrains: class TerrainInfo, outermost package = this map
+		std::vector<void *> Found;
+		for (int i = 0; i < EngObjs->Num; i++)
+		{
+			void *O = EngObjs->Data[i];
+			if (O == nullptr)
+				continue;
+			void *C = EngClass(O, nullptr);
+			const wchar_t *CN = C ? EngName(C, nullptr) : nullptr;
+			if (CN == nullptr || wcscmp(CN, L"TerrainInfo") != 0)
+				continue;
+			void *Pkg = O;
+			for (int d = 0; d < 8; d++)
+			{
+				void *Up = EngOuter(Pkg, nullptr);
+				if (Up == nullptr)
+					break;
+				Pkg = Up;
+			}
+			const wchar_t *PN = EngName(Pkg, nullptr);
+			std::string P;
+			for (const wchar_t *c = PN ? PN : L""; *c; c++)
+				P += (char)towlower(*c);
+			if (P == GmMap)
+				Found.push_back(O);
+		}
+		if (Found.empty())
+		{
+			Message("gm terrain: %d line(s) on %s but the map has no TerrainInfo", (int)Brushes.size(), GmMap.c_str());
+			return;
+		}
+		for (void *T : Found)
+		{
+			const wchar_t *TN = EngName(T, nullptr);
+			std::string Name;
+			for (const wchar_t *c = TN ? TN : L"?"; *c; c++)
+				Name += (char)*c;
+			int W = 0, H = 0;
+			if (const char *Why = GmCheck(T, W, H))
+			{
+				Message("gm terrain: %s skipped: %s", Name.c_str(), Why);
+				continue;
+			}
+			// heightmap <-> world is affine (FCoords): measured once through the engine's own transform
+			float O[3], PX[3], PY[3], PZ[3];
+			if (!GmSafeXform(GmToWorld, T, 0, 0, 0, O) || !GmSafeXform(GmToWorld, T, 1, 0, 0, PX) ||
+				!GmSafeXform(GmToWorld, T, 0, 1, 0, PY) || !GmSafeXform(GmToWorld, T, 0, 0, 1, PZ))
+			{
+				Message("gm terrain: %s skipped: HeightmapToWorld failed", Name.c_str());
+				continue;
+			}
+			float AX[3], AY[3], AZ[3];
+			for (int k = 0; k < 3; k++)
+			{
+				AX[k] = PX[k] - O[k];
+				AY[k] = PY[k] - O[k];
+				AZ[k] = PZ[k] - O[k];
+			}
+			const float CellX = sqrtf(AX[0] * AX[0] + AX[1] * AX[1]), CellY = sqrtf(AY[0] * AY[0] + AY[1] * AY[1]);
+			if (CellX < 1e-3f || CellY < 1e-3f || fabsf(AZ[2]) < 1e-6f)
+			{
+				Message("gm terrain: %s skipped: degenerate scale (cell %.3f x %.3f, height step %g)", Name.c_str(), CellX, CellY, AZ[2]);
+				continue;
+			}
+			GmTerrain *S = nullptr;
+			for (GmTerrain &G : GmTerrains)
+				if (G.Obj == T && G.W == W && G.H == H)
+					S = &G;
+			if (S == nullptr && Brushes.empty())
+				continue;                   // never touched, nothing to do
+			std::vector<WORD> Have((size_t)W * H);
+			if (!GmSafeRead(GmGetH, T, W, H, &Have[0]))
+			{
+				Message("gm terrain: %s skipped: reading the heightmap faulted", Name.c_str());
+				continue;
+			}
+			if (S == nullptr)
+			{
+				GmTerrain G;
+				G.Obj = T; G.W = W; G.H = H; G.Orig = Have; G.Name = Name;
+				GmTerrains.push_back(G);
+				S = &GmTerrains.back();
+				Message("gm terrain: %s %dx%d, cell %.1f x %.1f, height step %.4f: original kept", Name.c_str(), W, H, CellX, CellY, AZ[2]);
+			}
+			// the result: the original + every line in order
+			std::vector<float> Work(S->Orig.begin(), S->Orig.end());
+			std::vector<float> Prev;
+			int Applied = 0;
+			for (const GmBrush &B : Brushes)
+			{
+				float C[3];
+				if (!GmSafeXform(GmToHeight, T, B.X, B.Y, 0, C))
+					continue;
+				const float RX = B.R / CellX, RY = B.R / CellY;
+				const int X1 = (std::max)(0, (int)floorf(C[0] - RX - 1)), X2 = (std::min)(W - 1, (int)ceilf(C[0] + RX + 1));
+				const int Y1 = (std::max)(0, (int)floorf(C[1] - RY - 1)), Y2 = (std::min)(H - 1, (int)ceilf(C[1] + RY + 1));
+				if (X1 > X2 || Y1 > Y2)
+					continue;               // not on this terrain
+				const bool Smooth = B.Kind[0] == 's';
+				if (Smooth)
+					Prev = Work;
+				const float Strength = (std::min)((std::max)(B.H, 0.0f), 1.0f);
+				bool Touched = false;
+				for (int y = Y1; y <= Y2; y++)
+					for (int x = X1; x <= X2; x++)
+					{
+						const float WX = O[0] + x * AX[0] + y * AY[0], WY = O[1] + x * AX[1] + y * AY[1];
+						const float D = sqrtf((WX - B.X) * (WX - B.X) + (WY - B.Y) * (WY - B.Y));
+						if (D >= B.R)
+							continue;
+						const float Fall = 0.5f * (1.0f + cosf(3.14159265f * D / B.R));
+						float &V = Work[(size_t)y * W + x];
+						if (B.Kind[0] == 'r')
+							V += Fall * B.H / AZ[2];
+						else if (B.Kind[0] == 'l')
+							V -= Fall * B.H / AZ[2];
+						else if (B.Kind[0] == 'f')
+						{
+							const float Base = O[2] + x * AX[2] + y * AY[2];
+							V += Fall * ((B.H - Base) / AZ[2] - V);
+						}
+						else
+						{
+							float Sum = 0;
+							int N = 0;
+							for (int dy = -1; dy <= 1; dy++)
+								for (int dx = -1; dx <= 1; dx++)
+									if (x + dx >= 0 && x + dx < W && y + dy >= 0 && y + dy < H)
+									{
+										Sum += Prev[(size_t)(y + dy) * W + x + dx];
+										N++;
+									}
+							V += Fall * Strength * (Sum / N - V);
+						}
+						Touched = true;
+					}
+				Applied += Touched ? 1 : 0;
+			}
+			std::vector<WORD> Want((size_t)W * H);
+			int MinX = W, MinY = H, MaxX = -1, MaxY = -1, Changed = 0;
+			for (int y = 0; y < H; y++)
+				for (int x = 0; x < W; x++)
+				{
+					const size_t i = (size_t)y * W + x;
+					const float V = (std::min)((std::max)(Work[i], 0.0f), 65535.0f);
+					Want[i] = (WORD)(V + 0.5f);
+					if (Want[i] != Have[i])
+					{
+						Changed++;
+						MinX = (std::min)(MinX, x); MaxX = (std::max)(MaxX, x);
+						MinY = (std::min)(MinY, y); MaxY = (std::max)(MaxY, y);
+					}
+				}
+			if (Changed == 0)
+			{
+				Message("gm terrain: %s: %d line(s) on %s, already as journalled", Name.c_str(), Applied, GmMap.c_str());
+				continue;
+			}
+			const DWORD T0 = GetTickCount();
+			if (!GmSafeWrite(GmSetH, T, W, &Want[0], &Have[0], MinX, MinY, MaxX, MaxY))
+			{
+				Message("gm terrain: %s: writing the heightmap faulted: off", Name.c_str());
+				GmBroken = true;
+				return;
+			}
+			// the vertices one past the change (CalcVertices' ends are exclusive; a vertex's pass
+			// remakes the normals of the quad left/above it)
+			const int UX1 = (std::max)(0, MinX - 1), UY1 = (std::max)(0, MinY - 1);
+			const int UX2 = (std::min)(W, MaxX + 2), UY2 = (std::min)(H, MaxY + 2);
+			if (!GmSafeUpdate(GmCalc, GmVB, T, UX1, UY1, UX2, UY2))
+			{
+				Message("gm terrain: %s: rebuilding the terrain faulted: off", Name.c_str());
+				GmBroken = true;
+				return;
+			}
+			Message("gm terrain: %s on %s: %d line(s) applied, %d height(s) changed, rebuilt x %d..%d y %d..%d in %u ms",
+				Name.c_str(), GmMap.c_str(), Applied, Changed, UX1, UX2, UY1, UY2, (unsigned)(GetTickCount() - T0));
+		}
 	}
 
 	// ---- shotmask=1: a character mask with each shotp frame ---------------------------------
@@ -6273,6 +6786,8 @@ public:
 			WatchShaders();
 		if (Loaded)
 			LivePoll(Dev);
+		if (Loaded && GmTerrainOn && Frame % 10 == 5)
+			GmPoll(Dev);
 		if (U2Blood::Count > 0)
 			U2Blood::Step(Dev);
 		if (U2Runs::Count > 0)
