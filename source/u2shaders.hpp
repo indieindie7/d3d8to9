@@ -79,8 +79,17 @@
 #include <map>
 #include <set>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
+
+// sketch=1: the PNG writer (stb_image_write v1.16, public domain / MIT, vendored in source/)
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#define STB_IMAGE_WRITE_STATIC
+#pragma warning(push, 0)
+#pragma warning(disable : 4996)   // stb uses sprintf (an error under /sdl)
+#include "stb_image_write.h"
+#pragma warning(pop)
 
 #pragma comment(lib, "d3dcompiler.lib")
 
@@ -183,6 +192,21 @@ public:
 			;
 		else if (sscanf_s(Line, " gmpanel=%u", &Hash) == 1)
 			GmPanelMode = (int)Hash;
+		else if (_strnicmp(Line + strspn(Line, " 	"), "sketchkey=", 10) == 0)
+		{
+			// sketchkey=F8 (F1..F24) or a virtual-key code (decimal or 0x..)
+			char K[32] = "";
+			unsigned V = 0;
+			sscanf_s(Line + strspn(Line, " 	") + 10, "%31s", K, (unsigned)sizeof(K));
+			if ((K[0] == 'F' || K[0] == 'f') && isdigit((unsigned char)K[1]) && (V = (unsigned)atoi(K + 1)) >= 1 && V <= 24)
+				SketchKey = VK_F1 + V - 1;
+			else if (sscanf_s(K, "%i", &V) == 1 && V > 0 && V < 256)
+				SketchKey = V;
+		}
+		else if (sscanf_s(Line, " sketchhud=%u", &Hash) == 1)
+			SketchHud = Hash != 0;
+		else if (sscanf_s(Line, " sketch=%u", &Hash) == 1)
+			SketchOn = Hash != 0;
 		else if (sscanf_s(Line, " gloss=%x %255s", &Hash, Name, (unsigned)sizeof(Name)) == 2)
 		{
 			U2Rule R;
@@ -596,6 +620,8 @@ public:
 		if (!Loaded)
 			Load();
 		PostCheck(Dev);
+		if (SkGrabWant)
+			SketchDraw(Dev);                 // sketch=1: a frame to freeze, at its first 2D draw
 		GmCaptureView(Dev);                  // gmpanel=1, while shown: the scene's view for the gizmo
 		if (CharProbe && !HasTex0 && Offscreen(Dev))
 		{
@@ -1860,7 +1886,7 @@ public:
 	static U2Shaders *&LiveSelf() { static U2Shaders *P = nullptr; return P; }
 	static LRESULT CALLBACK LiveWndProc(HWND W, UINT M, WPARAM A, LPARAM B)
 	{
-		if (LiveSelf() != nullptr && LiveSelf()->GmPanelMode != 0)
+		if (LiveSelf() != nullptr && (LiveSelf()->GmPanelMode != 0 || LiveSelf()->SketchOn))
 		{
 			LRESULT R = 0;
 			if (LiveSelf()->GmPanelInput(W, M, A, B, R))
@@ -2595,6 +2621,9 @@ public:
 		float Loc[3] = { 0, 0, 0 }, Yaw = 0, Scale = 1, Cam[3] = { 0, 0, 0 };
 		long CommitStamp = 0;                // commit=STAMP:STATE:MAP (gm commit, gm_commit.py --watch)
 		std::string CommitState = "none", CommitMap = "-";
+		int Con = 0;                         // con=N: the console (1 the full one, 2 the one-line one; Console.ui's triggers)
+		bool ViewOk = false;
+		float View[2] = { 0, 0 };            // view=YAW,PITCH (degrees): where the player looks
 	};
 	GmStateT GmSt;
 	std::vector<std::pair<int, std::string>> GmPalette, GmJournal;
@@ -2636,8 +2665,8 @@ public:
 		vsnprintf(Buf, sizeof(Buf), Fmt, Args);
 		va_end(Args);
 		Buf[sizeof(Buf) - 1] = 0;
-		// "draw done ... NOTE": the note may also hold !?()/%& (never quotes, semicolons or |)
-		const char *Extra = strncmp(Buf, "draw done ", 10) == 0 ? " ._-#:,+!?()/%&" : " ._-#:,+";
+		// "draw done ... NOTE", "sketch mark NAME NOTE": the note may also hold !?()/%& (never quotes, semicolons or |)
+		const char *Extra = (strncmp(Buf, "draw done ", 10) == 0 || strncmp(Buf, "sketch mark ", 12) == 0) ? " ._-#:,+!?()/%&" : " ._-#:,+";
 		for (const char *c = Buf; *c; c++)
 			if (!isalnum((unsigned char)*c) && strchr(Extra, *c) == nullptr)
 			{
@@ -2743,6 +2772,8 @@ public:
 			else if (K == "yaw") S.Yaw = (float)atof(X.c_str());
 			else if (K == "scale") S.Scale = (float)atof(X.c_str());
 			else if (K == "cam") S.CamOk = sscanf_s(X.c_str(), "%f,%f,%f", &S.Cam[0], &S.Cam[1], &S.Cam[2]) == 3;
+			else if (K == "con") S.Con = atoi(X.c_str());
+			else if (K == "view") S.ViewOk = sscanf_s(X.c_str(), "%f,%f", &S.View[0], &S.View[1]) == 2;
 			else if (K == "commit")
 			{
 				const size_t C1 = X.find(':'), C2 = C1 == std::string::npos ? C1 : X.find(':', C1 + 1);
@@ -3436,11 +3467,13 @@ public:
 	}
 
 	// ---- show / hide, input
-	void GmSetShown(bool S)
+	// the game's mouse held and the cursor shown while the panel or the sketch is open
+	bool GmCaptured = false;
+	void GmCapture(bool S)
 	{
-		if (S == GmPanelShown)
+		if (S == GmCaptured)
 			return;
-		GmPanelShown = S;
+		GmCaptured = S;
 		if (!GmHoldLooked)
 		{
 			GmHoldLooked = true;
@@ -3470,12 +3503,20 @@ public:
 		}
 		else
 		{
-			GmDragCancel();
 			for (; GmCursorShows > 0; GmCursorShows--)
 				ShowCursor(FALSE);
 		}
 		if (GmImReady)
 			ImGui::GetIO().AddFocusEvent(S);
+	}
+	void GmSetShown(bool S)
+	{
+		if (S == GmPanelShown)
+			return;
+		GmPanelShown = S;
+		if (!S)
+			GmDragCancel();
+		GmCapture(GmPanelShown || SkOpen);
 		GmSend(S ? "panel 1" : "panel 0");
 		Message("gm panel: %s", S ? "shown" : "hidden");
 	}
@@ -3483,17 +3524,48 @@ public:
 	bool GmPanelInput(HWND W, UINT M, WPARAM A, LPARAM B, LRESULT &R)
 	{
 		R = 0;
-		if (GmPanelMode == 0 || GmPanelBroken)
+		if (GmPanelBroken || (GmPanelMode == 0 && !SketchOn))
 			return false;
-		if ((M == WM_KEYDOWN || M == WM_SYSKEYDOWN) && A == VK_F7)
+		if (GmPanelMode != 0 && (M == WM_KEYDOWN || M == WM_SYSKEYDOWN) && A == VK_F7)
 		{
 			if (!(B & (1 << 30)))                // not a repeat
 				GmSetShown(!GmPanelShown);
 			return true;
 		}
-		if ((M == WM_KEYUP || M == WM_SYSKEYUP) && A == VK_F7)
+		if (GmPanelMode != 0 && (M == WM_KEYUP || M == WM_SYSKEYUP) && A == VK_F7)
 			return true;
-		if (!GmPanelShown)
+		if (SketchOn && GmPanelStarted)
+		{
+			// sketch=1: its key (never reaches the game: U2 binds F8 to QuickLoad), the console's strip, Escape
+			if ((M == WM_KEYDOWN || M == WM_SYSKEYDOWN) && A == SketchKey)
+			{
+				if (!(B & (1 << 30)))
+				{
+					if (SkOpen)
+						SkSetOpen(false);
+					else
+						SkRequestOpen();
+				}
+				return true;
+			}
+			if ((M == WM_KEYUP || M == WM_SYSKEYUP) && A == SketchKey)
+				return true;
+			if (!SkOpen && SkStripShown && (M == WM_LBUTTONDOWN || M == WM_LBUTTONDBLCLK))
+			{
+				const float x = (float)(short)LOWORD(B), y = (float)(short)HIWORD(B);
+				if (x >= SkStrip.x && y >= SkStrip.y && x <= SkStrip.z && y <= SkStrip.w)
+				{
+					SkRequestOpen();
+					return true;
+				}
+			}
+			if (SkOpen && M == WM_KEYDOWN && A == VK_ESCAPE && !(GmImReady && ImGui::GetIO().WantTextInput))
+			{
+				SkSetOpen(false);
+				return true;
+			}
+		}
+		if (!GmPanelShown && !SkOpen)
 			return false;
 		const bool Im = GmImReady;
 		switch (M)
@@ -3579,20 +3651,31 @@ public:
 	}
 	void GmPanelDraw(IDirect3DDevice9 *Dev)
 	{
-		U2Crash::Where("drawing the GM panel");
+		U2Crash::Where("drawing the GM panel or the sketch");
 		ImGui_ImplDX9_NewFrame();
 		ImGui_ImplWin32_NewFrame();
 		ImGuiIO &io = ImGui::GetIO();
 		GmDispW = io.DisplaySize.x;
 		GmDispH = io.DisplaySize.y;
 		ImGui::NewFrame();
-		GmPanelUi();
-		if (GmDispW >= 16 && GmDispH >= 16)
+		if (SkOpen)
+			SketchUi(Dev);                   // sketch mode covers the screen: the panel waits
+		else
 		{
-			GmGizmo();
-			GmDrawLines();
-			GmWorldClick();
+			if (GmPanelShown)
+			{
+				GmPanelUi();
+				if (GmDispW >= 16 && GmDispH >= 16)
+				{
+					GmGizmo();
+					GmDrawLines();
+					GmWorldClick();
+				}
+			}
+			SketchStrip();
 		}
+		if (SkSaveWant != 0)
+			SkBuildSave();                   // before Render: glyphs it bakes are uploaded by this frame's render
 		ImGui::Render();
 		IDirect3DSurface9 *OldRT = nullptr, *OldDS = nullptr, *BB = nullptr;
 		D3DVIEWPORT9 OldVp = {};
@@ -3626,11 +3709,13 @@ public:
 		if (BB) BB->Release();
 		if (OldRT) OldRT->Release();
 		if (OldDS) OldDS->Release();
+		if (SkSaveWant != 0)
+			SkSave(Dev);
 	}
-	// every Present while gmpanel is on
+	// every Present while gmpanel or sketch is on
 	void GmPanelFrame(IDirect3DDevice9 *Dev)
 	{
-		if (GmPanelBroken || Dir.empty() || (GmPanelMode == 0 && !GmPanelShown))
+		if (GmPanelBroken || Dir.empty() || (GmPanelMode == 0 && !GmPanelShown && !SketchOn))
 			return;
 		if (!GmPanelStarted)
 		{
@@ -3643,18 +3728,914 @@ public:
 			}
 			GmSession = ((GetTickCount() ^ (GetCurrentProcessId() << 12)) & 0x3fffffff) | 1;
 			GmPanelFileEmpty(true);   // an old session's lines must not run (emptied, not deleted: U2GM execs it every poll)
-			Message("gm panel: on (F7), session %u, commands through %sU2GMPanel.txt", GmSession, Dir.c_str());
+			Message("gm panel: %s, session %u, commands through %sU2GMPanel.txt", GmPanelMode != 0 ? "on (F7)" : "off", GmSession, Dir.c_str());
+			if (SketchOn)
+				Message("sketch: on (key 0x%02X%s, frozen frame %s), files in %sSketch", SketchKey, SketchKey >= VK_F1 && SketchKey <= VK_F24 ? (" = F" + std::to_string(SketchKey - VK_F1 + 1)).c_str() : "",
+					SketchHud ? "= the presented frame (sketchhud=1)" : "= the world before the HUD and console", Dir.c_str());
 		}
 		if (GmPanelMode == 0)
 			GmSetShown(false);               // switched off in U2Shaders.ini while open
 		if (!LiveHook(Dev))
 			return;
-		if (Frame % 10 == 7 || (GmPanelShown && Frame % 3 == 0))
+		if (Frame % 10 == 7 || ((GmPanelShown || SkOpen) && Frame % 3 == 0))
 			GmPanelReadIni();
 		GmTakeView();
-		if (GmPanelShown && GmImSetup(Dev))
+		SketchFrame(Dev);                    // the console's state, frames frozen this frame
+		if ((GmPanelShown || SkOpen || (SketchOn && SkConsole)) && GmImSetup(Dev))
 			GmPanelDraw(Dev);
+		else
+			SkStripShown = false;
 		GmFlushOut();
+	}
+
+	// ---- sketch=1: screenshot markup over the game (Dear ImGui) ---------------------------------
+	// "Image editing tools when I'm on the console": a frozen frame marked up with pen, highlighter,
+	// arrow, rectangle, ellipse, text labels and a crop, saved as a PNG with a sidecar .txt, and if
+	// wanted sent as an "avalon mark" so the level team gets it with a normal mark.
+	//   - The console: U2's console is a UI component (UIScripts\Console.ui), not visible to script.
+	//     U2GM/tools/sketch_console_ui.py adds TriggerEvent lines to its two states, so the UI itself
+	//     runs "gm con big|quick 1|0" when either console opens or closes; GMMaster keeps it as con=N
+	//     in PanelState (U2GM.ini, written on change), read here every 10 frames (GmPanelReadIni).
+	//   - The frozen frame: the world of the next frame, copied at its first 2D draw (where post
+	//     runs, so post is in it): the console and the HUD are 2D draws drawn later, so they're never
+	//     in it, however late the console's flag arrives. A frame without a 2D draw is copied at
+	//     Present. sketchhud=1: the whole presented frame instead (HUD and an open console in it).
+	//   - While the console is open a "Sketch" strip shows on the right; a click on it or the key
+	//     (sketchkey=, default F8; U2 binds F8 to QuickLoad, which then never reaches the game) opens
+	//     sketch mode: the frozen frame full screen, a tool bar, the mouse held as for the GM panel
+	//     (U2Input's U2InputHoldMouse). The key outside the console freezes a fresh frame first.
+	//     Escape (outside a text field) or the key again closes it; the strokes stay with the frame.
+	//   - Strokes are vectors in the frame's pixels; undo/redo are snapshots of the list. Save draws
+	//     the frame and the strokes with ImGui's own renderer into a target of the frame's size,
+	//     reads it back, cuts the crop, and writes System\Sketch\sketch-YYYYMMDD-HHMMSS.png
+	//     (stb_image_write, on a thread) and sketch-....txt beside it (map, eye, view, note, strokes).
+	//   - Save as mark: the same, then "gm sketch mark NAME NOTE" through U2GMPanel.txt; GMMaster logs
+	//     it and, when AvalonCards is loaded, runs "avalon mark NOTE sketch:NAME" (a normal mark with
+	//     its own Shot*.bmp; U2Avalon/tools/live.py --marks copies the sketch next to it).
+	// Off unless U2Shaders.ini has sketch=1; never in UnrealEd (GmPanelFrame's check).
+	bool SketchOn = false, SketchHud = false;
+	UINT SketchKey = VK_F8;
+	enum { SkPen, SkHigh, SkArrow, SkRect, SkEllipse, SkText, SkCrop, SkToolCount };
+	struct SkStroke
+	{
+		int Tool = 0;
+		ImU32 Col = IM_COL32(255, 59, 48, 255);
+		float Size = 5;                      // frame pixels
+		std::vector<ImVec2> Pts;             // frame pixels: pen/highlight all, shapes start and end, text its place
+		std::string Text;
+	};
+	std::vector<SkStroke> SkStrokes;
+	std::vector<std::vector<SkStroke>> SkUndo, SkRedo;
+	SkStroke SkCur;                          // the stroke being drawn
+	bool SkDrawing = false;
+	bool SkOpen = false, SkConsole = false, SkStripShown = false;
+	ImVec4 SkStrip = ImVec4(0, 0, 0, 0);     // the strip, client pixels (x0 y0 x1 y1)
+	unsigned SkConsoleSeq = 0, SkPixSeq = 0; // console openings; the one the frozen frame is from (0 none)
+	bool SkGrabWant = false, SkGrabSaw3D = false, SkGrabPending = false, SkGrabFull = false;
+	bool SkGrabForConsole = false, SkOpenOnGrab = false;
+	int SkGrabAge = 0;
+	IDirect3DSurface9 *SkGrabRT = nullptr;   // the copy, until it is read back at Present
+	std::vector<DWORD> SkPix;                // the frozen frame, B G R A (A = 255)
+	UINT SkW = 0, SkH = 0;
+	bool SkPixFull = false;
+	IDirect3DTexture9 *SkTex = nullptr;      // managed: survives a reset
+	bool SkTexTold = false;
+	int SkTool = 0, SkColor = 0;
+	float SkSize = 5;
+	char SkLabel[128] = {}, SkNote[200] = {};
+	int SkSaveWant = 0;                      // 1 a PNG, 2 a PNG and a mark
+	std::string SkStatus, SkLastName;
+	ImDrawList *SkSaveList = nullptr;
+	ImVec2 SkO = ImVec2(0, 0);               // the frame on screen: top left, scale
+	float SkS = 1;
+
+	static ImU32 SkPal(int i)
+	{
+		static const ImU32 P[8] = { IM_COL32(255, 59, 48, 255), IM_COL32(255, 149, 0, 255), IM_COL32(255, 214, 10, 255), IM_COL32(52, 199, 89, 255),
+			IM_COL32(50, 210, 245, 255), IM_COL32(10, 132, 255, 255), IM_COL32(255, 45, 149, 255), IM_COL32(255, 255, 255, 255) };
+		return P[i & 7];
+	}
+	static const char *SkPalName(int i)
+	{
+		static const char *N[8] = { "red", "orange", "yellow", "green", "cyan", "blue", "magenta", "white" };
+		return N[i & 7];
+	}
+	static const char *SkToolName(int i)
+	{
+		static const char *N[SkToolCount] = { "Pen", "Highlight", "Arrow", "Rect", "Ellipse", "Text", "Crop" };
+		return (i >= 0 && i < SkToolCount) ? N[i] : "?";
+	}
+	std::string SkKeyName() const
+	{
+		char B[16];
+		if (SketchKey >= VK_F1 && SketchKey <= VK_F24)
+			snprintf(B, sizeof(B), "F%u", SketchKey - VK_F1 + 1);
+		else
+			snprintf(B, sizeof(B), "key 0x%02X", SketchKey);
+		return B;
+	}
+
+	// ---- the frozen frame
+	// per draw while a frame is wanted (LogTargetDraw): the first 2D draw after the world
+	void SketchDraw(IDirect3DDevice9 *Dev)
+	{
+		if (SketchHud || Offscreen(Dev))
+			return;
+		DWORD Fvf = 0;
+		Dev->GetFVF(&Fvf);
+		IDirect3DVertexShader9 *VS = nullptr;
+		Dev->GetVertexShader(&VS);
+		const bool Prog = VS != nullptr;
+		if (VS) VS->Release();
+		D3DMATRIX P = {};
+		Dev->GetTransform(D3DTS_PROJECTION, &P);
+		const bool Rhw = (Fvf & D3DFVF_POSITION_MASK) == D3DFVF_XYZRHW;
+		const bool Ortho = !Prog && !Rhw && P._34 == 0.0f && P._44 == 1.0f;
+		if (!Rhw && !Ortho)
+		{
+			SkGrabSaw3D = true;
+			return;
+		}
+		if (!SkGrabSaw3D)
+			return;
+		if (PostHudZ0)
+		{
+			DWORD Z = 0;
+			Dev->GetRenderState(D3DRS_ZENABLE, &Z);
+			if (Z)
+				return;                      // as the post: z-tested 2D draws are still the scene
+		}
+		IDirect3DSurface9 *RT = nullptr;
+		if (SUCCEEDED(Dev->GetRenderTarget(0, &RT)) && RT)
+		{
+			SkGrab(Dev, RT, false);
+			RT->Release();
+		}
+	}
+	void SkGrab(IDirect3DDevice9 *Dev, IDirect3DSurface9 *Src, bool Full)
+	{
+		SkGrabWant = false;
+		D3DSURFACE_DESC D = {};
+		Src->GetDesc(&D);
+		if (SkGrabRT != nullptr)
+		{
+			D3DSURFACE_DESC G = {};
+			SkGrabRT->GetDesc(&G);
+			if (G.Width != D.Width || G.Height != D.Height || G.Format != D.Format)
+			{
+				SkGrabRT->Release();
+				SkGrabRT = nullptr;
+			}
+		}
+		if (SkGrabRT == nullptr && FAILED(Dev->CreateRenderTarget(D.Width, D.Height, D.Format, D3DMULTISAMPLE_NONE, 0, FALSE, &SkGrabRT, nullptr)))
+		{
+			SkGrabRT = nullptr;
+			Message("sketch: couldn't make a %ux%u copy (format %u): no frame", D.Width, D.Height, (unsigned)D.Format);
+			SkOpenOnGrab = false;
+			return;
+		}
+		const HRESULT hr = Dev->StretchRect(Src, nullptr, SkGrabRT, nullptr, D3DTEXF_NONE);
+		if (FAILED(hr))
+		{
+			Message("sketch: couldn't copy the frame (%08x): no frame", (unsigned)hr);
+			SkOpenOnGrab = false;
+			return;
+		}
+		SkGrabPending = true;
+		SkGrabFull = Full;
+	}
+	static bool SkToBgra(const D3DSURFACE_DESC &D, const D3DLOCKED_RECT &L, std::vector<DWORD> &Out)
+	{
+		Out.resize((size_t)D.Width * D.Height);
+		for (UINT y = 0; y < D.Height; y++)
+		{
+			const BYTE *Row = static_cast<const BYTE *>(L.pBits) + (size_t)y * L.Pitch;
+			DWORD *O = &Out[(size_t)y * D.Width];
+			switch (D.Format)
+			{
+			case D3DFMT_X8R8G8B8:
+			case D3DFMT_A8R8G8B8:
+				for (UINT x = 0; x < D.Width; x++)
+					O[x] = reinterpret_cast<const DWORD *>(Row)[x] | 0xFF000000u;
+				break;
+			case D3DFMT_R5G6B5:
+				for (UINT x = 0; x < D.Width; x++)
+				{
+					const DWORD p = reinterpret_cast<const WORD *>(Row)[x];
+					O[x] = 0xFF000000u | ((((p >> 11) & 31) * 255 / 31) << 16) | ((((p >> 5) & 63) * 255 / 63) << 8) | ((p & 31) * 255 / 31);
+				}
+				break;
+			case D3DFMT_X1R5G5B5:
+			case D3DFMT_A1R5G5B5:
+				for (UINT x = 0; x < D.Width; x++)
+				{
+					const DWORD p = reinterpret_cast<const WORD *>(Row)[x];
+					O[x] = 0xFF000000u | ((((p >> 10) & 31) * 255 / 31) << 16) | ((((p >> 5) & 31) * 255 / 31) << 8) | ((p & 31) * 255 / 31);
+				}
+				break;
+			default:
+				Out.clear();
+				return false;
+			}
+		}
+		return true;
+	}
+	void SkReadBack(IDirect3DDevice9 *Dev)
+	{
+		SkGrabPending = false;
+		if (SkGrabRT == nullptr)
+			return;
+		D3DSURFACE_DESC D = {};
+		SkGrabRT->GetDesc(&D);
+		IDirect3DSurface9 *Sys = nullptr;
+		D3DLOCKED_RECT L = {};
+		bool Ok = false;
+		HRESULT hr = Dev->CreateOffscreenPlainSurface(D.Width, D.Height, D.Format, D3DPOOL_SYSTEMMEM, &Sys, nullptr);
+		if (SUCCEEDED(hr))
+			hr = Dev->GetRenderTargetData(SkGrabRT, Sys);
+		if (SUCCEEDED(hr))
+			hr = Sys->LockRect(&L, nullptr, D3DLOCK_READONLY);
+		std::vector<DWORD> Pix;
+		if (SUCCEEDED(hr))
+		{
+			Ok = SkToBgra(D, L, Pix);
+			Sys->UnlockRect();
+		}
+		if (Sys) Sys->Release();
+		SkGrabRT->Release();                 // a grab is rare: no full-screen copy kept around
+		SkGrabRT = nullptr;
+		if (!Ok)
+		{
+			Message("sketch: couldn't read the frame (%08x, format %u)", (unsigned)hr, (unsigned)D.Format);
+			SkOpenOnGrab = false;
+			SkGrabForConsole = false;
+			return;
+		}
+		SkPix.swap(Pix);
+		SkW = D.Width;
+		SkH = D.Height;
+		SkPixFull = SkGrabFull;
+		SkPixSeq = SkGrabForConsole ? SkConsoleSeq : 0;
+		SkGrabForConsole = false;
+		if (SkTex) { SkTex->Release(); SkTex = nullptr; }
+		SkStrokes.clear();                   // a new frame: a new sketch
+		SkUndo.clear();
+		SkRedo.clear();
+		SkDrawing = false;
+		SkStatus.clear();
+		if (SkOpenOnGrab)
+		{
+			SkOpenOnGrab = false;
+			SkSetOpen(true);
+		}
+	}
+	bool SkEnsureTex(IDirect3DDevice9 *Dev)
+	{
+		if (SkTex != nullptr)
+			return true;
+		if (SkPix.empty() || SkW == 0 || SkH == 0)
+			return false;
+		if (FAILED(Dev->CreateTexture(SkW, SkH, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &SkTex, nullptr)) || SkTex == nullptr)
+		{
+			SkTex = nullptr;
+			if (!SkTexTold)
+				Message("sketch: couldn't make a %ux%u texture for the frame", SkW, SkH);
+			SkTexTold = true;
+			return false;
+		}
+		D3DLOCKED_RECT L = {};
+		if (SUCCEEDED(SkTex->LockRect(0, &L, nullptr, 0)))
+		{
+			for (UINT y = 0; y < SkH; y++)
+				memcpy(static_cast<BYTE *>(L.pBits) + (size_t)y * L.Pitch, &SkPix[(size_t)y * SkW], SkW * 4);
+			SkTex->UnlockRect(0);
+		}
+		return true;
+	}
+	ImTextureRef SkTexRef() const { return ImTextureRef((ImTextureID)(intptr_t)SkTex); }
+
+	// every Present (GmPanelFrame), before anything of ours is drawn: the console, the frame
+	void SketchFrame(IDirect3DDevice9 *Dev)
+	{
+		if (!SketchOn)
+			return;
+		U2Crash::Where("the sketch (frozen frame, console state)");
+		// still wanted: no 2D draw came in a whole frame (or sketchhud=1): the frame as presented
+		if (SkGrabWant && (SketchHud || ++SkGrabAge >= 2))
+		{
+			IDirect3DSurface9 *BB = nullptr;
+			if (SUCCEEDED(Dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &BB)) && BB)
+			{
+				SkGrab(Dev, BB, true);
+				BB->Release();
+			}
+		}
+		SkGrabSaw3D = false;
+		if (SkGrabPending)
+			SkReadBack(Dev);
+		// the console (U2GM's PanelState con=): opened -> freeze a frame for the strip
+		const bool Con = GmSt.Valid && GmSt.Con != 0;
+		if (Con && !SkConsole)
+		{
+			SkConsoleSeq++;
+			if (!SkOpen && !SkGrabWant)
+				SkWantGrab(true);
+		}
+		SkConsole = Con;
+	}
+	void SkWantGrab(bool ForConsole)
+	{
+		SkGrabWant = true;
+		SkGrabAge = 0;
+		SkGrabSaw3D = false;
+		SkGrabForConsole = ForConsole;
+	}
+	// the key or the strip: the console's frame if there is one, else a fresh one first
+	void SkRequestOpen()
+	{
+		if (SkConsole && SkPixSeq != 0 && SkPixSeq == SkConsoleSeq && !SkPix.empty())
+		{
+			SkSetOpen(true);
+			return;
+		}
+		if (!(SkGrabWant && SkGrabForConsole))
+			SkWantGrab(SkConsole);
+		SkOpenOnGrab = true;
+	}
+	void SkSetOpen(bool S)
+	{
+		if (S == SkOpen || (S && SkPix.empty()))
+			return;
+		SkOpen = S;
+		SkDrawing = false;
+		if (S)
+			GmDragCancel();
+		GmCapture(GmPanelShown || SkOpen);
+		Message("sketch: %s (%ux%u, %d stroke(s))", S ? "open" : "closed", SkW, SkH, (int)SkStrokes.size());
+	}
+
+	// ---- strokes
+	void SkPushUndo()
+	{
+		SkUndo.push_back(SkStrokes);
+		if (SkUndo.size() > 200)
+			SkUndo.erase(SkUndo.begin());
+		SkRedo.clear();
+	}
+	void SkUndoStep()
+	{
+		if (SkUndo.empty())
+			return;
+		SkRedo.push_back(SkStrokes);
+		SkStrokes = SkUndo.back();
+		SkUndo.pop_back();
+	}
+	void SkRedoStep()
+	{
+		if (SkRedo.empty())
+			return;
+		SkUndo.push_back(SkStrokes);
+		SkStrokes = SkRedo.back();
+		SkRedo.pop_back();
+	}
+	// the last crop, in frame pixels (x0 y0 x1 y1); false: none (or too small)
+	bool SkCropRect(ImVec4 &R) const
+	{
+		for (size_t i = SkStrokes.size(); i-- > 0;)
+		{
+			const SkStroke &S = SkStrokes[i];
+			if (S.Tool != SkCrop || S.Pts.size() < 2)
+				continue;
+			const ImVec2 &a = S.Pts[0], &b = S.Pts[1];
+			R.x = floorf((std::max)(0.0f, (std::min)(a.x, b.x)));
+			R.y = floorf((std::max)(0.0f, (std::min)(a.y, b.y)));
+			R.z = ceilf((std::min)((float)SkW, (std::max)(a.x, b.x)));
+			R.w = ceilf((std::min)((float)SkH, (std::max)(a.y, b.y)));
+			return R.z - R.x >= 4 && R.w - R.y >= 4;
+		}
+		return false;
+	}
+	// one stroke into a draw list: O + frame pixels * Sc (the screen, or 0 and 1 for the saved PNG)
+	void SkDrawStroke(ImDrawList *DL, const SkStroke &S, ImVec2 O, float Sc, bool Live)
+	{
+		if (S.Pts.empty())
+			return;
+		const float Th = (std::max)(1.0f, S.Size * Sc);
+		const ImVec2 A(O.x + S.Pts[0].x * Sc, O.y + S.Pts[0].y * Sc);
+		const ImVec2 B = S.Pts.size() > 1 ? ImVec2(O.x + S.Pts[1].x * Sc, O.y + S.Pts[1].y * Sc) : A;
+		switch (S.Tool)
+		{
+		case SkPen:
+		case SkHigh:
+		{
+			const bool Hi = S.Tool == SkHigh;
+			const ImU32 C = Hi ? ((S.Col & ~IM_COL32_A_MASK) | (0x66u << IM_COL32_A_SHIFT)) : S.Col;
+			const float T = Hi ? Th * 4.0f : Th;
+			std::vector<ImVec2> P;
+			P.reserve(S.Pts.size());
+			for (const ImVec2 &p : S.Pts)
+			{
+				const ImVec2 q(O.x + p.x * Sc, O.y + p.y * Sc);
+				if (P.empty() || q.x != P.back().x || q.y != P.back().y)
+					P.push_back(q);
+			}
+			if (P.size() == 1)
+			{
+				if (Hi)
+					DL->AddRectFilled(ImVec2(P[0].x - T * 0.5f, P[0].y - T * 0.5f), ImVec2(P[0].x + T * 0.5f, P[0].y + T * 0.5f), C);
+				else
+					DL->AddCircleFilled(P[0], T * 0.5f, C);
+				break;
+			}
+			DL->AddPolyline(P.data(), (int)P.size(), C, ImDrawFlags_None, T);
+			if (!Hi && T > 2.5f)
+				for (const ImVec2 &p : P)
+					DL->AddCircleFilled(p, T * 0.5f, C);   // round joins and caps
+			break;
+		}
+		case SkArrow:
+		{
+			float dx = B.x - A.x, dy = B.y - A.y;
+			const float L = sqrtf(dx * dx + dy * dy);
+			if (L < 0.5f)
+				break;
+			dx /= L;
+			dy /= L;
+			const float H = (std::min)((std::max)(S.Size * 3.5f, 12.0f) * Sc, L);
+			const ImVec2 Base(B.x - dx * H, B.y - dy * H);
+			DL->AddLine(A, ImVec2(B.x - dx * H * 0.7f, B.y - dy * H * 0.7f), S.Col, Th);
+			DL->AddCircleFilled(A, Th * 0.5f, S.Col);
+			DL->AddTriangleFilled(B, ImVec2(Base.x - dy * H * 0.55f, Base.y + dx * H * 0.55f), ImVec2(Base.x + dy * H * 0.55f, Base.y - dx * H * 0.55f), S.Col);
+			break;
+		}
+		case SkRect:
+			DL->AddRect(ImVec2((std::min)(A.x, B.x), (std::min)(A.y, B.y)), ImVec2((std::max)(A.x, B.x), (std::max)(A.y, B.y)), S.Col, 0.0f, 0, Th);
+			break;
+		case SkEllipse:
+		{
+			const ImVec2 R(fabsf(B.x - A.x) * 0.5f, fabsf(B.y - A.y) * 0.5f);
+			if (R.x >= 0.5f && R.y >= 0.5f)
+				DL->AddEllipse(ImVec2((A.x + B.x) * 0.5f, (A.y + B.y) * 0.5f), R, S.Col, 0.0f, 0, Th);
+			break;
+		}
+		case SkText:
+		{
+			if (S.Text.empty())
+				break;
+			const float Fs = (16.0f + S.Size * 2.5f) * Sc;
+			const float o = (std::max)(1.0f, Fs / 14.0f);
+			static const float D[8][2] = { { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 }, { -1, -1 }, { 1, 1 }, { -1, 1 }, { 1, -1 } };
+			for (int k = 0; k < 8; k++)              // a dark outline: readable on any part of the frame
+				DL->AddText(nullptr, Fs, ImVec2(A.x + D[k][0] * o, A.y + D[k][1] * o), IM_COL32(0, 0, 0, 210), S.Text.c_str());
+			DL->AddText(nullptr, Fs, A, S.Col, S.Text.c_str());
+			break;
+		}
+		case SkCrop:
+			if (Live)                                // a kept crop shows as the dimmed outside (SkDrawCrop)
+				DL->AddRect(ImVec2((std::min)(A.x, B.x), (std::min)(A.y, B.y)), ImVec2((std::max)(A.x, B.x), (std::max)(A.y, B.y)), IM_COL32(255, 255, 255, 230), 0.0f, 0, 1.5f);
+			break;
+		}
+	}
+	void SkDrawCrop(ImDrawList *DL)
+	{
+		ImVec4 R;
+		if (!SkCropRect(R))
+			return;
+		const ImVec2 a(SkO.x + R.x * SkS, SkO.y + R.y * SkS), b(SkO.x + R.z * SkS, SkO.y + R.w * SkS);
+		const ImVec2 i0 = SkO, i1(SkO.x + SkW * SkS, SkO.y + SkH * SkS);
+		const ImU32 Dim = IM_COL32(0, 0, 0, 150);
+		DL->AddRectFilled(i0, ImVec2(i1.x, a.y), Dim);
+		DL->AddRectFilled(ImVec2(i0.x, b.y), i1, Dim);
+		DL->AddRectFilled(ImVec2(i0.x, a.y), ImVec2(a.x, b.y), Dim);
+		DL->AddRectFilled(ImVec2(b.x, a.y), ImVec2(i1.x, b.y), Dim);
+		DL->AddRect(a, b, IM_COL32(255, 255, 255, 230), 0.0f, 0, 1.5f);
+	}
+
+	// ---- on screen
+	// while the console is open (and sketch mode isn't): the strip to click
+	void SketchStrip()
+	{
+		SkStripShown = false;
+		if (!SketchOn || !SkConsole || SkOpen)
+			return;
+		const ImGuiIO &io = ImGui::GetIO();
+		const float Sc = (GmPanelScale > 0.5f && GmPanelScale < 4) ? GmPanelScale : 1.0f;
+		const std::string T = "Sketch this frame  (" + SkKeyName() + ")";
+		const ImVec2 TS = ImGui::CalcTextSize(T.c_str());
+		const ImVec2 Sz(TS.x + 28 * Sc, TS.y + 18 * Sc);
+		const ImVec2 A(io.DisplaySize.x - Sz.x - 16 * Sc, (float)(int)(io.DisplaySize.y * 0.3f));
+		const ImVec2 B(A.x + Sz.x, A.y + Sz.y);
+		bool Hot = false;
+		POINT M = {};
+		if (LiveWnd != nullptr && GetCursorPos(&M) && ScreenToClient(LiveWnd, &M))
+			Hot = M.x >= A.x && M.y >= A.y && M.x <= B.x && M.y <= B.y;
+		ImDrawList *FG = ImGui::GetForegroundDrawList();
+		FG->AddRectFilled(A, B, Hot ? IM_COL32(40, 110, 200, 235) : IM_COL32(18, 22, 28, 220), 6 * Sc);
+		FG->AddRect(A, B, SkPal(2), 6 * Sc, 0, 1.5f * Sc);
+		FG->AddText(ImVec2(A.x + 14 * Sc, A.y + 9 * Sc), IM_COL32_WHITE, T.c_str());
+		SkStrip = ImVec4(A.x, A.y, B.x, B.y);
+		SkStripShown = true;
+	}
+	void SketchUi(IDirect3DDevice9 *Dev)
+	{
+		const ImGuiIO &io = ImGui::GetIO();
+		const float DW = io.DisplaySize.x, DH = io.DisplaySize.y;
+		if (DW < 16 || DH < 16 || !SkEnsureTex(Dev))
+			return;
+		SkS = (std::min)(DW / SkW, DH / SkH);
+		SkO = ImVec2((float)(int)((DW - SkW * SkS) * 0.5f), (float)(int)((DH - SkH * SkS) * 0.5f));
+		ImDrawList *BG = ImGui::GetBackgroundDrawList();
+		BG->AddRectFilled(ImVec2(0, 0), ImVec2(DW, DH), IM_COL32(0, 0, 0, 255));
+		BG->AddImage(SkTexRef(), SkO, ImVec2(SkO.x + SkW * SkS, SkO.y + SkH * SkS));
+		for (const SkStroke &S : SkStrokes)
+			SkDrawStroke(BG, S, SkO, SkS, false);
+		SkDrawCrop(BG);
+		if (SkDrawing)
+			SkDrawStroke(BG, SkCur, SkO, SkS, true);
+		SkToolbar();
+		SkMouse();
+		SkKeys();
+	}
+	void SkToolbar()
+	{
+		const ImVec4 Warn(1.0f, 0.65f, 0.25f, 1.0f);
+		ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f, 10), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0));
+		ImGui::SetNextWindowBgAlpha(0.9f);
+		if (!ImGui::Begin("Sketch   (Esc closes)", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+		{
+			ImGui::End();
+			return;
+		}
+		for (int i = 0; i < SkToolCount; i++)
+		{
+			if (i)
+				ImGui::SameLine();
+			const bool Sel = SkTool == i;
+			if (Sel)
+				ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+			char L[32];
+			snprintf(L, sizeof(L), "%d %s", i + 1, SkToolName(i));
+			if (ImGui::Button(L))
+				SkTool = i;
+			if (Sel)
+				ImGui::PopStyleColor();
+		}
+		for (int i = 0; i < 8; i++)
+		{
+			if (i)
+				ImGui::SameLine();
+			ImGui::PushID(i);
+			const bool Sel = SkColor == i;
+			if (Sel)
+			{
+				ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 3.0f);
+				ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1, 1, 1, 1));
+			}
+			if (ImGui::ColorButton(SkPalName(i), ImGui::ColorConvertU32ToFloat4(SkPal(i)), ImGuiColorEditFlags_NoAlpha, ImVec2(26, 26)))
+				SkColor = i;
+			if (Sel)
+			{
+				ImGui::PopStyleColor();
+				ImGui::PopStyleVar();
+			}
+			ImGui::PopID();
+		}
+		ImGui::SameLine();
+		ImGui::SetNextItemWidth(130);
+		ImGui::SliderFloat("size", &SkSize, 1.0f, 24.0f, "%.0f px");
+		ImGui::SetNextItemWidth(300);
+		ImGui::InputTextWithHint("##label", "label for the Text tool", SkLabel, sizeof(SkLabel));
+		ImGui::SameLine();
+		ImGui::BeginDisabled(SkUndo.empty());
+		if (ImGui::Button("Erase last"))
+			SkUndoStep();
+		ImGui::EndDisabled();
+		ImGui::SameLine();
+		ImGui::BeginDisabled(SkRedo.empty());
+		if (ImGui::Button("Redo"))
+			SkRedoStep();
+		ImGui::EndDisabled();
+		ImGui::SameLine();
+		ImGui::BeginDisabled(SkStrokes.empty());
+		if (ImGui::Button("Clear"))
+		{
+			SkPushUndo();
+			SkStrokes.clear();
+		}
+		ImGui::EndDisabled();
+		ImGui::SetNextItemWidth(470);
+		ImGui::InputTextWithHint("##note", "note (goes into the .txt and the mark)", SkNote, sizeof(SkNote));
+		if (ImGui::Button("Save PNG"))
+			SkSaveWant = 1;
+		ImGui::SameLine();
+		if (ImGui::Button("Save as mark"))
+			SkSaveWant = 2;
+		ImGui::SameLine();
+		if (ImGui::Button("Close"))
+			SkSetOpen(false);
+		ImGui::SameLine();
+		ImVec4 Cr;
+		ImGui::TextDisabled("%ux%u %s | %d stroke(s)%s", SkW, SkH, SkPixFull ? "presented frame" : "world (no HUD/console)", (int)SkStrokes.size(),
+			SkCropRect(Cr) ? " | cropped" : "");
+		if (GmHold == nullptr)
+			ImGui::TextColored(Warn, "U2Input not found: the mouse still turns the view");
+		if (!SkStatus.empty())
+			ImGui::TextWrapped("%s", SkStatus.c_str());
+		ImGui::TextDisabled("1-7 tools | Ctrl+Z erase last, Ctrl+Y redo, Ctrl+S save | right click drops a stroke");
+		ImGui::End();
+	}
+	void SkMouse()
+	{
+		const ImGuiIO &io = ImGui::GetIO();
+		const ImVec2 M = io.MousePos;
+		ImVec2 P((M.x - SkO.x) / SkS, (M.y - SkO.y) / SkS);
+		const bool Over = P.x >= 0 && P.y >= 0 && P.x <= SkW && P.y <= SkH;
+		P.x = (std::min)((std::max)(P.x, 0.0f), (float)SkW);
+		P.y = (std::min)((std::max)(P.y, 0.0f), (float)SkH);
+		if (!SkDrawing && Over && !io.WantCaptureMouse && ImGui::IsMouseClicked(0))
+		{
+			if (SkTool == SkText)
+			{
+				if (SkLabel[0] == 0)
+					SkStatus = "Text: type the label first (the field under the colours), then click where it goes";
+				else
+				{
+					SkStroke S;
+					S.Tool = SkText;
+					S.Col = SkPal(SkColor);
+					S.Size = SkSize;
+					S.Pts.push_back(P);
+					S.Text = SkLabel;
+					SkPushUndo();
+					SkStrokes.push_back(S);
+				}
+			}
+			else
+			{
+				SkCur = SkStroke();
+				SkCur.Tool = SkTool;
+				SkCur.Col = SkPal(SkColor);
+				SkCur.Size = SkSize;
+				SkCur.Pts.push_back(P);
+				SkCur.Pts.push_back(P);
+				SkDrawing = true;
+			}
+		}
+		if (!SkDrawing)
+			return;
+		if (ImGui::IsMouseClicked(1))
+		{
+			SkDrawing = false;                       // right click: drop the stroke being drawn
+			return;
+		}
+		if (ImGui::IsMouseDown(0))
+		{
+			if (SkCur.Tool == SkPen || SkCur.Tool == SkHigh)
+			{
+				const ImVec2 &L = SkCur.Pts.back();
+				if (fabsf(P.x - L.x) + fabsf(P.y - L.y) >= 2.0f / SkS)
+					SkCur.Pts.push_back(P);
+			}
+			else
+				SkCur.Pts[1] = P;
+			return;
+		}
+		SkDrawing = false;
+		const bool Shape = SkCur.Tool != SkPen && SkCur.Tool != SkHigh;
+		if (Shape && fabsf(SkCur.Pts[1].x - SkCur.Pts[0].x) + fabsf(SkCur.Pts[1].y - SkCur.Pts[0].y) < 3.0f)
+			return;                                  // a click, not a shape
+		if (!Shape && SkCur.Pts.size() > 2 && SkCur.Pts[0].x == SkCur.Pts[1].x && SkCur.Pts[0].y == SkCur.Pts[1].y)
+			SkCur.Pts.erase(SkCur.Pts.begin());      // the press's doubled first point
+		SkPushUndo();
+		SkStrokes.push_back(SkCur);
+		if (SkCur.Tool == SkCrop)
+			SkStatus = "crop set: Save writes only this part (Erase last takes it back)";
+	}
+	void SkKeys()
+	{
+		const ImGuiIO &io = ImGui::GetIO();
+		if (io.WantTextInput)
+			return;
+		if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Z))
+			SkUndoStep();
+		if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Y))
+			SkRedoStep();
+		if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_S))
+			SkSaveWant = 1;
+		if (!io.KeyCtrl && !io.KeyAlt)
+			for (int i = 0; i < SkToolCount; i++)
+				if (ImGui::IsKeyPressed((ImGuiKey)(ImGuiKey_1 + i), false))
+					SkTool = i;
+	}
+
+	// ---- save
+	// in the ImGui frame (before Render): the frame and the strokes at 1:1, for SkSave
+	void SkBuildSave()
+	{
+		if (!SkOpen || SkTex == nullptr || SkW == 0 || SkH == 0)
+		{
+			SkSaveWant = 0;
+			return;
+		}
+		if (SkSaveList == nullptr)
+			SkSaveList = IM_NEW(ImDrawList)(ImGui::GetDrawListSharedData());
+		ImDrawList *DL = SkSaveList;
+		DL->_ResetForNewFrame();
+		DL->PushTexture(ImGui::GetIO().Fonts->TexRef);
+		DL->PushClipRect(ImVec2(0, 0), ImVec2((float)SkW, (float)SkH));
+		DL->AddImage(SkTexRef(), ImVec2(0, 0), ImVec2((float)SkW, (float)SkH));
+		for (const SkStroke &S : SkStrokes)
+			SkDrawStroke(DL, S, ImVec2(0, 0), 1.0f, false);
+		DL->_PopUnusedDrawCmd();
+	}
+	// the note for the mark: U+00C0..U+00FF as plain letters, only what a q-line may hold
+	static std::string SkMarkNote(const char *In)
+	{
+		static const char *Latin = "AAAAAAACEEEEIIIIDNOOOOOxOUUUUYPsaaaaaaaceeeeiiiidnooooo/ouuuuypy";
+		std::string Out;
+		for (const unsigned char *c = (const unsigned char *)In; *c;)
+		{
+			char ch = ' ';
+			if (*c < 0x80)
+				ch = (char)*c++;
+			else if ((*c & 0xE0) == 0xC0 && (c[1] & 0xC0) == 0x80)
+			{
+				const unsigned cp = ((c[0] & 0x1Fu) << 6) | (c[1] & 0x3Fu);
+				if (cp >= 0xC0 && cp <= 0xFF)
+					ch = Latin[cp - 0xC0];
+				c += 2;
+			}
+			else
+				for (c++; (*c & 0xC0) == 0x80; c++)
+					;
+			if (!isalnum((unsigned char)ch) && strchr(" ._-#:,+!?()/%&", ch) == nullptr)
+				ch = ' ';
+			if (ch == ' ' && (Out.empty() || Out.back() == ' '))
+				continue;
+			Out += ch;
+		}
+		while (!Out.empty() && Out.back() == ' ')
+			Out.pop_back();
+		if (Out.size() > 180)
+			Out.resize(180);
+		return Out;
+	}
+	// after the frame's ImGui render: SkSaveList into a target, read back, the files written
+	void SkSave(IDirect3DDevice9 *Dev)
+	{
+		const int Want = SkSaveWant;
+		SkSaveWant = 0;
+		if (SkSaveList == nullptr || SkW == 0 || SkH == 0)
+			return;
+		U2Crash::Where("saving a sketch");
+		IDirect3DSurface9 *RT = nullptr, *Sys = nullptr, *OldRT = nullptr, *OldDS = nullptr;
+		D3DVIEWPORT9 OldVp = {};
+		HRESULT hr = Dev->CreateRenderTarget(SkW, SkH, D3DFMT_A8R8G8B8, D3DMULTISAMPLE_NONE, 0, FALSE, &RT, nullptr);
+		if (SUCCEEDED(hr))
+			hr = Dev->CreateOffscreenPlainSurface(SkW, SkH, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, &Sys, nullptr);
+		if (SUCCEEDED(hr))
+		{
+			Dev->GetViewport(&OldVp);
+			Dev->GetRenderTarget(0, &OldRT);
+			Dev->GetDepthStencilSurface(&OldDS);
+			Dev->SetRenderTarget(0, RT);
+			Dev->SetDepthStencilSurface(nullptr);
+			if (SUCCEEDED(Dev->BeginScene()))
+			{
+				Dev->Clear(0, nullptr, D3DCLEAR_TARGET, 0xFF000000, 1.0f, 0);
+				ImDrawData DD;
+				DD.Valid = true;
+				DD.CmdLists.push_back(SkSaveList);
+				DD.CmdListsCount = 1;
+				DD.TotalVtxCount = SkSaveList->VtxBuffer.Size;
+				DD.TotalIdxCount = SkSaveList->IdxBuffer.Size;
+				DD.DisplayPos = ImVec2(0, 0);
+				DD.DisplaySize = ImVec2((float)SkW, (float)SkH);
+				DD.FramebufferScale = ImVec2(1, 1);
+				DD.OwnerViewport = ImGui::GetMainViewport();
+				DD.Textures = nullptr;            // this frame's render already brought the font up to date
+				ImGui_ImplDX9_RenderDrawData(&DD);
+				Dev->EndScene();
+			}
+			Dev->SetRenderTarget(0, OldRT);
+			Dev->SetDepthStencilSurface(OldDS);
+			Dev->SetViewport(&OldVp);
+			hr = Dev->GetRenderTargetData(RT, Sys);
+		}
+		ImVec4 Cr(0, 0, (float)SkW, (float)SkH);
+		const bool Cropped = SkCropRect(Cr);
+		if (!Cropped)
+			Cr = ImVec4(0, 0, (float)SkW, (float)SkH);
+		const UINT X0 = (UINT)Cr.x, Y0 = (UINT)Cr.y, CW = (UINT)(Cr.z - Cr.x), CH = (UINT)(Cr.w - Cr.y);
+		std::vector<unsigned char> Rgb;
+		D3DLOCKED_RECT L = {};
+		if (SUCCEEDED(hr) && SUCCEEDED(hr = Sys->LockRect(&L, nullptr, D3DLOCK_READONLY)))
+		{
+			Rgb.resize((size_t)CW * CH * 3);
+			for (UINT y = 0; y < CH; y++)
+			{
+				const BYTE *In = static_cast<const BYTE *>(L.pBits) + (size_t)(Y0 + y) * L.Pitch + (size_t)X0 * 4;
+				unsigned char *O = &Rgb[(size_t)y * CW * 3];
+				for (UINT x = 0; x < CW; x++)
+				{
+					O[x * 3 + 0] = In[x * 4 + 2];
+					O[x * 3 + 1] = In[x * 4 + 1];
+					O[x * 3 + 2] = In[x * 4 + 0];
+				}
+			}
+			Sys->UnlockRect();
+		}
+		if (Sys) Sys->Release();
+		if (RT) RT->Release();
+		if (OldRT) OldRT->Release();
+		if (OldDS) OldDS->Release();
+		if (Rgb.empty())
+		{
+			SkStatus = "couldn't save: the drawing wasn't readable (see U2Shaders.log)";
+			Message("sketch: save failed (%08x)", (unsigned)hr);
+			return;
+		}
+		// the name: sketch-YYYYMMDD-HHMMSS(-N)
+		const std::string Folder = Dir + "Sketch\\";
+		CreateDirectoryA(Folder.c_str(), nullptr);
+		SYSTEMTIME T = {};
+		GetLocalTime(&T);
+		char Stamp[64];
+		snprintf(Stamp, sizeof(Stamp), "sketch-%04u%02u%02u-%02u%02u%02u", T.wYear, T.wMonth, T.wDay, T.wHour, T.wMinute, T.wSecond);
+		std::string Name = Stamp;
+		for (int k = 2; k < 100 && (Name == SkLastName || GetFileAttributesA((Folder + Name + ".png").c_str()) != INVALID_FILE_ATTRIBUTES); k++)
+			Name = std::string(Stamp) + "-" + std::to_string(k);
+		SkLastName = Name;
+		// the mark (U2GM's q-line channel), then the sidecar that says what became of it
+		std::string MarkLine = "not asked (Save PNG)";
+		const std::string Note = SkMarkNote(SkNote);
+		if (Want == 2)
+		{
+			if (!GmSt.Valid)
+				MarkLine = "not sent: no PanelState in U2GM.ini (is U2GM loaded?)";
+			else
+			{
+				const long K = Note.empty() ? GmSend("sketch mark %s", Name.c_str()) : GmSend("sketch mark %s %s", Name.c_str(), Note.c_str());
+				MarkLine = K > 0 ? ("sent as gm q line " + std::to_string(K) + ": gm sketch mark " + Name + (Note.empty() ? "" : " " + Note)
+					+ " (GMMaster runs: avalon mark " + Note + (Note.empty() ? "" : " ") + "sketch:" + Name + ")") : std::string("not sent (refused, see U2Shaders.log)");
+			}
+		}
+		std::string Txt;
+		char Line[512];
+		snprintf(Line, sizeof(Line), "sketch    %s.png\r\ntime      %04u-%02u-%02u %02u:%02u:%02u\r\nmap       %s\r\n", Name.c_str(), T.wYear, T.wMonth, T.wDay, T.wHour, T.wMinute, T.wSecond,
+			CurMap.empty() ? "?" : CurMap.c_str());
+		Txt += Line;
+		if (GmSt.Valid && GmSt.CamOk)
+			snprintf(Line, sizeof(Line), "eye       %.0f %.0f %.0f   (U2GM PanelState cam=: the player's eye, up to 1 s old)\r\n", GmSt.Cam[0], GmSt.Cam[1], GmSt.Cam[2]);
+		else
+			snprintf(Line, sizeof(Line), "eye       unknown (no PanelState: U2GM isn't loaded)\r\n");
+		Txt += Line;
+		if (GmSt.Valid && GmSt.ViewOk)
+			snprintf(Line, sizeof(Line), "view      yaw %.0f pitch %.0f   (degrees, PanelState view=)\r\n", GmSt.View[0], GmSt.View[1]);
+		else
+			snprintf(Line, sizeof(Line), "view      unknown\r\n");
+		Txt += Line;
+		snprintf(Line, sizeof(Line), "frame     %ux%u, %s\r\n", SkW, SkH, SkPixFull ? "the presented frame" : "the world before the HUD and the console were drawn");
+		Txt += Line;
+		if (Cropped)
+			snprintf(Line, sizeof(Line), "crop      x %u y %u w %u h %u (the PNG is this part)\r\n", X0, Y0, CW, CH);
+		else
+			snprintf(Line, sizeof(Line), "crop      none\r\n");
+		Txt += Line;
+		int Count[SkToolCount] = {};
+		std::string Labels;
+		for (const SkStroke &S : SkStrokes)
+		{
+			if (S.Tool >= 0 && S.Tool < SkToolCount)
+				Count[S.Tool]++;
+			if (S.Tool == SkText)
+				Labels += (Labels.empty() ? "\"" : " | \"") + S.Text + "\"";
+		}
+		std::string Kinds;
+		for (int i = 0; i < SkToolCount; i++)
+			if (Count[i] > 0)
+				Kinds += (Kinds.empty() ? "" : ", ") + std::string(SkToolName(i)) + " " + std::to_string(Count[i]);
+		Txt += "strokes   " + std::to_string(SkStrokes.size()) + (Kinds.empty() ? std::string() : " (" + Kinds + ")") + "\r\n";
+		Txt += "labels    " + (Labels.empty() ? std::string("none") : Labels) + "\r\n";
+		Txt += "note      " + std::string(SkNote) + "\r\n";
+		Txt += "mark      " + MarkLine + "\r\n";
+		const std::string Png = Folder + Name + ".png", TxtPath = Folder + Name + ".txt";
+		const int PW = (int)CW, PH = (int)CH;
+		std::thread([Rgb, PW, PH, Png, TxtPath, Txt]()
+		{
+			// a 1080p PNG takes a moment to compress: not on the game's thread
+			stbi_write_png(Png.c_str(), PW, PH, 3, Rgb.data(), PW * 3);
+			FILE *F = nullptr;
+			if (!fopen_s(&F, TxtPath.c_str(), "wb") && F)
+			{
+				fwrite(Txt.data(), 1, Txt.size(), F);
+				fclose(F);
+			}
+		}).detach();
+		SkStatus = "saved System\\Sketch\\" + Name + ".png (+ .txt)";
+		if (Want == 2)
+			SkStatus += "; mark: " + MarkLine;
+		Message("sketch: saved %s.png (%ux%u%s, %d stroke(s)); mark: %s", Name.c_str(), CW, CH, Cropped ? ", cropped" : "", (int)SkStrokes.size(), MarkLine.c_str());
 	}
 
 	// ---- shotmask=1: a character mask with each shotp frame ---------------------------------
@@ -8047,6 +9028,17 @@ public:
 	{
 		if (GmImDev != nullptr)
 			ImGui_ImplDX9_InvalidateDeviceObjects();   // gmpanel: its buffers and font are default-pool
+		if (SkGrabRT != nullptr)
+		{
+			SkGrabRT->Release();             // sketch: a copy not read back yet is lost: copied again
+			SkGrabRT = nullptr;
+		}
+		if (SkGrabPending)
+		{
+			SkGrabPending = false;
+			SkGrabWant = true;
+			SkGrabAge = 0;
+		}
 		U2Blood::Release();
 		U2Runs::Release();
 		MapViews.clear();
@@ -8090,6 +9082,7 @@ public:
 			It.second.Tried = false;
 		}
 		if (PostQuadVB) { PostQuadVB->Release(); PostQuadVB = nullptr; }
+		if (SkTex) { SkTex->Release(); SkTex = nullptr; }   // sketch: made again from its pixels on the next device
 		if (GmImDev != nullptr)
 		{
 			ImGui_ImplDX9_Shutdown();            // it holds a reference to the device
