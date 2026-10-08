@@ -24,6 +24,13 @@ float4    Setup0 : register(c2);  // x stage 0 alpha: 0 texture, 1 texture x dif
 
 #define HEX 1                      // 0: plain read (checks the replication against the stock look)
 #define CELL 1.5                   // texture repeats per hex
+// far repeats (seen from 50-200 m): the same texture read again ~9x larger, hex-tiled too, modulates the
+// near one's brightness against the texture's mean (its smallest mip), plus a slow value-noise
+// brightness drift, so big slopes stop showing the same blotch pattern every few metres
+#define MACRO 0.11                 // the macro read's scale (uv x MACRO)
+#define MACRO_AMT 0.55             // how much the macro read modulates (0 off)
+#define DRIFT_SCALE 0.035          // value-noise scale in uv
+#define DRIFT_AMT 0.16             // +- brightness drift
 
 float2 HexHash(float2 p)
 {
@@ -59,10 +66,26 @@ float4 HexTile(sampler2D s, float2 uv, float cell)
 	return a * k.x + b * k.y + c * k.z;
 }
 
+float VNoise(float2 p)
+{
+	float2 i = floor(p), f = frac(p);
+	f = f * f * (3 - 2 * f);
+	float a = HexHash(i).x, b = HexHash(i + float2(1, 0)).x, c = HexHash(i + float2(0, 1)).x, d = HexHash(i + float2(1, 1)).x;
+	return lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
+}
+
 float4 main(float2 uv : TEXCOORD0, float2 uvm : TEXCOORD1, float4 diffuse : COLOR0) : COLOR
 {
 #if HEX
 	float4 t = HexTile(Layer, uv, CELL);
+	if (MACRO_AMT > 0)
+	{
+		const float3 L = float3(0.3, 0.59, 0.11);
+		float mean = max(dot(tex2Dbias(Layer, float4(uv, 0, 12)).rgb, L), 0.02);
+		float far = dot(HexTile(Layer, uv * MACRO + 0.37, CELL).rgb, L);
+		t.rgb *= lerp(1, clamp(far / mean, 0.55, 1.6), MACRO_AMT);
+		t.rgb *= 1 + DRIFT_AMT * (2 * VNoise(uv * DRIFT_SCALE) - 1);
+	}
 #else
 	float4 t = tex2D(Layer, uv);
 #endif
