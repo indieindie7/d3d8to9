@@ -69,6 +69,7 @@
 #include "imgui/imgui_impl_dx9.h"
 #include "imgui/imgui_impl_win32.h"
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -2589,9 +2590,15 @@ public:
 		long Seq = 0;
 		std::string Pick = "-", Cls = "-", Mesh = "-";
 		float Loc[3] = { 0, 0, 0 }, Yaw = 0, Scale = 1, Cam[3] = { 0, 0, 0 };
+		long CommitStamp = 0;                // commit=STAMP:STATE:MAP (gm commit, gm_commit.py --watch)
+		std::string CommitState = "none", CommitMap = "-";
 	};
 	GmStateT GmSt;
 	std::vector<std::pair<int, std::string>> GmPalette, GmJournal;
+	std::vector<std::array<float, 3>> GmDrawPts;    // U2GM.ini DrawState: the draw being made
+	char GmNote[112] = {};                           // the draw's note
+	std::string GmCommitWatch;                       // System\U2GMCommit.status: the watcher's last word
+	DWORD GmCommitWatchAge = 0xffffffff;             // its age in ms when read
 	float GmGrid = 32;
 	int GmYawStep = 15;
 	FILETIME GmPanelIniTime = {};
@@ -2626,10 +2633,12 @@ public:
 		vsnprintf(Buf, sizeof(Buf), Fmt, Args);
 		va_end(Args);
 		Buf[sizeof(Buf) - 1] = 0;
+		// "draw done ... NOTE": the note may also hold !?()/%& (never quotes, semicolons or |)
+		const char *Extra = strncmp(Buf, "draw done ", 10) == 0 ? " ._-#:,+!?()/%&" : " ._-#:,+";
 		for (const char *c = Buf; *c; c++)
-			if (!isalnum((unsigned char)*c) && strchr(" ._-#:,+", *c) == nullptr)
+			if (!isalnum((unsigned char)*c) && strchr(Extra, *c) == nullptr)
 			{
-				Message("gm panel: not sent (only letters, digits and ._-#:,+): %s", Buf);
+				Message("gm panel: not sent (only letters, digits and %s): %s", Extra + 1, Buf);
 				return 0;
 			}
 		const bool Preview = strncmp(Buf, "preview ", 8) == 0;
@@ -2654,14 +2663,43 @@ public:
 			Text += "gm q " + std::to_string(GmSession) + " " + std::to_string(L.K) + " " + L.Cmd + "\r\n";
 		if (Text == GmOutWritten)
 			return;
+		const std::string Mine = Text;
 		const std::string Tmp = Dir + "U2GMPanel.tmp", Path = Dir + "U2GMPanel.txt";
+		// lines of another session (gm_commit.py's watcher: "gm q <2^30 and up> ...") stay in the
+		// file; the watcher takes its own out once the game ran them
+		{
+			FILE *Old = nullptr;
+			if (fopen_s(&Old, Path.c_str(), "rb") == 0 && Old != nullptr)
+			{
+				std::string Was;
+				char Rd[4096];
+				size_t n;
+				while ((n = fread(Rd, 1, sizeof(Rd), Old)) > 0 && Was.size() < 65536)
+					Was.append(Rd, n);
+				fclose(Old);
+				const std::string Own = "gm q " + std::to_string(GmSession) + " ";
+				size_t At = 0;
+				while (At < Was.size())
+				{
+					size_t End = Was.find('\n', At);
+					if (End == std::string::npos)
+						End = Was.size();
+					std::string L = Was.substr(At, End - At);
+					At = End + 1;
+					while (!L.empty() && (L.back() == '\r' || L.back() == ' '))
+						L.pop_back();
+					if (L.compare(0, 5, "gm q ") == 0 && L.compare(0, Own.size(), Own) != 0)
+						Text += L + "\r\n";
+				}
+			}
+		}
 		FILE *F = nullptr;
 		if (fopen_s(&F, Tmp.c_str(), "wb") || F == nullptr)
 			return;
 		const bool Ok = fwrite(Text.data(), 1, Text.size(), F) == Text.size();
 		fclose(F);
 		if (Ok && MoveFileExA(Tmp.c_str(), Path.c_str(), MOVEFILE_REPLACE_EXISTING))
-			GmOutWritten = Text;            // else (the game reading it): the next frame
+			GmOutWritten = Mine;            // else (the game reading it): the next frame
 		else
 			DeleteFileA(Tmp.c_str());
 	}
@@ -2702,6 +2740,15 @@ public:
 			else if (K == "yaw") S.Yaw = (float)atof(X.c_str());
 			else if (K == "scale") S.Scale = (float)atof(X.c_str());
 			else if (K == "cam") S.CamOk = sscanf_s(X.c_str(), "%f,%f,%f", &S.Cam[0], &S.Cam[1], &S.Cam[2]) == 3;
+			else if (K == "commit")
+			{
+				const size_t C1 = X.find(':'), C2 = C1 == std::string::npos ? C1 : X.find(':', C1 + 1);
+				S.CommitStamp = atol(X.c_str());
+				if (C1 != std::string::npos)
+					S.CommitState = X.substr(C1 + 1, C2 == std::string::npos ? std::string::npos : C2 - C1 - 1);
+				if (C2 != std::string::npos)
+					S.CommitMap = X.substr(C2 + 1);
+			}
 		}
 		if (S.Pick.empty())
 			S.Pick = "-";
@@ -2722,6 +2769,7 @@ public:
 		GmPanelMap = CurMap;
 		GmPalette.clear();
 		GmJournal.clear();
+		GmDrawPts.clear();
 		const std::string Tag = "@" + GmFamily() + " ";
 		bool InSec = false;
 		size_t At = 0;
@@ -2752,6 +2800,20 @@ public:
 				V = V.substr(1, V.size() - 2);
 			if (_stricmp(Key.c_str(), "PanelState") == 0)
 				GmParseState(V);
+			else if (_stricmp(Key.c_str(), "DrawState") == 0)
+			{
+				size_t P = 0;
+				while (P < V.size())
+				{
+					size_t E = V.find(' ', P);
+					if (E == std::string::npos)
+						E = V.size();
+					std::array<float, 3> Pt = { 0, 0, 0 };
+					if (sscanf_s(V.substr(P, E - P).c_str(), "%f,%f,%f", &Pt[0], &Pt[1], &Pt[2]) == 3)
+						GmDrawPts.push_back(Pt);
+					P = E + 1;
+				}
+			}
 			else if (_stricmp(Key.c_str(), "GridSize") == 0)
 				GmGrid = (float)atof(V.c_str());
 			else if (_stricmp(Key.c_str(), "YawStep") == 0)
@@ -3127,8 +3189,65 @@ public:
 		case 3: GmSend("raise %.0f %.0f", GmRadius, GmHeight); break;
 		case 4: GmSend("lower %.0f %.0f", GmRadius, GmHeight); break;
 		case 5: GmSend("flatten %.0f", GmRadius); break;
-		default: GmSend("smooth %.0f", GmRadius); break;
+		case 6: GmSend("smooth %.0f", GmRadius); break;
+		default: GmSend("draw add"); break;   // a point of the draw at the hit along the ray
 		}
+	}
+	// the draw being made: screen-space lines between its projected points (closing edge faint)
+	void GmDrawLines()
+	{
+		if (GmDrawPts.empty() || !GmViewOk)
+			return;
+		ImDrawList *DL = ImGui::GetBackgroundDrawList();
+		const ImU32 Col = IM_COL32(255, 120, 230, 255), Faint = IM_COL32(255, 120, 230, 90);
+		std::vector<ImVec2> S(GmDrawPts.size());
+		std::vector<char> Ok(GmDrawPts.size());
+		for (size_t i = 0; i < GmDrawPts.size(); i++)
+			Ok[i] = GmProject(GmDrawPts[i].data(), S[i]) ? 1 : 0;
+		for (size_t i = 0; i < S.size(); i++)
+		{
+			if (Ok[i])
+			{
+				DL->AddCircleFilled(S[i], 4.0f, Col);
+				char N[8];
+				snprintf(N, sizeof(N), "%d", (int)i + 1);
+				DL->AddText(ImVec2(S[i].x + 6, S[i].y - 14), Col, N);
+			}
+			if (i > 0 && Ok[i] && Ok[i - 1])
+				DL->AddLine(S[i - 1], S[i], Col, 2.0f);
+		}
+		if (S.size() > 2 && Ok.front() && Ok.back())
+			DL->AddLine(S.back(), S.front(), Faint, 1.0f);
+	}
+	// System\U2GMCommit.status (the commit watcher's progress line), read about twice a second while shown
+	void GmReadCommitStatus()
+	{
+		const std::string Path = Dir + "U2GMCommit.status";
+		WIN32_FILE_ATTRIBUTE_DATA A = {};
+		if (!GetFileAttributesExA(Path.c_str(), GetFileExInfoStandard, &A))
+		{
+			GmCommitWatch.clear();
+			return;
+		}
+		FILETIME Now;
+		GetSystemTimeAsFileTime(&Now);
+		const ULONGLONG T0 = ((ULONGLONG)A.ftLastWriteTime.dwHighDateTime << 32) | A.ftLastWriteTime.dwLowDateTime;
+		const ULONGLONG T1 = ((ULONGLONG)Now.dwHighDateTime << 32) | Now.dwLowDateTime;
+		GmCommitWatchAge = T1 > T0 ? (DWORD)(std::min)((T1 - T0) / 10000, (ULONGLONG)0xfffffffe) : 0;
+		FILE *F = nullptr;
+		if (fopen_s(&F, Path.c_str(), "rb") || F == nullptr)
+			return;
+		char Buf[256] = {};
+		const size_t n = fread(Buf, 1, sizeof(Buf) - 1, F);
+		fclose(F);
+		Buf[n] = 0;
+		for (char *c = Buf; *c; c++)
+			if ((unsigned char)*c < 32)
+			{
+				*c = 0;
+				break;
+			}
+		GmCommitWatch = Buf;
 	}
 
 	// ---- the panel
@@ -3181,7 +3300,7 @@ public:
 		if (ImGui::Button("Hide"))
 			GmSend("hide");
 		ImGui::SetNextItemWidth(200);
-		ImGui::Combo("click in world", &GmClickMode, "pick\0spawn the palette entry\0move the picked here\0raise terrain\0lower terrain\0flatten terrain\0smooth terrain\0\0");
+		ImGui::Combo("click in world", &GmClickMode, "pick\0spawn the palette entry\0move the picked here\0raise terrain\0lower terrain\0flatten terrain\0smooth terrain\0draw (add a point)\0\0");
 
 		ImGui::SeparatorText("Move / turn / scale");
 		ImGui::SetNextItemWidth(90);
@@ -3249,6 +3368,57 @@ public:
 		ImGui::SameLine();
 		if (ImGui::Button("Smooth"))
 			GmSend("smooth %.0f", GmRadius);
+
+		ImGui::SeparatorText("Draw (notes for the level team)");
+		ImGui::Text("%d point(s)%s", (int)GmDrawPts.size(), GmClickMode == 7 ? ": world clicks add points" : ": click in world = draw adds points");
+		if (ImGui::Button("Point at crosshair"))
+			GmSend("draw add");
+		ImGui::SameLine();
+		if (ImGui::Button("Undo point"))
+			GmSend("draw undo");
+		ImGui::SameLine();
+		if (ImGui::Button("Clear"))
+			GmSend("draw clear");
+		ImGui::SetNextItemWidth(260);
+		ImGui::InputText("note", GmNote, sizeof(GmNote));
+		for (int c = 0; c < 2; c++)
+		{
+			if (c)
+				ImGui::SameLine();
+			if (ImGui::Button(c ? "Done (closed)" : "Done (open)"))
+			{
+				// the note through the command file's filter: anything else becomes a space
+				std::string N;
+				for (const char *p = GmNote; *p; p++)
+					N += (isalnum((unsigned char)*p) || strchr(" ._-#:,+!?()/%&", *p)) ? *p : ' ';
+				while (!N.empty() && N.back() == ' ')
+					N.pop_back();
+				GmSend("draw done %s%s%s", c ? "closed" : "open", N.empty() ? "" : " ", N.c_str());
+				GmNote[0] = 0;
+			}
+		}
+
+		ImGui::SeparatorText("Commit (bake into a new map)");
+		{
+			const bool Pending = GmSt.CommitState == "pending";
+			if (!Pending && ImGui::Button("Commit"))
+				GmSend("commit");
+			if (Pending && ImGui::Button("Cancel commit"))
+				GmSend("commit cancel");
+			ImGui::SameLine();
+			if (GmSt.CommitStamp == 0)
+				ImGui::TextDisabled("no commit yet");
+			else if (GmSt.CommitState == "done")
+				ImGui::Text("commit %ld done: %s", GmSt.CommitStamp, GmSt.CommitMap.c_str());
+			else
+				ImGui::Text("commit %ld %s%s%s", GmSt.CommitStamp, GmSt.CommitState.c_str(), GmSt.CommitMap != "-" ? ": " : "", GmSt.CommitMap != "-" ? GmSt.CommitMap.c_str() : "");
+			if (Frame % 30 == 0 || GmCommitWatchAge == 0xffffffff)
+				GmReadCommitStatus();
+			if (!GmCommitWatch.empty() && GmCommitWatchAge < 90000)   // the watcher beats every 30 s
+				ImGui::TextWrapped("watcher: %s", GmCommitWatch.c_str());
+			else if (Pending)
+				ImGui::TextColored(Warn, "no watcher answered: run U2GM/tools/gm_commit.py --watch");
+		}
 
 		ImGui::SeparatorText("Journal (this map)");
 		ImGui::BeginChild("journal", ImVec2(0, 140), ImGuiChildFlags_Borders);
@@ -3416,6 +3586,7 @@ public:
 		if (GmDispW >= 16 && GmDispH >= 16)
 		{
 			GmGizmo();
+			GmDrawLines();
 			GmWorldClick();
 		}
 		ImGui::Render();
