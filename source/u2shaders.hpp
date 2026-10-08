@@ -65,6 +65,7 @@
 #include "runs.hpp"
 #include <d3dcompiler.h>
 #include "fakefull.hpp"
+#include "crash.hpp"
 #include "imgui/imgui.h"
 #include "imgui/imgui_impl_dx9.h"
 #include "imgui/imgui_impl_win32.h"
@@ -374,6 +375,7 @@ public:
 		Dir = Path;
 		Dir.erase(Dir.find_last_of("\\/") + 1);
 		DeleteFileA((Dir + "U2Shaders.log").c_str());
+		U2Crash::Install(Dir);   // a C-runtime abort leaves a log line and a minidump (crash.hpp)
 		if (!U2FakeFull::Pending().empty())
 			Message("%s", U2FakeFull::Pending().substr(0, U2FakeFull::Pending().size() - 1).c_str());
 
@@ -3577,6 +3579,7 @@ public:
 	}
 	void GmPanelDraw(IDirect3DDevice9 *Dev)
 	{
+		U2Crash::Where("drawing the GM panel");
 		ImGui_ImplDX9_NewFrame();
 		ImGui_ImplWin32_NewFrame();
 		ImGuiIO &io = ImGui::GetIO();
@@ -7923,6 +7926,7 @@ public:
 
 	void OnPresent(IDirect3DDevice9 *Dev)
 	{
+		U2Crash::Where("the layer's end-of-frame work (post, GI, panel)");
 		if (Loaded && Frame % 10 == 0)
 		{
 			if (WatchMap())

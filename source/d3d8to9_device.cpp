@@ -281,7 +281,10 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::Present(const RECT *pSourceRect, cons
 	if (!U2.MsaaTested && U2Msaa::Wanted() != 0 && U2.Loaded && U2.Frame > 200)
 		U2.MsaaSelfTest(ProxyInterface);
 	U2.OnPresent(ProxyInterface);
-	return ProxyInterface->Present(pSourceRect, pDestRect, hDestWindowOverride, nullptr);
+	U2Crash::Where("the driver's Present");
+	const HRESULT Hr = ProxyInterface->Present(pSourceRect, pDestRect, hDestWindowOverride, nullptr);
+	U2Crash::Where("the game's own code or draws (between frames)");
+	return Hr;
 }
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::GetBackBuffer(UINT iBackBuffer, D3DBACKBUFFER_TYPE Type, IDirect3DSurface8 **ppBackBuffer)
 {
