@@ -59,6 +59,9 @@ Direct3DDevice8::Direct3DDevice8(Direct3D8 *d3d, IDirect3DDevice9 *ProxyInterfac
 	ReleaseDC(nullptr, hDC);
 
 	IsMixedVertexProcessingDevice = (BehaviorFlags & D3DCREATE_MIXED_VERTEXPROCESSING) != 0;
+	U2PerfC().Behavior = BehaviorFlags;   // perf: logged once (pure device or not)
+	U2PerfC().HaveBehavior = true;
+	U2PerfC().Forget();
 
 	CurrentZBufferBitCount = GetDepthStencilBitCount(ZBufferFormat);
 
@@ -243,6 +246,7 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::Reset(D3DPRESENT_PARAMETERS8 *pPresen
 		return D3DERR_INVALIDCALL;
 
 	CurrentZBiasRenderState = 0;
+	U2PerfC().Forget();                  // perf: a Reset puts every state back to its default
 	U2.OnLost();
 	TexEd().OnLost();                    // texedit: its render targets (bakes, pick target) are DEFAULT pool
 
@@ -289,11 +293,14 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::Present(const RECT *pSourceRect, cons
 {
 	UNREFERENCED_PARAMETER(pDirtyRegion);
 
-	U2.MsaaResolve(ProxyInterface);
-	if (!U2.MsaaTested && U2Msaa::Wanted() != 0 && U2.Loaded && U2.Frame > 200)
-		U2.MsaaSelfTest(ProxyInterface);
-	TexEd().OnPresent(U2, ProxyInterface);   // texedit: pick readback, ini/journal watch, adjust bakes
-	U2.OnPresent(ProxyInterface);
+	{
+		U2PerfScope PerfEnd(U2PerfC().EndFrame);   // perf: "end-of-frame" (a post chain run from here counts as post)
+		U2.MsaaResolve(ProxyInterface);
+		if (!U2.MsaaTested && U2Msaa::Wanted() != 0 && U2.Loaded && U2.Frame > 200)
+			U2.MsaaSelfTest(ProxyInterface);
+		TexEd().OnPresent(U2, ProxyInterface);   // texedit: pick readback, ini/journal watch, adjust bakes
+		U2.OnPresent(ProxyInterface);
+	}
 	Perf.OnPresent([](const char *Line) { U2.Message("%s", Line); });
 	U2Crash::Where("the driver's Present");
 	const HRESULT Hr = ProxyInterface->Present(pSourceRect, pDestRect, hDestWindowOverride, nullptr);
@@ -580,6 +587,10 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::CopyRects(IDirect3DSurface8 *pSourceS
 			hr = D3DERR_INVALIDCALL;
 			if (D3DXLoadSurfaceFromSurface != nullptr)
 			{
+				const bool Read = SourceDesc.Pool == D3DPOOL_DEFAULT;   // perf: "game readback"
+				if (Read)
+					U2PerfC().GameReads++;
+				U2PerfScope PerfRead(U2PerfC().GameRead, Read ? 1u : 0u);
 				if (SUCCEEDED(D3DXLoadSurfaceFromSurface(pDestinationSurfaceImpl->GetProxyInterface(), nullptr, &DestinationRect, Source, nullptr, &SourceRect, D3DX_FILTER_NONE, 0)))
 				{
 					// Explicitly call AddDirtyRect on the surface
@@ -651,6 +662,8 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::GetFrontBuffer(IDirect3DSurface8 *pDe
 		return D3DERR_INVALIDCALL;
 
 	auto pDestSurfaceImpl = static_cast<Direct3DSurface8 *>(pDestSurface);
+	U2PerfC().GameReads++;               // perf: "game readback"
+	U2PerfScope PerfRead(U2PerfC().GameRead);
 	return ProxyInterface->GetFrontBufferData(0, pDestSurfaceImpl->GetProxyInterface());
 }
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::SetRenderTarget(IDirect3DSurface8 *pRenderTarget, IDirect3DSurface8 *pNewZStencil)
@@ -852,6 +865,9 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::GetClipPlane(DWORD Index, float *pPla
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::SetRenderState(D3DRENDERSTATETYPE State, DWORD Value)
 {
 	HRESULT hr;
+	U2PerfCounters &Pc = U2PerfC();     // perf: the game's state traffic (counted as the game asked, before any rewrite)
+	U2PerfScope PerfState(Pc.State, U2PerfStateScale());
+	Pc.Note(U2PerfCounters::Rs, (DWORD)State < 256 ? &Pc.RsSlot[State] : nullptr, Value);
 
 	// msaa=N: the game's own "no multisampling" doesn't apply
 	if ((State == D3DRS_MULTISAMPLEANTIALIAS || State == D3DRS_MULTISAMPLEMASK) && U2Msaa::Wanted() != 0)
@@ -925,7 +941,10 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::BeginStateBlock()
 	HRESULT hr = ProxyInterface->BeginStateBlock();
 
 	if (SUCCEEDED(hr))
+	{
 		IsRecordingState = true;
+		U2PerfC().Recording = true;      // perf: recorded Sets don't change the device
+	}
 
 	return hr;
 }
@@ -943,6 +962,7 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::EndStateBlock(DWORD *pToken)
 	{
 		StateBlockTokens.insert(*pToken);
 		IsRecordingState = false;
+		U2PerfC().Recording = false;
 	}
 
 	return hr;
@@ -958,6 +978,7 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::ApplyStateBlock(DWORD Token)
 	if (StateBlockTokens.find(Token) == StateBlockTokens.end())
 		return D3D_OK;
 
+	U2PerfC().Forget();                  // perf: the block sets states the slots don't know about
 	return reinterpret_cast<IDirect3DStateBlock9 *>(Token)->Apply();
 }
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::CaptureStateBlock(DWORD Token)
@@ -1063,6 +1084,9 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::GetTexture(DWORD Stage, IDirect3DBase
 }
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::SetTexture(DWORD Stage, IDirect3DBaseTexture8 *pTexture)
 {
+	U2PerfCounters &Pc = U2PerfC();     // perf: the game's state traffic
+	U2PerfScope PerfState(Pc.State, U2PerfStateScale());
+	Pc.Note(U2PerfCounters::Tex, Stage < 8 ? &Pc.TexSlot[Stage] : nullptr, (ULONG_PTR)pTexture);
 	if (Stage == 0)
 		U2Stage0 = (pTexture != nullptr && pTexture->GetType() == D3DRTYPE_TEXTURE) ? static_cast<Direct3DTexture8 *>(pTexture) : nullptr;
 	if (Stage < 4)
@@ -1121,6 +1145,15 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::GetTextureStageState(DWORD Stage, D3D
 }
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::SetTextureStageState(DWORD Stage, D3DTEXTURESTAGESTATETYPE Type, DWORD Value)
 {
+	// perf: the game's state traffic, as the game asked (before the aniso= rewrite below);
+	// the sampler kinds (address, border, filters, mip bias/level, anisotropy) count as "samp"
+	U2PerfCounters &Pc = U2PerfC();
+	U2PerfScope PerfState(Pc.State, U2PerfStateScale());
+	{
+		const DWORD T = static_cast<DWORD>(Type);
+		const bool Samp = (T >= D3DTSS_ADDRESSU && T <= D3DTSS_MAXANISOTROPY) || T == D3DTSS_ADDRESSW;
+		Pc.Note(Samp ? U2PerfCounters::Samp : U2PerfCounters::Tss, Stage < 8 && T < 33 ? &Pc.TssSlot[Stage][T] : nullptr, Value);
+	}
 	switch (static_cast<DWORD>(Type))
 	{
 	case D3DTSS_ADDRESSU:
@@ -1453,11 +1486,17 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawPrimitive(D3DPRIMITIVETYPE Primit
 	if (U2.Capture && U2Stream0 != nullptr && !U2Stream0->U2Shadow.empty() && (size_t)StartVertex * U2Stride0 < U2Stream0->U2Shadow.size())
 		U2CaptureDraw(PrimitiveType, PrimitiveCount, U2Stream0->U2Shadow.data() + (size_t)StartVertex * U2Stride0,
 			U2Stream0->U2Shadow.size() - (size_t)StartVertex * U2Stride0, U2Stride0, 0, nullptr, 0, false, 0);
-	const bool Shaded = U2Begin();
+	const unsigned PerfScale = U2PerfDrawScale();   // perf: "draw hooks", 1 draw in 8
+	bool Shaded;
+	{
+		U2PerfScope PerfHook(U2PerfC().Draw, PerfScale);
+		Shaded = U2Begin();
+	}
 	U2.LastDrawHR = ProxyInterface->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
 	if (U2.LightProbeFile && U2Stream0 != nullptr && !U2Stream0->U2Shadow.empty())
 		U2ProbeVB(ProxyInterface, U2Stream0->U2Shadow.data(), U2Stream0->U2Shadow.size(), U2Stride0, StartVertex,
 			PrimitiveType == D3DPT_TRIANGLELIST ? PrimitiveCount * 3 : PrimitiveCount + 2);
+	U2PerfScope PerfAfter(U2PerfC().Draw, PerfScale);   // (until the return: the layer's extra passes on this geometry)
 	U2After(Shaded);
 	if (U2GlossBegin())                             // gloss=: the same geometry again, added on top
 	{
@@ -1529,8 +1568,14 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawIndexedPrimitive(D3DPRIMITIVETYPE
 			fprintf(U2.LightProbeFile, "  decl%s | normal at %d, avg |n| %.3f over %u verts, stride %u\n", Decl, NormOff, Cnt ? Sum / Cnt : -1.0, Cnt, U2Stride0);
 		}
 	}
-	const bool Shaded = U2Begin();
+	const unsigned PerfScale = U2PerfDrawScale();   // perf: "draw hooks", 1 draw in 8
+	bool Shaded;
+	{
+		U2PerfScope PerfHook(U2PerfC().Draw, PerfScale);
+		Shaded = U2Begin();
+	}
 	U2.LastDrawHR = ProxyInterface->DrawIndexedPrimitive(PrimitiveType, CurrentBaseVertexIndex, MinIndex, NumVertices, StartIndex, PrimitiveCount);
+	U2PerfScope PerfAfter(U2PerfC().Draw, PerfScale);   // (until the return: the layer's extra passes on this geometry)
 	U2After(Shaded);
 	if (U2GlossBegin())                             // gloss=: the same geometry again, added on top
 	{
@@ -1576,9 +1621,15 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawPrimitiveUP(D3DPRIMITIVETYPE Prim
 	if (U2.Capture)
 		U2CaptureDraw(PrimitiveType, PrimitiveCount, static_cast<const BYTE *>(pVertexStreamZeroData), (size_t)(PrimitiveType == D3DPT_TRIANGLELIST ? PrimitiveCount * 3 : PrimitiveCount + 2) * VertexStreamZeroStride,
 			VertexStreamZeroStride, 0, nullptr, 0, false, 0);
-	const bool Shaded = U2Begin();
+	const unsigned PerfScale = U2PerfDrawScale();   // perf: "draw hooks", 1 draw in 8
+	bool Shaded;
+	{
+		U2PerfScope PerfHook(U2PerfC().Draw, PerfScale);
+		Shaded = U2Begin();
+	}
 	U2.LastDrawHR = ProxyInterface->DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride);
 	U2ProbeVerts(pVertexStreamZeroData, VertexStreamZeroStride, 0, PrimitiveType == D3DPT_TRIANGLELIST ? PrimitiveCount * 3 : PrimitiveCount + 2);
+	U2PerfScope PerfAfter(U2PerfC().Draw, PerfScale);   // (until the return: the layer's extra passes on this geometry)
 	U2After(Shaded);
 	if (U2GlossBegin())                             // gloss=: the same geometry again, added on top
 	{
@@ -1609,9 +1660,15 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawIndexedPrimitiveUP(D3DPRIMITIVETY
 		U2CaptureDraw(PrimitiveType, PrimitiveCount, static_cast<const BYTE *>(pVertexStreamZeroData), (size_t)(MinVertexIndex + NumVertexIndices) * VertexStreamZeroStride,
 			VertexStreamZeroStride, 0, static_cast<const BYTE *>(pIndexData), (size_t)(PrimitiveType == D3DPT_TRIANGLELIST ? PrimitiveCount * 3 : PrimitiveCount + 2) * (IndexDataFormat == D3DFMT_INDEX32 ? 4 : 2),
 			IndexDataFormat == D3DFMT_INDEX32, 0);
-	const bool Shaded = U2Begin();
+	const unsigned PerfScale = U2PerfDrawScale();   // perf: "draw hooks", 1 draw in 8
+	bool Shaded;
+	{
+		U2PerfScope PerfHook(U2PerfC().Draw, PerfScale);
+		Shaded = U2Begin();
+	}
 	U2.LastDrawHR = ProxyInterface->DrawIndexedPrimitiveUP(PrimitiveType, MinVertexIndex, NumVertexIndices, PrimitiveCount, pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride);
 	U2ProbeVerts(pVertexStreamZeroData, VertexStreamZeroStride, MinVertexIndex, NumVertexIndices);
+	U2PerfScope PerfAfter(U2PerfC().Draw, PerfScale);   // (until the return: the layer's extra passes on this geometry)
 	U2After(Shaded);
 	if (U2GlossBegin())                             // gloss=: the same geometry again, added on top
 	{

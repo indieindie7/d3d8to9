@@ -42,6 +42,7 @@
 #include <d3d9.h>
 #include <d3dcompiler.h>
 #include "crash.hpp"
+#include "perf.hpp"
 #include "imgui/imgui.h"
 #include <algorithm>
 #include <cmath>
@@ -463,7 +464,7 @@ public:
 		if (PickSys == nullptr && FAILED(D->CreateOffscreenPlainSurface(1, 1, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, &PickSys, nullptr)))
 			PickSys = nullptr;
 		D3DLOCKED_RECT L = {};
-		if (PickSys == nullptr || PickSmall == nullptr || FAILED(D->GetRenderTargetData(PickSmall, PickSys)) || FAILED(PickSys->LockRect(&L, nullptr, D3DLOCK_READONLY)))
+		if (PickSys == nullptr || PickSmall == nullptr || FAILED(U2PerfReadback(D, PickSmall, PickSys)) || FAILED(PickSys->LockRect(&L, nullptr, D3DLOCK_READONLY)))
 		{
 			PickMsg = "pick: the read failed";
 			Log("%s", PickMsg.c_str());

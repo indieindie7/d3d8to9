@@ -4,6 +4,7 @@
  */
 
 #include "d3d8to9.hpp"
+#include "perf.hpp"
 
 Direct3DSurface8::Direct3DSurface8(Direct3DDevice8 *Device, IDirect3DSurface9 *ProxyInterface) :
 	Device(Device), ProxyInterface(ProxyInterface)
@@ -91,6 +92,12 @@ HRESULT STDMETHODCALLTYPE Direct3DSurface8::GetDesc(D3DSURFACE_DESC8 *pDesc)
 }
 HRESULT STDMETHODCALLTYPE Direct3DSurface8::LockRect(D3DLOCKED_RECT *pLockedRect, const RECT *pRect, DWORD Flags)
 {
+	// perf: the game locking a render target or depth surface waits for the GPU ("game readback")
+	D3DSURFACE_DESC D = {};
+	const bool Read = SUCCEEDED(ProxyInterface->GetDesc(&D)) && (D.Usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)) != 0;
+	if (Read)
+		U2PerfC().GameReads++;
+	U2PerfScope PerfRead(U2PerfC().GameRead, Read ? 1u : 0u);
 	return ProxyInterface->LockRect(pLockedRect, pRect, Flags);
 }
 HRESULT STDMETHODCALLTYPE Direct3DSurface8::UnlockRect()

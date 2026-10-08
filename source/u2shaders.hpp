@@ -69,6 +69,7 @@
 #include <d3dcompiler.h>
 #include "fakefull.hpp"
 #include "crash.hpp"
+#include "perf.hpp"
 #include "texedit.hpp"
 #include "imgui/imgui.h"
 #include "imgui/imgui_impl_dx9.h"
@@ -1277,7 +1278,7 @@ public:
 		IDirect3DSurface9 *RT = nullptr, *Sys = nullptr;
 		if (SUCCEEDED(Tex->GetSurfaceLevel(0, &RT)) &&
 			SUCCEEDED(Dev->CreateOffscreenPlainSurface(D.Width, D.Height, D.Format, D3DPOOL_SYSTEMMEM, &Sys, nullptr)) &&
-			SUCCEEDED(Dev->GetRenderTargetData(RT, Sys)))
+			SUCCEEDED(U2PerfReadback(Dev, RT, Sys)))
 		{
 			D3DLOCKED_RECT L;
 			if (SUCCEEDED(Sys->LockRect(&L, nullptr, D3DLOCK_READONLY)))
@@ -1322,7 +1323,7 @@ public:
 		IDirect3DSurface9 *Sys = nullptr;
 		int n = -1;
 		if (SUCCEEDED(Dev->CreateOffscreenPlainSurface(D.Width, D.Height, D.Format, D3DPOOL_SYSTEMMEM, &Sys, nullptr)) &&
-			SUCCEEDED(Dev->GetRenderTargetData(RT, Sys)))
+			SUCCEEDED(U2PerfReadback(Dev, RT, Sys)))
 		{
 			D3DLOCKED_RECT L;
 			if (SUCCEEDED(Sys->LockRect(&L, nullptr, D3DLOCK_READONLY)))
@@ -4044,7 +4045,7 @@ public:
 		bool Ok = false;
 		HRESULT hr = Dev->CreateOffscreenPlainSurface(D.Width, D.Height, D.Format, D3DPOOL_SYSTEMMEM, &Sys, nullptr);
 		if (SUCCEEDED(hr))
-			hr = Dev->GetRenderTargetData(SkGrabRT, Sys);
+			hr = U2PerfReadback(Dev, SkGrabRT, Sys);
 		if (SUCCEEDED(hr))
 			hr = Sys->LockRect(&L, nullptr, D3DLOCK_READONLY);
 		std::vector<DWORD> Pix;
@@ -4612,7 +4613,7 @@ public:
 			Dev->SetRenderTarget(0, OldRT);
 			Dev->SetDepthStencilSurface(OldDS);
 			Dev->SetViewport(&OldVp);
-			hr = Dev->GetRenderTargetData(RT, Sys);
+			hr = U2PerfReadback(Dev, RT, Sys);
 		}
 		ImVec4 Cr(0, 0, (float)SkW, (float)SkH);
 		const bool Cropped = SkCropRect(Cr);
@@ -4875,7 +4876,7 @@ public:
 			Src = Plain;
 		D3DLOCKED_RECT L = {};
 		if (SUCCEEDED(Dev->CreateOffscreenPlainSurface(D.Width, D.Height, D.Format, D3DPOOL_SYSTEMMEM, &Sys, nullptr))
-			&& SUCCEEDED(Dev->GetRenderTargetData(Src, Sys)) && SUCCEEDED(Sys->LockRect(&L, nullptr, D3DLOCK_READONLY)))
+			&& SUCCEEDED(U2PerfReadback(Dev, Src, Sys)) && SUCCEEDED(Sys->LockRect(&L, nullptr, D3DLOCK_READONLY)))
 		{
 			FILE *F = nullptr;
 			if (!fopen_s(&F, Path.c_str(), "wb") && F)
@@ -4935,7 +4936,7 @@ public:
 		D3DLOCKED_RECT L = {};
 		HRESULT hr = Dev->CreateOffscreenPlainSurface(D.Width, D.Height, D.Format, D3DPOOL_SYSTEMMEM, &Sys, nullptr);
 		if (SUCCEEDED(hr))
-			hr = Dev->GetRenderTargetData(T, Sys);
+			hr = U2PerfReadback(Dev, T, Sys);
 		if (SUCCEEDED(hr))
 			hr = Sys->LockRect(&L, nullptr, D3DLOCK_READONLY);
 		if (SUCCEEDED(hr) && (D.Format == D3DFMT_A8R8G8B8 || D.Format == D3DFMT_X8R8G8B8))
@@ -5913,7 +5914,7 @@ public:
 				IDirect3DSurface9 *RT = nullptr, *Sys = nullptr;
 				if (SUCCEEDED(Tex->GetSurfaceLevel(0, &RT)) &&
 					SUCCEEDED(Dev->CreateOffscreenPlainSurface(Desc.Width, Desc.Height, Desc.Format, D3DPOOL_SYSTEMMEM, &Sys, nullptr)) &&
-					SUCCEEDED(Dev->GetRenderTargetData(RT, Sys)))
+					SUCCEEDED(U2PerfReadback(Dev, RT, Sys)))
 				{
 					D3DLOCKED_RECT L;
 					if (SUCCEEDED(Sys->LockRect(&L, nullptr, D3DLOCK_READONLY)))
@@ -6439,6 +6440,7 @@ public:
 
 	void RunPost(IDirect3DDevice9 *Dev)
 	{
+		U2PerfScope PerfPost(U2PerfC().Post);   // perf: "post passes" (bloom, gi, ssao, sss, smaa, lens)
 		PostDone = true;
 		IDirect3DPixelShader9 *Bright = Compile(Dev, PostBright), *Blur = Compile(Dev, PostBlur), *Final = Compile(Dev, PostFinal);
 		if (Bright == nullptr || Blur == nullptr || Final == nullptr)
@@ -6851,7 +6853,7 @@ public:
 			Dev->StretchRect(Multi, nullptr, Plain, nullptr, D3DTEXF_NONE);
 			int Mid = 0, Lit = 0;
 			D3DLOCKED_RECT L = {};
-			if (SUCCEEDED(Dev->GetRenderTargetData(Plain, Sys)) && SUCCEEDED(Sys->LockRect(&L, nullptr, D3DLOCK_READONLY)))
+			if (SUCCEEDED(U2PerfReadback(Dev, Plain, Sys)) && SUCCEEDED(Sys->LockRect(&L, nullptr, D3DLOCK_READONLY)))
 			{
 				for (int y = 0; y < 64; y++)
 					for (int x = 0; x < 64; x++)
@@ -8563,7 +8565,7 @@ public:
 		}
 		HRESULT hr = Dev->CreateOffscreenPlainSurface(D.Width, D.Height, D.Format, D3DPOOL_SYSTEMMEM, &Sys, nullptr);
 		if (SUCCEEDED(hr))
-			hr = Dev->GetRenderTargetData(Src, Sys);
+			hr = U2PerfReadback(Dev, Src, Sys);
 		D3DLOCKED_RECT L = {};
 		if (SUCCEEDED(hr))
 			hr = Sys->LockRect(&L, nullptr, D3DLOCK_READONLY);
