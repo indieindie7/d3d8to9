@@ -52,6 +52,7 @@ struct U2PerfCounters
 	unsigned long long EndFrame = 0, Post = 0, Draw = 0, Read = 0, GameRead = 0, State = 0;
 	unsigned long long Accounted = 0;     // every scope's whole time so far (a parent takes its children out)
 	unsigned Reads = 0, GameReads = 0;
+	char GameReadWhat[120] = {};           // what the game's last readback was (logged with the perf line)
 	unsigned Calls[4] = {}, Repeats[4] = {};
 	unsigned Gen = 1, Sample = 0, DrawSample = 0;
 	bool Recording = false;               // the game is recording a state block: its Sets don't reach the device
@@ -73,6 +74,16 @@ struct U2PerfCounters
 	}
 };
 // one instance for every file that includes this (C++14: no inline variables)
+// lagfix=1 (default on): Advent's ReduceMouseLag locks one back-buffer pixel read-only every frame, which
+// waits for the GPU to finish the whole frame (~3.6 ms/frame at 1080p). The lock is answered from a dummy
+// pixel instead, and Present keeps the CPU at most one frame ahead with an event query: the same low mouse
+// lag without stalling on the frame just submitted. lagfix=0: the game's own lock.
+inline int &U2LagFix()
+{
+	static int On = 1;
+	return On;
+}
+
 inline U2PerfCounters &U2PerfC()
 {
 	static U2PerfCounters C;
@@ -193,6 +204,12 @@ struct U2Perf
 		const double EndFrame = PerFrame(C.EndFrame), Post = PerFrame(C.Post), Draw = PerFrame(C.Draw), Read = PerFrame(C.Read);
 		sprintf_s(B, "perf: layer %.2f ms/frame (eof %.2f, post %.2f, draws %.2f), readback %.2f ms/frame (%u reads), game %.2f (%u)",
 			EndFrame + Post + Draw + Read, EndFrame, Post, Draw, Read, C.Reads, PerFrame(C.GameRead), C.GameReads);
+		if (C.GameReads > 0 && C.GameReadWhat[0])
+		{
+			char W[200];
+			sprintf_s(W, "perf: the game's readback: %s", C.GameReadWhat);
+			Message(W);
+		}
 		Message(B);
 		auto Pct = [&](int k) { return C.Calls[k] ? 100.0 * C.Repeats[k] / C.Calls[k] : 0.0; };
 		sprintf_s(B, "perf: state calls/frame rs %.0f (%.0f%% repeat), tss %.0f (%.0f%%), samp %.0f (%.0f%%), tex %.0f (%.0f%%), %.2f ms/frame",

@@ -373,6 +373,8 @@ public:
 private:
 	Direct3DDevice8 *const Device;
 	IDirect3DSurface9 *const ProxyInterface;
+	bool FakeLock = false;       // lagfix: the game's 1-pixel back-buffer read answered from FakePixel
+	DWORD FakePixel[4] = {};
 };
 
 class Direct3DVolume8 : public IDirect3DVolume8, public AddressLookupTableObject

@@ -329,6 +329,8 @@ public:
 			R.File = Name;
 			Rules.push_back(R);
 		}
+		else if (sscanf_s(Line, " lagfix=%u", &Hash) == 1)
+			U2LagFix() = Hash != 0;
 		else if (sscanf_s(Line, " aniso=%u", &Hash) == 1)
 			Aniso = Hash > 16 ? 16 : Hash;
 		else if (sscanf_s(Line, " stagelog=%u", &Hash) == 1)

@@ -95,12 +95,28 @@ HRESULT STDMETHODCALLTYPE Direct3DSurface8::LockRect(D3DLOCKED_RECT *pLockedRect
 	// perf: the game locking a render target or depth surface waits for the GPU ("game readback")
 	D3DSURFACE_DESC D = {};
 	const bool Read = SUCCEEDED(ProxyInterface->GetDesc(&D)) && (D.Usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)) != 0;
+	if (Read && U2LagFix() && (Flags & D3DLOCK_READONLY) && pRect != nullptr && pLockedRect != nullptr
+		&& pRect->right - pRect->left <= 2 && pRect->bottom - pRect->top <= 2)
+	{
+		FakeLock = true;
+		pLockedRect->pBits = FakePixel;
+		pLockedRect->Pitch = sizeof(FakePixel) / 2;
+		return D3D_OK;
+	}
 	if (Read)
+	{
 		U2PerfC().GameReads++;
+		sprintf_s(U2PerfC().GameReadWhat, "LockRect %ux%u fmt %u usage %lx pool %u flags %lx rect %ld,%ld-%ld,%ld", D.Width, D.Height, (unsigned)D.Format, (unsigned long)D.Usage, (unsigned)D.Pool, (unsigned long)Flags, pRect ? pRect->left : 0L, pRect ? pRect->top : 0L, pRect ? pRect->right : (long)D.Width, pRect ? pRect->bottom : (long)D.Height);
+	}
 	U2PerfScope PerfRead(U2PerfC().GameRead, Read ? 1u : 0u);
 	return ProxyInterface->LockRect(pLockedRect, pRect, Flags);
 }
 HRESULT STDMETHODCALLTYPE Direct3DSurface8::UnlockRect()
 {
+	if (FakeLock)
+	{
+		FakeLock = false;
+		return D3D_OK;
+	}
 	return ProxyInterface->UnlockRect();
 }

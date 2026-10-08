@@ -187,3 +187,15 @@ Pilot: Advent heavy fight, `fps_fight.ps1` in the scratchpad (two 30 s perf wind
   Surface locks are rare in UE2 (textures are locked through the texture interface).
 - Repeat counts are relative to the game's own last value, not to the device's: an upper bound
   for what a filter could drop, not exactly what it would drop.
+
+## Results (2026-10-08, Advent heavy-fight pilot, 1080p, vsync 60)
+
+| | before | after |
+|---|---|---|
+| the game's own readback (ReduceMouseLag: a 1x1 READONLY lock of the back buffer every frame) | 3.3-3.6 ms/frame | 0 (lagfix=1: dummy pixel + previous-frame event wait at Present, wait measured ~0) |
+| layer end-of-frame work in a fight (blood pool sim + run sheets, every frame) | 5.07 ms/frame | 1.11 ms/frame (pools and runs step at 30 Hz) |
+| game state calls (redundancy filter candidate) | 0.08 ms/frame | not filtered: not worth it |
+| aniso=16 (game asks 4x) | | ~1-2% sharper distant floor (Laplacian 257 -> 261); kept on, cost negligible |
+
+lagfix keeps mouse lag at about one frame (the CPU waits for the previous frame's GPU work at Present),
+instead of a full-frame stall each frame. lagfix=0 restores the game's own lock.

@@ -364,9 +364,15 @@ namespace U2Blood
 	inline void Step(IDirect3DDevice9 *Dev)
 	{
 		const DWORD now = GetTickCount();
-		float dt = LastMs ? (now - LastMs) / 1000.0f : 1 / 60.0f;
+		if (LastMs == 0)
+			LastMs = now - 33;
+		// 30 steps a second, not every frame: blood is slow, and the simulation plus a full upload per sheet
+		// every frame was most of the layer's end-of-frame time in fights (perf: eof ~5 ms)
+		if (now - LastMs < 30)
+			return;
+		float dt = (now - LastMs) / 1000.0f;
 		LastMs = now;
-		dt = fmaxf(1 / 120.0f, fminf(dt, 1 / 30.0f));
+		dt = fmaxf(1 / 120.0f, fminf(dt, 1 / 15.0f));
 		for (int k = 0; k < Count; k++)
 		{
 			Sheet &S = Slots[k];

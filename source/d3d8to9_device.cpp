@@ -12,6 +12,9 @@
 #include "u2shaders.hpp"
 #include "perf.hpp"
 static U2Perf Perf;   // frame times at Present -> U2Shaders.log (perf.hpp)
+static IDirect3DQuery9 *LagQuery[2] = {};   // lagfix (perf.hpp U2LagFix)
+static bool LagIssued[2] = {};
+static int LagIdx = 0;
 
 static U2Shaders U2;
 // blood.hpp logs through the layer's log, and the mod's native DLL reaches it by this export
@@ -248,6 +251,8 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::Reset(D3DPRESENT_PARAMETERS8 *pPresen
 	CurrentZBiasRenderState = 0;
 	U2PerfC().Forget();                  // perf: a Reset puts every state back to its default
 	U2.OnLost();
+	for (int q = 0; q < 2; q++)            // lagfix's event queries are DEFAULT pool
+		if (LagQuery[q] != nullptr) { LagQuery[q]->Release(); LagQuery[q] = nullptr; LagIssued[q] = false; }
 	TexEd().OnLost();                    // texedit: its render targets (bakes, pick target) are DEFAULT pool
 
 	const HRESULT deviceState = ProxyInterface->TestCooperativeLevel();
@@ -302,8 +307,30 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::Present(const RECT *pSourceRect, cons
 		U2.OnPresent(ProxyInterface);
 	}
 	Perf.OnPresent([](const char *Line) { U2.Message("%s", Line); });
+	// lagfix: wait for the previous frame (not this one) before presenting: the CPU stays at most one
+	// frame ahead (low mouse lag) without the game's full-frame stall (perf.hpp U2LagFix)
+	if (U2LagFix())
+	{
+		if (LagQuery[LagIdx ^ 1] != nullptr && LagIssued[LagIdx ^ 1])
+		{
+			U2PerfScope PerfWait(U2PerfC().GameRead, 0u);
+			while (LagQuery[LagIdx ^ 1]->GetData(nullptr, 0, D3DGETDATA_FLUSH) == S_FALSE)
+				SwitchToThread();
+		}
+	}
 	U2Crash::Where("the driver's Present");
 	const HRESULT Hr = ProxyInterface->Present(pSourceRect, pDestRect, hDestWindowOverride, nullptr);
+	if (U2LagFix())
+	{
+		if (LagQuery[LagIdx] == nullptr)
+			ProxyInterface->CreateQuery(D3DQUERYTYPE_EVENT, &LagQuery[LagIdx]);
+		if (LagQuery[LagIdx] != nullptr)
+		{
+			LagQuery[LagIdx]->Issue(D3DISSUE_END);
+			LagIssued[LagIdx] = true;
+		}
+		LagIdx ^= 1;
+	}
 	U2Crash::Where("the game's own code or draws (between frames)");
 	return Hr;
 }
@@ -589,7 +616,10 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::CopyRects(IDirect3DSurface8 *pSourceS
 			{
 				const bool Read = SourceDesc.Pool == D3DPOOL_DEFAULT;   // perf: "game readback"
 				if (Read)
+				{
 					U2PerfC().GameReads++;
+					sprintf_s(U2PerfC().GameReadWhat, "CopyRects %ux%u fmt %u -> pool %u fmt %u (%ld x %ld)", SourceDesc.Width, SourceDesc.Height, (unsigned)SourceDesc.Format, (unsigned)DestinationDesc.Pool, (unsigned)DestinationDesc.Format, SourceRect.right - SourceRect.left, SourceRect.bottom - SourceRect.top);
+				}
 				U2PerfScope PerfRead(U2PerfC().GameRead, Read ? 1u : 0u);
 				if (SUCCEEDED(D3DXLoadSurfaceFromSurface(pDestinationSurfaceImpl->GetProxyInterface(), nullptr, &DestinationRect, Source, nullptr, &SourceRect, D3DX_FILTER_NONE, 0)))
 				{

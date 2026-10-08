@@ -242,9 +242,13 @@ namespace U2Runs
 	inline void Step(IDirect3DDevice9 *Dev)
 	{
 		const DWORD now = GetTickCount();
-		float dt = LastMs ? (now - LastMs) / 1000.0f : 1 / 60.0f;
+		if (LastMs == 0)
+			LastMs = now - 33;
+		if (now - LastMs < 30)              // 30 steps a second (see blood.hpp Step)
+			return;
+		float dt = (now - LastMs) / 1000.0f;
 		LastMs = now;
-		dt = fmaxf(1 / 240.0f, fminf(dt, 1 / 20.0f));
+		dt = fmaxf(1 / 240.0f, fminf(dt, 1 / 15.0f));
 		for (int k = 0; k < Count; k++)
 		{
 			Sheet &S = Slots[k];
