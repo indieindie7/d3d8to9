@@ -77,14 +77,21 @@ float VNoise(float2 p)
 float4 main(float2 uv : TEXCOORD0, float2 uvm : TEXCOORD1, float4 diffuse : COLOR0) : COLOR
 {
 #if HEX
-	float4 t = HexTile(Layer, uv, CELL);
-	if (MACRO_AMT > 0)
+	// up close the texture is magnified (a texel covers several pixels) and no repeat can show: the
+	// game's own read there (hex blending of magnified texels only blurs and grains; Q30, 2026-10-08).
+	// Hex tiling fades in as texels shrink below ~1 per pixel.
+	float fp = max(length(ddx(uv)), length(ddy(uv))) / max(Info.z, 0.00001);   // texels per pixel
+	float hexw = saturate((fp - 0.35) / 0.65);
+	float4 t = tex2D(Layer, uv);
+	if (hexw > 0.001)
+		t = lerp(t, HexTile(Layer, uv, CELL), hexw);
+	if (MACRO_AMT > 0 && hexw > 0.001)
 	{
 		const float3 L = float3(0.3, 0.59, 0.11);
 		float mean = max(dot(tex2Dbias(Layer, float4(uv, 0, 12)).rgb, L), 0.02);
 		float far = dot(HexTile(Layer, uv * MACRO + 0.37, CELL).rgb, L);
-		t.rgb *= lerp(1, clamp(far / mean, 0.55, 1.6), MACRO_AMT);
-		t.rgb *= 1 + DRIFT_AMT * (2 * VNoise(uv * DRIFT_SCALE) - 1);
+		t.rgb *= lerp(1, clamp(far / mean, 0.55, 1.6), MACRO_AMT * hexw);
+		t.rgb *= 1 + DRIFT_AMT * hexw * (2 * VNoise(uv * DRIFT_SCALE) - 1);
 	}
 #else
 	float4 t = tex2D(Layer, uv);

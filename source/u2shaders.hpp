@@ -386,6 +386,7 @@ public:
 			if (!MapSkip(Line, InMap, MapHit))
 				ParseLine(Line, false);
 		fclose(F);
+		GmPanelFileEmpty(false);   // U2GM execs System\U2GMPanel.txt every poll: a missing file logs a warning each time
 		Message("U2Shaders: log %d, %u rule(s), %u replacement(s), pcss %d (%g %g %g %g), shadow tint %g %g %g", (int)Log, (unsigned)Rules.size(), (unsigned)Replacements.size(), (int)Pcss,
 			PcssParams[0], PcssParams[1], PcssParams[2], PcssParams[3], ShadowTint[0], ShadowTint[1], ShadowTint[2]);
 		if (Log || CharProbe || Capture)
@@ -3638,7 +3639,7 @@ public:
 				return;
 			}
 			GmSession = ((GetTickCount() ^ (GetCurrentProcessId() << 12)) & 0x3fffffff) | 1;
-			DeleteFileA((Dir + "U2GMPanel.txt").c_str());   // an old session's lines must not run
+			GmPanelFileEmpty(true);   // an old session's lines must not run (emptied, not deleted: U2GM execs it every poll)
 			Message("gm panel: on (F7), session %u, commands through %sU2GMPanel.txt", GmSession, Dir.c_str());
 		}
 		if (GmPanelMode == 0)
@@ -7731,6 +7732,18 @@ public:
 			Message("live: %s changed, compiled again at its next draw", F.c_str());
 	}
 
+	// System\U2GMPanel.txt present and empty (Truncate) or just present (created empty when missing)
+	void GmPanelFileEmpty(bool Truncate)
+	{
+		if (Dir.empty())
+			return;
+		const std::string Path = Dir + "U2GMPanel.txt";
+		if (!Truncate && GetFileAttributesA(Path.c_str()) != INVALID_FILE_ATTRIBUTES)
+			return;
+		FILE *F = nullptr;
+		if (!fopen_s(&F, Path.c_str(), "w") && F)
+			fclose(F);
+	}
 	// U2Shaders.ini without its runtime switches (pcss=, shotp=), plus the map its map= parts are read for
 	std::string LastRuleText;
 	std::string RuleText()
