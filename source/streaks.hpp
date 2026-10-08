@@ -25,6 +25,24 @@
 //
 // The shader takes two sources a pass; a draw gets a pass per two sources near it (by the draw's
 // world matrix when it has one, else all near the camera), at most four passes.
+//
+// hands=1: blood on the player's own hands, forearms and held weapon, with the same machinery: one
+// more pass (its own shader) over character draws near the player's hands. The mod (ModPlayerBlood)
+// sends up to six capsules every tick (hand, forearm, weapon, blade: a segment and a radius) and how
+// bloody they are. Pixels inside a capsule take blood in a smudged pattern worked out in the capsule's
+// own frame (along the bone, its side axis, around), so the pattern rides with the hand instead of
+// swimming through world space; the more blood, the more of the pattern fills in. Weights at the two
+// ends let the blood thin out up the forearm or along the barrel. It dries like the streaks.
+//   hand K ax ay az bx by bz r sx sy sz wa wb   capsule K (0-4): ends A and B (world), radius, a side
+//                                               axis (any length; hundredths are fine), the weights
+//                                               at A and B in percent
+//   hands amount kind wet seed n                amount and wet in percent (0-100), kind 1 red 2 purple,
+//                                               a pattern seed, capsules n.. unused ("hands 0": off)
+//   handclear                                   all off
+// Capsules the mod stops sending go after 2 s. U2Shaders.ini: hands=1 (default off); handsparams=
+// radius pattern opacity gain (multiplier on the capsules' radius, the pattern's scale in radians
+// per world unit (0.8: blotches a few units across), opacity, colour gain over the lit colour;
+// 1 0.8 0.9 2). Five capsules at most (the shader's constant registers are full).
 #pragma once
 #include <d3d9.h>
 #include <d3dcompiler.h>
@@ -70,17 +88,110 @@ namespace U2Streaks
 	static bool ToldFirst = false;
 	// state put back after a pass
 	static IDirect3DPixelShader9 *OldPS = nullptr;
-	static float OldConst[17][4];
+	static float OldConst[24][4];
+	static UINT OldConstN = 17;
 	static DWORD OldRS[7], OldTCI[2], OldTTF[2];
 	static D3DMATRIX OldTexMat[2];
 
+	// ---- hands=1 ----
+	const int MaxCaps = 5;            // (the shader's constant registers are full at five)
+	const float HandReach = 160.0f;        // a placed draw farther than this from the hands takes no hands pass
+	struct Capsule { bool Used; float A[3], B[3], R, S[3], WA, WB; };
+	static Capsule Cap[MaxCaps] = {};
+	static bool HandsOn = false;
+	static float HandsParams[4] = { 1.0f, 0.8f, 0.9f, 2.0f };     // handsparams= radius pattern opacity gain
+	static float HandAmount = 0, HandWet = 0;
+	static int HandKind = 1, HandCaps = 0;
+	static unsigned HandSeed = 0;
+	static DWORD HandGot = 0;
+	static IDirect3DPixelShader9 *HandPS = nullptr;
+	static bool HandBroken = false, HandDraw = false, ToldHands = false;
+	static int StreakPasses = 0;
+	static DWORD HandDraws = 0;
+
+	inline bool HandsLive()
+	{
+		return HandsOn && !HandBroken && HandAmount > 0.005f && HandCaps > 0 && GetTickCount() - HandGot < 2000;
+	}
+	// anything for the per-draw hook to do
+	inline bool Any() { return (On && Live > 0) || HandsLive(); }
+
 	inline bool Handles(const char *Word)
 	{
-		return !_stricmp(Word, "streak") || !_stricmp(Word, "streaks") || !_stricmp(Word, "streakclear");
+		return !_stricmp(Word, "streak") || !_stricmp(Word, "streaks") || !_stricmp(Word, "streakclear")
+			|| !_stricmp(Word, "hand") || !_stricmp(Word, "hands") || !_stricmp(Word, "handclear");
+	}
+
+	inline void CountCaps()
+	{
+		HandCaps = 0;
+		for (const Capsule &C : Cap)
+			HandCaps += C.Used ? 1 : 0;
+	}
+
+	inline int HandCommand(const char *Cmd)
+	{
+		char Word[16] = "";
+		sscanf_s(Cmd, "%15s", Word, (unsigned)sizeof(Word));
+		if (!_stricmp(Word, "handclear"))
+		{
+			for (Capsule &C : Cap) C.Used = false;
+			HandCaps = 0;
+			HandAmount = 0;
+			return HandsOn ? 1 : 0;
+		}
+		if (!_stricmp(Word, "hands"))
+		{
+			float Amount = 0, Wet = 0, Seed = 0;
+			int Kind = 1, N = MaxCaps;
+			const int Got = sscanf_s(Cmd, "%15s %f %d %f %f %d", Word, (unsigned)sizeof(Word), &Amount, &Kind, &Wet, &Seed, &N);
+			if (Got < 2)
+				return 0;
+			if (!ToldHands && Amount > 0)
+			{
+				ToldHands = true;
+				Say("hands: first blood on the player's hands (amount %.0f%%, %s, %d capsules)%s", Amount, Kind == 2 ? "purple" : "red", N, HandsOn ? "" : " - hands=0 in U2Shaders.ini, not drawn");
+			}
+			HandAmount = (Amount < 0 ? 0 : Amount > 100 ? 100 : Amount) / 100.0f;
+			HandWet = (Wet < 0 ? 0 : Wet > 100 ? 100 : Wet) / 100.0f;
+			HandKind = Kind == 2 ? 2 : 1;
+			HandSeed = (unsigned)Seed;
+			for (int i = (N < 0 ? 0 : N); i < MaxCaps; i++)
+				Cap[i].Used = false;
+			CountCaps();
+			HandGot = GetTickCount();
+			return HandsOn ? 1 : 0;
+		}
+		int K = -1;
+		float V[12] = {};
+		const int Got = sscanf_s(Cmd, "%15s %d %f %f %f %f %f %f %f %f %f %f %f %f", Word, (unsigned)sizeof(Word), &K,
+			&V[0], &V[1], &V[2], &V[3], &V[4], &V[5], &V[6], &V[7], &V[8], &V[9], &V[10], &V[11]);
+		if (Got < 9 || K < 0 || K >= MaxCaps)
+			return 0;
+		Capsule &C = Cap[K];
+		for (int c = 0; c < 3; c++) { C.A[c] = V[c]; C.B[c] = V[3 + c]; }
+		C.R = V[6] > 0.5f ? V[6] : 0.5f;
+		// the side axis: any length, but not along the capsule (the shader squares it up)
+		float S[3] = { V[7], V[8], V[9] };
+		if (Got < 12 || S[0] * S[0] + S[1] * S[1] + S[2] * S[2] < 1e-6f) { S[0] = 0; S[1] = 0; S[2] = 1; }
+		const float L = sqrtf(S[0] * S[0] + S[1] * S[1] + S[2] * S[2]);
+		for (int c = 0; c < 3; c++) C.S[c] = S[c] / L;
+		C.WA = Got >= 13 ? V[10] / 100.0f : 1.0f;
+		C.WB = Got >= 14 ? V[11] / 100.0f : C.WA;
+		C.Used = true;
+		CountCaps();
+		HandGot = GetTickCount();
+		return HandsOn ? 1 : 0;
 	}
 
 	inline int Command(const char *Cmd)
 	{
+		{
+			char First[16] = "";
+			sscanf_s(Cmd, "%15s", First, (unsigned)sizeof(First));
+			if (!_strnicmp(First, "hand", 4))
+				return HandCommand(Cmd);
+		}
 		char Word[16] = "";
 		int K = -1, Kind = 1;
 		float X = 0, Y = 0, Z = 0, Nx = 1, Ny = 0, Age = 0, Str = 1, Seed = 0;
@@ -120,6 +231,17 @@ namespace U2Streaks
 	{
 		U2Crash::Where("blood streaks");
 		NeedPick = true;
+		if (HandsOn)
+		{
+			static DWORD HandTold = 0;
+			const DWORD T = GetTickCount();
+			if (T - HandTold > 20000 && HandDraws > 0)
+			{
+				HandTold = T;
+				Say("hands: %d capsules, amount %.2f wet %.2f; %u character draws took the hands pass since the last note", HandCaps, HandAmount, HandWet, (unsigned)HandDraws);
+				HandDraws = 0;
+			}
+		}
 		if (Live == 0)
 			return;
 		const DWORD Now = GetTickCount();
@@ -144,9 +266,14 @@ namespace U2Streaks
 	// a character draw (lit, solid, depth-tested, textured, an FVF with normals: Advent's characters
 	// and their weapons; its level meshes come through vertex declarations), with sources near it?
 	// Fills DrawList. Offscreen draws (shadow maps) are the caller's to refuse.
+	inline bool CompileHands(IDirect3DDevice9 *Dev);
+
 	inline bool Wants(IDirect3DDevice9 *Dev, bool FixedFunction, bool Textured)
 	{
-		if (!On || Live == 0 || Broken || !FixedFunction || !Textured)
+		StreakPasses = 0;
+		HandDraw = false;
+		const bool Streaking = On && Live > 0 && !Broken, Handing = HandsLive();
+		if ((!Streaking && !Handing) || !FixedFunction || !Textured)
 			return false;
 		DWORD Lit = 0, Blend = 0, Z = 0, Test = 0, Fvf = 0;
 		Dev->GetRenderState(D3DRS_LIGHTING, &Lit);
@@ -160,57 +287,78 @@ namespace U2Streaks
 			return false;
 		D3DMATRIX V, Wm;
 		Dev->GetTransform(D3DTS_VIEW, &V);
-		if (NeedPick)
-		{
-			// the camera: the view's inverse translation
-			NeedPick = false;
-			NearCount = 0;
-			const float Cx = -(V._41 * V._11 + V._42 * V._12 + V._43 * V._13);
-			const float Cy = -(V._41 * V._21 + V._42 * V._22 + V._43 * V._23);
-			const float Cz = -(V._41 * V._31 + V._42 * V._32 + V._43 * V._33);
-			float D[MaxSources];
-			for (int i = 0; i < MaxSources; i++)
-			{
-				const Source &S = Src[i];
-				if (!S.Used || S.Str <= 0)
-					continue;
-				const float d = sqrtf((S.X - Cx) * (S.X - Cx) + (S.Y - Cy) * (S.Y - Cy) + (S.Z - Cz) * (S.Z - Cz));
-				if (d > ViewReach)
-					continue;
-				int k = NearCount++;
-				while (k > 0 && D[k - 1] > d) { D[k] = D[k - 1]; Near[k] = Near[k - 1]; k--; }
-				D[k] = d; Near[k] = i;
-			}
-		}
-		if (NearCount == 0)
-			return false;
 		// the draw's origin: a mesh drawn in its own space has its actor's place in the world matrix
 		Dev->GetTransform(D3DTS_WORLD, &Wm);
 		const bool Placed = fabsf(Wm._41) + fabsf(Wm._42) + fabsf(Wm._43) > 0.01f;
-		DrawCount = 0;
-		for (int k = 0; k < NearCount; k++)
+		if (Handing)
 		{
-			const Source &S = Src[Near[k]];
-			if (Placed)
+			// the hands pass: a draw near the capsules (the player, the gun, the blade; a body the
+			// fist is in), or any draw that isn't placed (the shader keeps to the capsules)
+			HandDraw = !Placed;
+			for (int i = 0; i < MaxCaps && !HandDraw; i++)
 			{
-				const float dx = S.X - Wm._41, dy = S.Y - Wm._42, dz = S.Z - Wm._43;
-				if (dx * dx + dy * dy + dz * dz > DrawReach * DrawReach)
+				const Capsule &C = Cap[i];
+				if (!C.Used)
 					continue;
+				const float dx = C.A[0] - Wm._41, dy = C.A[1] - Wm._42, dz = C.A[2] - Wm._43;
+				HandDraw = dx * dx + dy * dy + dz * dz < HandReach * HandReach;
 			}
-			DrawList[DrawCount++] = Near[k];
+			if (HandDraw && HandPS == nullptr && !CompileHands(Dev))
+				HandDraw = false;
+			if (HandDraw)
+				HandDraws++;
 		}
-		if (DrawCount > 4 * PerPass)
-			DrawCount = 4 * PerPass;
-		if (DrawCount == 0)
-			return false;
-		if (!ToldFirst)
+		if (Streaking)
 		{
-			ToldFirst = true;
-			Say("streaks: first character draw with sources (fvf %x, world origin %.0f %.0f %.0f%s, %d of %d sources)",
-				(unsigned)Fvf, Wm._41, Wm._42, Wm._43, Placed ? "" : ": not placed, every near source taken", DrawCount, NearCount);
+			if (NeedPick)
+			{
+				// the camera: the view's inverse translation
+				NeedPick = false;
+				NearCount = 0;
+				const float Cx = -(V._41 * V._11 + V._42 * V._12 + V._43 * V._13);
+				const float Cy = -(V._41 * V._21 + V._42 * V._22 + V._43 * V._23);
+				const float Cz = -(V._41 * V._31 + V._42 * V._32 + V._43 * V._33);
+				float D[MaxSources];
+				for (int i = 0; i < MaxSources; i++)
+				{
+					const Source &S = Src[i];
+					if (!S.Used || S.Str <= 0)
+						continue;
+					const float d = sqrtf((S.X - Cx) * (S.X - Cx) + (S.Y - Cy) * (S.Y - Cy) + (S.Z - Cz) * (S.Z - Cz));
+					if (d > ViewReach)
+						continue;
+					int k = NearCount++;
+					while (k > 0 && D[k - 1] > d) { D[k] = D[k - 1]; Near[k] = Near[k - 1]; k--; }
+					D[k] = d; Near[k] = i;
+				}
+			}
+			DrawCount = 0;
+			for (int k = 0; k < NearCount; k++)
+			{
+				const Source &S = Src[Near[k]];
+				if (Placed)
+				{
+					const float dx = S.X - Wm._41, dy = S.Y - Wm._42, dz = S.Z - Wm._43;
+					if (dx * dx + dy * dy + dz * dz > DrawReach * DrawReach)
+						continue;
+				}
+				DrawList[DrawCount++] = Near[k];
+			}
+			if (DrawCount > 4 * PerPass)
+				DrawCount = 4 * PerPass;
+			if (DrawCount > 0 && !ToldFirst)
+			{
+				ToldFirst = true;
+				Say("streaks: first character draw with sources (fvf %x, world origin %.0f %.0f %.0f%s, %d of %d sources)",
+					(unsigned)Fvf, Wm._41, Wm._42, Wm._43, Placed ? "" : ": not placed, every near source taken", DrawCount, NearCount);
+			}
+			if (DrawCount > 0 && (PS != nullptr || Compile(Dev)))
+			{
+				StreakPasses = (DrawCount + PerPass - 1) / PerPass;
+				Draws++;
+			}
 		}
-		Draws++;
-		return PS != nullptr || Compile(Dev);
+		return StreakPasses > 0 || HandDraw;
 	}
 
 	inline float Rand(unsigned &R) { R = R * 1664525u + 1013904223u; return (R >> 8) / 16777216.0f; }
@@ -253,18 +401,23 @@ namespace U2Streaks
 		}
 	}
 
+	inline void FillHands(float (*C)[4]);
+
 	// before pass Pass of the draw Wants took: false = no more passes
 	inline bool Begin(IDirect3DDevice9 *Dev, int Pass)
 	{
-		if (Pass * PerPass >= DrawCount || PS == nullptr)
+		// the streak passes first, then the hands pass
+		const bool Hands = Pass == StreakPasses && HandDraw && HandPS != nullptr;
+		if (!Hands && (Pass >= StreakPasses || Pass * PerPass >= DrawCount || PS == nullptr))
 			return false;
+		OldConstN = Hands ? 23 : 17;
 		static const D3DRENDERSTATETYPE RS[7] = { D3DRS_ALPHABLENDENABLE, D3DRS_SRCBLEND, D3DRS_DESTBLEND, D3DRS_BLENDOP, D3DRS_ZWRITEENABLE, D3DRS_FOGENABLE, D3DRS_SEPARATEALPHABLENDENABLE };
 		for (int i = 0; i < 7; i++)
 			Dev->GetRenderState(RS[i], &OldRS[i]);
 		Dev->GetPixelShader(&OldPS);
-		Dev->GetPixelShaderConstantF(0, OldConst[0], 17);
+		Dev->GetPixelShaderConstantF(0, OldConst[0], OldConstN);
 
-		float C[17][4] = {};
+		float C[24][4] = {};
 		D3DMATRIX V;
 		Dev->GetTransform(D3DTS_VIEW, &V);
 		// camera -> world: the transpose of the view's rotation, and the camera's place
@@ -291,13 +444,16 @@ namespace U2Streaks
 		memcpy(&C[5][1], &FS, 4); memcpy(&C[5][2], &FE, 4); memcpy(&C[5][3], &FD, 4);
 		for (int c = 0; c < 3; c++)
 			C[6][c] = V.m[2][c];                 // Unreal's up (world Z) in camera space
-		for (int k = 0; k < PerPass; k++)
-		{
-			const int n = Pass * PerPass + k;
-			if (n < DrawCount)
-				Fill(Src[DrawList[n]], C[7 + 5 * k]);   // (an unused one stays all zero: no splat, no rivulets)
-		}
-		Dev->SetPixelShaderConstantF(0, C[0], 17);
+		if (Hands)
+			FillHands(C);
+		else
+			for (int k = 0; k < PerPass; k++)
+			{
+				const int n = Pass * PerPass + k;
+				if (n < DrawCount)
+					Fill(Src[DrawList[n]], C[7 + 5 * k]);   // (an unused one stays all zero: no splat, no rivulets)
+			}
+		Dev->SetPixelShaderConstantF(0, C[0], OldConstN);
 
 		// camera-space position and normal from stages 0 and 1 (the shader samples no texture)
 		static const D3DMATRIX Identity = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
@@ -318,7 +474,7 @@ namespace U2Streaks
 		Dev->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
 		Dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
 		Dev->SetRenderState(D3DRS_FOGENABLE, FALSE);    // the shader fogs it
-		Dev->SetPixelShader(PS);
+		Dev->SetPixelShader(Hands ? HandPS : PS);
 		Passes++;
 		return true;
 	}
@@ -330,7 +486,7 @@ namespace U2Streaks
 			Dev->SetRenderState(RS[i], OldRS[i]);
 		Dev->SetPixelShader(OldPS);
 		if (OldPS) { OldPS->Release(); OldPS = nullptr; }
-		Dev->SetPixelShaderConstantF(0, OldConst[0], 17);
+		Dev->SetPixelShaderConstantF(0, OldConst[0], OldConstN);
 		for (DWORD s = 0; s < 2; s++)
 		{
 			Dev->SetTextureStageState(s, D3DTSS_TEXCOORDINDEX, OldTCI[s]);
@@ -413,8 +569,113 @@ namespace U2Streaks
 		return PS != nullptr;
 	}
 
+	// ---- hands=1: the hands pass's registers and shader ----
+	// c0-c3 camera -> world (w: gloss, opacity, -, gain), c4 amount wet pattern phase, c5 shape
+	// numbers (edge sharpness, stretch along the bone, pattern amplitude, fill range), c6 up (camera
+	// space; w: the fill's threshold at no blood), c7 colour and radius multiplier, c8-c22 five
+	// capsules of three registers: (A, radius) (B, weight at B) (side axis, weight at A). No fog:
+	// the player's hands are near the camera. (The shader's 32 constant registers are all in use:
+	// 23 here and 9 of its own literals.)
+	inline void FillHands(float (*C)[4])
+	{
+		static const float Fresh[2][3] = { { 0.50f, 0.03f, 0.03f }, { 0.32f, 0.06f, 0.42f } };
+		static const float Dried[2][3] = { { 0.17f, 0.045f, 0.03f }, { 0.12f, 0.035f, 0.14f } };
+		const int K = HandKind == 2 ? 1 : 0;
+		C[1][3] = HandsParams[2];
+		C[3][3] = HandsParams[3];
+		C[4][0] = HandAmount; C[4][1] = HandWet; C[4][2] = HandsParams[1] > 0.001f ? HandsParams[1] : 0.001f;
+		C[4][3] = (float)(HandSeed % 1000u) * 0.37f;
+		for (int c = 0; c < 3; c++)
+			C[7][c] = Dried[K][c] + (Fresh[K][c] - Dried[K][c]) * HandWet;
+		C[7][3] = HandsParams[0] > 0.05f ? HandsParams[0] : 0.05f;
+		C[5][0] = 3.3f; C[5][1] = 0.45f; C[5][2] = 1.0f / 6.0f; C[5][3] = 0.62f;
+		C[6][3] = 0.78f;
+		for (int i = 0; i < MaxCaps; i++)
+		{
+			float *R = C[8 + 3 * i];
+			const Capsule &P = Cap[i];
+			if (!P.Used)
+				continue;                            // (all zero: radius 0, the shader skips it)
+			R[0] = P.A[0]; R[1] = P.A[1]; R[2] = P.A[2]; R[3] = P.R;
+			R[4] = P.B[0]; R[5] = P.B[1]; R[6] = P.B[2]; R[7] = P.WB;
+			R[8] = P.S[0]; R[9] = P.S[1]; R[10] = P.S[2]; R[11] = P.WA;
+		}
+	}
+
+	// the hands shader: the capsule the pixel is deepest in gives the frame the pattern is read in
+	// (the capsule's radius doubles as its pattern's phase); the pattern is three warped crossing
+	// waves at two scales, stretched along the bone (smudges), and the amount (times the capsule's
+	// weight there) sets how much of it fills in
+	static const char HandSource_[] =
+		"float4 C[23] : register(c0);\n"
+		"float Wavy(float3 p)\n"
+		"{\n"
+		"	return sin(p.x + sin(p.y * 1.7) * 1.5) + sin(p.y + sin(p.z * 1.7) * 1.5) + sin(p.z + sin(p.x * 1.7) * 1.5);\n"
+		"}\n"
+		"float4 main(float4 Lit : COLOR0, float3 P : TEXCOORD0, float3 Nc : TEXCOORD1) : COLOR\n"
+		"{\n"
+		"	float3 W = P.x * C[0].xyz + P.y * C[1].xyz + P.z * C[2].xyz + C[3].xyz;\n"
+		"	float Best = 0, Wt = 0;\n"
+		"	float3 Q = 0;\n"
+		"	[unroll] for (int i = 0; i < 5; i++)\n"
+		"	{\n"
+		"		float4 A = C[8 + 3 * i], B = C[9 + 3 * i], S = C[10 + 3 * i];\n"
+		"		float3 Ax = B.xyz - A.xyz;\n"
+		"		float Ln = length(Ax) + 0.01;\n"
+		"		float3 U = Ax / Ln;\n"
+		"		float3 D = W - A.xyz;\n"
+		"		float t = dot(D, U);\n"
+		"		float k = saturate(t / Ln);\n"
+		"		float R = A.w * C[7].w;\n"
+		"		float Inside = saturate((R - length(D - U * (k * Ln))) * C[5].x / R);\n"
+		"		float3 Sd = normalize(S.xyz - U * dot(S.xyz, U) + 0.001);\n"
+		"		float3 q = float3(t * C[5].y, dot(D, Sd), dot(D, cross(U, Sd))) * C[4].z + (C[4].w + A.w);\n"
+		"		if (Inside > Best)\n"
+		"		{\n"
+		"			Best = Inside;\n"
+		"			Q = q;\n"
+		"			Wt = lerp(S.w, B.w, k);\n"
+		"		}\n"
+		"	}\n"
+		"	clip(Best - 0.004);\n"
+		"	float n = (Wavy(Q) * 0.65 + Wavy(Q.yzx * 2.7) * 0.35) * C[5].z + 0.5;\n"
+		"	float Th = C[6].w - C[5].w * C[4].x * Wt;\n"
+		"	float Cov = Best * smoothstep(Th - 0.06, Th + 0.06, n);\n"
+		"	clip(Cov - 0.004);\n"
+		"	float3 N = normalize(Nc);\n"
+		"	float3 Hh = normalize(normalize(-P) + C[6].xyz);\n"
+		"	float Spec = pow(saturate(dot(N, Hh)), 32) * C[4].y * C[0].w * (Lit.g + 0.15);\n"
+		"	float3 Rgb = C[7].rgb * (0.8 + 0.4 * saturate((n - Th) * 4)) * Lit.rgb * C[3].w + Spec;\n"
+		"	float K = Cov * C[1].w * (0.75 + 0.25 * C[4].y);\n"
+		"	return float4(Rgb * K, 1 - K);\n"
+		"}\n";
+
+	inline bool CompileHands(IDirect3DDevice9 *Dev)
+	{
+		if (HandPS != nullptr)
+			return true;
+		if (HandBroken)
+			return false;
+		static const char *Profiles[2] = { "ps_2_a", "ps_2_b" };
+		for (int p = 0; p < 2 && HandPS == nullptr; p++)
+		{
+			ID3DBlob *Code = nullptr, *Err = nullptr;
+			const HRESULT hr = D3DCompile(HandSource_, sizeof(HandSource_) - 1, "hands", nullptr, nullptr, "main", Profiles[p], 0, 0, &Code, &Err);
+			if (SUCCEEDED(hr) && Code != nullptr && SUCCEEDED(Dev->CreatePixelShader((const DWORD *)Code->GetBufferPointer(), &HandPS)))
+				Say("hands: shader ready (%s)", Profiles[p]);
+			else
+				Say("hands: %s: %s", Profiles[p], Err ? (const char *)Err->GetBufferPointer() : "no shader");
+			if (Code) Code->Release();
+			if (Err) Err->Release();
+		}
+		if (HandPS == nullptr)
+			HandBroken = true;
+		return HandPS != nullptr;
+	}
+
 	inline void Release()
 	{
 		if (PS) { PS->Release(); PS = nullptr; }
+		if (HandPS) { HandPS->Release(); HandPS = nullptr; }
 	}
 }

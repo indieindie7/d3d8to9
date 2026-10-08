@@ -65,6 +65,7 @@
 #include "runs.hpp"
 #include "streaks.hpp"
 #include "strings.hpp"
+#include "lens.hpp"
 #include <d3dcompiler.h>
 #include "fakefull.hpp"
 #include "crash.hpp"
@@ -231,6 +232,16 @@ public:
 			;
 		else if (sscanf_s(Line, " streaks=%u", &Hash) == 1)
 			U2Streaks::On = Hash != 0;        // blood running down characters (streaks.hpp)
+		else if (sscanf_s(Line, " handsparams=%f %f %f %f", &U2Streaks::HandsParams[0], &U2Streaks::HandsParams[1], &U2Streaks::HandsParams[2], &U2Streaks::HandsParams[3]) >= 1)
+			;
+		else if (sscanf_s(Line, " hands=%u", &Hash) == 1)
+			U2Streaks::HandsOn = Hash != 0;   // blood on the player's hands and weapon (streaks.hpp)
+		else if (sscanf_s(Line, " lensparams=%f %f %f %f", &U2Lens::Params[0], &U2Lens::Params[1], &U2Lens::Params[2], &U2Lens::Params[3]) >= 1)
+			;
+		else if (sscanf_s(Line, " lensfx=%f %f %f %f", &U2Lens::Fx[0], &U2Lens::Fx[1], &U2Lens::Fx[2], &U2Lens::Fx[3]) >= 1)
+			;
+		else if (sscanf_s(Line, " lens=%u", &Hash) == 1)
+			U2Lens::On = Hash != 0;           // blood drops on the lens (lens.hpp; needs post=1)
 		else if (sscanf_s(Line, " stringparams=%f %f %f %f", &U2Strings::Params[0], &U2Strings::Params[1], &U2Strings::Params[2], &U2Strings::Params[3]) >= 1)
 			;
 		else if (sscanf_s(Line, " stringfx=%f %f %f %f", &U2Strings::Fx[0], &U2Strings::Fx[1], &U2Strings::Fx[2], &U2Strings::Fx[3]) >= 1)
@@ -610,6 +621,10 @@ public:
 			U2Streaks::Compile(Dev);   // the body-streak shader (first wound was a 130 ms hitch)
 		if (U2Strings::On)
 			U2Strings::Compile(Dev);   // and the goo strings'
+		if (U2Streaks::HandsOn)
+			U2Streaks::CompileHands(Dev);   // the hands pass's
+		if (U2Lens::On)
+			U2Lens::Compile(Dev);      // and the lens drops'
 		QueryPerformanceCounter(&T1);
 		QueryPerformanceFrequency(&Fq);
 		Message("shaders: %u rule shader file(s) compiled at load in %.0f ms", n, (T1.QuadPart - T0.QuadPart) * 1000.0 / Fq.QuadPart);
@@ -6235,6 +6250,8 @@ public:
 		if (!rhw && !ortho)
 		{
 			Saw3D = true;
+			if (U2Lens::WantsView() && !programmable && P._34 == 1.0f && P._44 == 0.0f)
+				U2Lens::SeeView(Dev, P);      // lens=1: a blood spot waits to be judged against the camera
 			return;
 		}
 		if (PostTrace > 0)
@@ -6400,6 +6417,23 @@ public:
 		}
 	}
 
+	// lens=1 (lens.hpp): blood drops on the lens over the finished frame, right after the final
+	// pass (the frame copied again, the drops blended over it); the state is RunPost's
+	void RunLens(IDirect3DDevice9 *Dev)
+	{
+		U2Lens::Resolve();
+		if (!U2Lens::Active() || U2Lens::Live == 0)
+			return;
+		if (!CopyScene(Dev, true) || SceneTex == nullptr)
+			return;
+		if (U2Lens::Begin(Dev, SceneTex, SceneW, SceneH))
+		{
+			Dev->SetTexture(2, nullptr);
+			Quad(Dev, SceneW, SceneH);
+			U2Lens::End(Dev);
+		}
+	}
+
 	void RunPost(IDirect3DDevice9 *Dev)
 	{
 		PostDone = true;
@@ -6539,6 +6573,7 @@ public:
 			if (Debug)
 				PostLog(Dev, "before the final pass (stage 0 the copy, stage 1 the bloom)");
 			Quad(Dev, SceneW, SceneH);
+			RunLens(Dev);
 		}
 
 		Saved.Restore(Dev);
@@ -9038,8 +9073,10 @@ public:
 			U2Blood::Step(Dev);
 		if (U2Runs::Count > 0)
 			U2Runs::Step(Dev);
-		if (U2Streaks::On)
+		if (U2Streaks::On || U2Streaks::HandsOn)
 			U2Streaks::NewFrame();             // (marks itself for crash reports: "blood streaks")
+		if (U2Lens::On)
+			U2Lens::NewFrame();                // lens drops age and slide ("lens blood")
 		if (U2Strings::On)
 		{
 			// a frame without a HUD draw: the goo strings now (before the post chain's own fallback
@@ -9185,6 +9222,7 @@ public:
 		OnLost();
 		U2Strings::Release();                    // its pixel shader belongs to this device
 		U2Streaks::Release();                    // the same for the body-streak shader
+		U2Lens::Release();                       // and the lens drops'
 		for (auto &It : PsCache)                 // the compile cache's shaders too (and warm again on the next device)
 			if (It.second != nullptr)
 				It.second->Release();

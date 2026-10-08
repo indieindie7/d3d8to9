@@ -16,10 +16,11 @@ static U2Perf Perf;   // frame times at Present -> U2Shaders.log (perf.hpp)
 static U2Shaders U2;
 // blood.hpp logs through the layer's log, and the mod's native DLL reaches it by this export
 static void U2BloodLog(const char *S) { U2.Message("%s", S); }
-static int U2BloodLogSet = (U2Blood::Log = U2BloodLog, U2Runs::Log = U2BloodLog, U2Streaks::Log = U2BloodLog, U2Strings::Log = U2BloodLog, 0);
+static int U2BloodLogSet = (U2Blood::Log = U2BloodLog, U2Runs::Log = U2BloodLog, U2Streaks::Log = U2BloodLog, U2Strings::Log = U2BloodLog, U2Lens::Log = U2BloodLog, 0);
 // the mod's blood commands: floor pools (blood.hpp), wall runs (runs.hpp: run, drip, rstop) and
 // streaks down characters (streaks.hpp: streak, streaks, streakclear) and goo strings between body
-// parts (strings.hpp: string, stringoff, stringclear)
+// parts (strings.hpp: string, stringoff, stringclear); blood on the player's hands and weapon
+// (streaks.hpp: hand, hands, handclear) and drops on the lens (lens.hpp: lens, lensat, lensclear)
 extern "C" __declspec(dllexport) int __cdecl U2BloodCommand(const char *Cmd)
 {
 	char Word[16] = "";
@@ -28,6 +29,8 @@ extern "C" __declspec(dllexport) int __cdecl U2BloodCommand(const char *Cmd)
 		return U2Streaks::Command(Cmd);
 	if (U2Strings::Handles(Word))
 		return U2Strings::Command(Cmd);
+	if (U2Lens::Handles(Word))
+		return U2Lens::Command(Cmd);
 	return U2Runs::Handles(Word) ? U2Runs::Command(Cmd) : U2Blood::Command(Cmd);
 }
 // a shotp from outside (AdventNative's "Capture"): the next presented frame saved as System\ShotP#####.bmp;
@@ -1373,7 +1376,7 @@ bool Direct3DDevice8::U2MaskBegin(UINT Prims)
 }
 bool Direct3DDevice8::U2StreakBegin(int Pass)
 {
-	if (!U2Streaks::On || U2Streaks::Live == 0)
+	if (!U2Streaks::Any())
 		return false;
 	bool FixedFunction = CurrentVertexShaderHandle == 0;
 	if (!FixedFunction)
