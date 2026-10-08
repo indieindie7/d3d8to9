@@ -1425,7 +1425,9 @@ bool Direct3DDevice8::U2Begin()
 		T0->Release();
 		return false;
 	}
-	return U2.Begin(ProxyInterface, U2Stage0->GetProxyInterface(), U2Stage0->U2Hash, FixedFunction);
+	if (U2.Begin(ProxyInterface, U2Stage0->GetProxyInterface(), U2Stage0->U2Hash, FixedFunction))
+		return true;
+	return U2.SoftBegin(ProxyInterface, FixedFunction, true);   // soft=1: sprites fade into what they touch
 }
 // lmcapture=: hands a draw's vertices (from the buffers' copies) to U2Shaders::CaptureDraw
 void Direct3DDevice8::U2CaptureDraw(D3DPRIMITIVETYPE Type, UINT PrimCount, const BYTE *Verts, size_t VertBytes, UINT Stride, INT BaseVertex,
@@ -1463,6 +1465,15 @@ bool Direct3DDevice8::U2GlossBegin()
 	if (!FixedFunction)
 		FixedFunction = reinterpret_cast<VertexShaderInfo *>(CurrentVertexShaderHandle << 1)->Shader == nullptr;
 	return U2.GlossBegin(ProxyInterface, U2Stage0->GetProxyInterface(), U2Stage0->U2Hash, FixedFunction);
+}
+bool Direct3DDevice8::U2SheenBegin()
+{
+	if (U2.SheenRules.empty() || U2Stage0 == nullptr)
+		return false;
+	bool FixedFunction = CurrentVertexShaderHandle == 0;
+	if (!FixedFunction)
+		FixedFunction = reinterpret_cast<VertexShaderInfo *>(CurrentVertexShaderHandle << 1)->Shader == nullptr;
+	return U2.SheenBegin(ProxyInterface, U2Stage0->U2Hash, FixedFunction);
 }
 void Direct3DDevice8::U2After(bool Shaded)
 {
@@ -1532,6 +1543,11 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawPrimitive(D3DPRIMITIVETYPE Primit
 	{
 		ProxyInterface->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
 		U2.GlossEnd(ProxyInterface);
+	}
+	if (U2SheenBegin())                             // sheen=: highlights added over a solid surface
+	{
+		ProxyInterface->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
+		U2.SheenEnd(ProxyInterface);
 	}
 	for (int Pass = 0; U2StreakBegin(Pass); Pass++)   // streaks=1: blood running down characters (a pass per two sources)
 	{
@@ -1612,6 +1628,11 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawIndexedPrimitive(D3DPRIMITIVETYPE
 		ProxyInterface->DrawIndexedPrimitive(PrimitiveType, CurrentBaseVertexIndex, MinIndex, NumVertices, StartIndex, PrimitiveCount);
 		U2.GlossEnd(ProxyInterface);
 	}
+	if (U2SheenBegin())                             // sheen=: highlights added over a solid surface
+	{
+		ProxyInterface->DrawIndexedPrimitive(PrimitiveType, CurrentBaseVertexIndex, MinIndex, NumVertices, StartIndex, PrimitiveCount);
+		U2.SheenEnd(ProxyInterface);
+	}
 	for (int Pass = 0; U2StreakBegin(Pass); Pass++)   // streaks=1: blood running down characters (a pass per two sources)
 	{
 		ProxyInterface->DrawIndexedPrimitive(PrimitiveType, CurrentBaseVertexIndex, MinIndex, NumVertices, StartIndex, PrimitiveCount);
@@ -1666,6 +1687,11 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawPrimitiveUP(D3DPRIMITIVETYPE Prim
 		ProxyInterface->DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride);
 		U2.GlossEnd(ProxyInterface);
 	}
+	if (U2SheenBegin())                             // sheen=: highlights added over a solid surface
+	{
+		ProxyInterface->DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride);
+		U2.SheenEnd(ProxyInterface);
+	}
 	for (int Pass = 0; U2StreakBegin(Pass); Pass++)   // streaks=1: blood running down characters (a pass per two sources)
 	{
 		ProxyInterface->DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride);
@@ -1704,6 +1730,11 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawIndexedPrimitiveUP(D3DPRIMITIVETY
 	{
 		ProxyInterface->DrawIndexedPrimitiveUP(PrimitiveType, MinVertexIndex, NumVertexIndices, PrimitiveCount, pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride);
 		U2.GlossEnd(ProxyInterface);
+	}
+	if (U2SheenBegin())                             // sheen=: highlights added over a solid surface
+	{
+		ProxyInterface->DrawIndexedPrimitiveUP(PrimitiveType, MinVertexIndex, NumVertexIndices, PrimitiveCount, pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride);
+		U2.SheenEnd(ProxyInterface);
 	}
 	for (int Pass = 0; U2StreakBegin(Pass); Pass++)   // streaks=1: blood running down characters (a pass per two sources)
 	{

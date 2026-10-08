@@ -173,6 +173,7 @@ private:
 	bool U2Begin();
 	void U2After(bool Shaded);
 	bool U2GlossBegin();
+	bool U2SheenBegin();
 	bool U2StreakBegin(int Pass);
 	bool U2MaskBegin(UINT Prims);
 	DWORD U2Swapped = 0;

@@ -225,6 +225,22 @@ public:
 		}
 		else if (sscanf_s(Line, " glossfx=%f %f %f %f", &GlossFx[0], &GlossFx[1], &GlossFx[2], &GlossFx[3]) >= 1)
 			;
+		else if (strncmp(Line + strspn(Line, " \t"), "sheen=", 6) == 0)
+		{
+			U2Rule R;
+			float L[3] = { 0, 0, 0 };
+			if (sscanf_s(Line, " sheen=%x %255s %f %f %f", &Hash, Name, (unsigned)sizeof(Name), &L[0], &L[1], &L[2]) >= 2)
+			{
+				R.Hash = Hash;
+				R.File = Name;
+				R.Levels[0] = L[0]; R.Levels[1] = L[1]; R.Levels[2] = L[2];
+				SheenRules.push_back(R);
+			}
+		}
+		else if (sscanf_s(Line, " sheenfx=%f %f %f %f", &SheenFx[0], &SheenFx[1], &SheenFx[2], &SheenFx[3]) >= 1)
+			;
+		else if (sscanf_s(Line, " sheenenv=%f %f %f %f", &SheenEnv[0], &SheenEnv[1], &SheenEnv[2], &SheenEnv[3]) >= 1)
+			;
 		else if (sscanf_s(Line, " glossenv=%f %f %f %f", &GlossEnv[0], &GlossEnv[1], &GlossEnv[2], &GlossEnv[3]) >= 3)
 			;
 		else if (sscanf_s(Line, " glossdry=%f %f %f %f", &GlossDry[0], &GlossDry[1], &GlossDry[2], &GlossDry[3]) >= 2)
@@ -625,6 +641,13 @@ public:
 		};
 		for (const U2Rule &R : Rules) Warm(R);
 		for (const U2Rule &R : GlossRules) Warm(R);
+		for (const U2Rule &R : SheenRules) Warm(R);
+		if (Soft)
+		{
+			U2Rule S;
+			S.File = "soft.hlsl";
+			Warm(S);
+		}
 		for (const auto &It : PsReplace) Warm(It.second);
 		if (U2Streaks::On)
 			U2Streaks::Compile(Dev);   // the body-streak shader (first wound was a 130 ms hitch)
@@ -1266,7 +1289,7 @@ public:
 	float PcssParams[4] = { 0.05f, 0.004f, 0.0006f, 0.06f };
 	float ShadowTint[4] = { 1, 1, 1, 1 };   // w = 1 tells pcss_proj.hlsl the tint is set
 	float PcssDebug = 0;          // pcssdebug=1: colour the shadows by the measured gap
-	int Mode = 0;                 // what End() undoes: 1 surface shader, 2 shadow map, 3 projector, 5 solid surface
+	int Mode = 0;                 // what End() undoes: 1 surface shader, 2 shadow map, 3 projector, 5 solid surface, 9 soft particle
 	DWORD OldCWE = 0;
 	std::map<void *, D3DMATRIX> MapViews;   // shadow-map surface -> the light's view it was drawn with
 	IDirect3DSurface9 *MapTarget = nullptr; // the shadow map drawn last (compared only, not referenced)
@@ -1785,46 +1808,7 @@ public:
 		for (int r = 0; r < 4; r++)
 			for (int c = 0; c < 4; c++)
 				C[4 + r][c] = P.m[r][c];
-		// the lights in camera space, the nearest four (directional ones count as nearest)
-		struct Near { float D; int I; };
-		std::vector<Near> Order;
-		for (size_t i = 0; i < GlossLights.size(); i++)
-		{
-			const D3DLIGHT9 &L = GlossLights[i];
-			float D = 0;
-			if (L.Type != D3DLIGHT_DIRECTIONAL)
-			{
-				const D3DVECTOR &p = L.Position;
-				const float cx = p.x * V._11 + p.y * V._21 + p.z * V._31 + V._41;
-				const float cy = p.x * V._12 + p.y * V._22 + p.z * V._32 + V._42;
-				const float cz = p.x * V._13 + p.y * V._23 + p.z * V._33 + V._43;
-				D = sqrtf(cx * cx + cy * cy + cz * cz);
-			}
-			Order.push_back({ D, (int)i });
-		}
-		std::sort(Order.begin(), Order.end(), [](const Near &A, const Near &B) { return A.D < B.D; });
-		for (size_t k = 0; k < Order.size() && k < 4; k++)
-		{
-			const D3DLIGHT9 &L = GlossLights[Order[k].I];
-			float *Pos = C[8 + 2 * k], *Col = C[9 + 2 * k];
-			if (L.Type == D3DLIGHT_DIRECTIONAL)
-			{
-				const D3DVECTOR &d = L.Direction;
-				Pos[0] = -(d.x * V._11 + d.y * V._21 + d.z * V._31);
-				Pos[1] = -(d.x * V._12 + d.y * V._22 + d.z * V._32);
-				Pos[2] = -(d.x * V._13 + d.y * V._23 + d.z * V._33);
-				Pos[3] = 0;
-			}
-			else
-			{
-				const D3DVECTOR &p = L.Position;
-				Pos[0] = p.x * V._11 + p.y * V._21 + p.z * V._31 + V._41;
-				Pos[1] = p.x * V._12 + p.y * V._22 + p.z * V._32 + V._42;
-				Pos[2] = p.x * V._13 + p.y * V._23 + p.z * V._33 + V._43;
-				Pos[3] = L.Range > 1 ? L.Range : 1000;
-			}
-			Col[0] = L.Diffuse.r; Col[1] = L.Diffuse.g; Col[2] = L.Diffuse.b; Col[3] = 1;
-		}
+		PackLights(V, C);                  // the lights in camera space, the nearest four
 		Dev->SetPixelShaderConstantF(0, C[0], 16);
 		GlossBound1 = false;
 		if (GlossReflect[0] > 0 && CopyScene(Dev) && SceneTex != nullptr)
@@ -1894,6 +1878,164 @@ public:
 		}
 	}
 
+	// ---- sheen= : highlights and a grazing reflection added over solid world surfaces --------
+	// The world is lightmapped: metal panels and polished floors come out as matte as concrete.
+	// sheen=HASH sheen.hlsl [strength sharpness metal] draws a solid fixed-function draw with that
+	// texture once more with the shader, added on top (ONE/ONE, depth equal, fog black): the
+	// texture (s0, TEXCOORD0) and the draw's own lightmap (s1, TEXCOORD1, when stage 1 has one) or
+	// vertex light (COLOR0) say how lit the spot is; TEXCOORD4/5 are the camera-space normal and
+	// position. What it adds: Blinn highlights from the game's lights near the camera (the ones it
+	// set for lit draws, as gloss= gets them) and a Fresnel reflection of the "room" whose
+	// brightness is the baked light at that spot, brighter when the reflection looks up (lamps,
+	// sky). The texture's own brightness masks it (scuffs and seams shine less), and "metal"
+	// tints the reflection with the texture's colour.
+	//   c0  time, 1, 1/w, 1/h       c2 sheenfx= strength, sharpness, Fresnel, mask contrast
+	//   c3  sheenenv= the room's colour (r g b), its multiplier
+	//   c8..c15 lights (as gloss=)  c16 1 if a lightmap is on stage 1, the lightmap's scale (x2/x4)
+	//   c17 the world's up in camera space   c18 the rule's own strength, sharpness, metal (0 = global)
+	std::vector<U2Rule> SheenRules;
+	float SheenFx[4] = { 1.0f, 60.0f, 1.0f, 0.6f };
+	float SheenEnv[4] = { 0.55f, 0.55f, 0.6f, 1.0f };
+	IDirect3DPixelShader9 *SheenOldPS = nullptr;
+	float SheenOldConst[19][4];
+	DWORD SheenOldRS[7], SheenOldTCI[2], SheenOldTTF[2];
+	D3DMATRIX SheenOldTexMat[2];
+	unsigned SheenDraws = 0;
+
+	// the frame's lights in camera space, the nearest four, into C[8..15] (gloss= and sheen=)
+	void PackLights(const D3DMATRIX &V, float C[][4])
+	{
+		struct Near { float D; int I; };
+		std::vector<Near> Order;
+		for (size_t i = 0; i < GlossLights.size(); i++)
+		{
+			const D3DLIGHT9 &L = GlossLights[i];
+			float D = 0;
+			if (L.Type != D3DLIGHT_DIRECTIONAL)
+			{
+				const D3DVECTOR &p = L.Position;
+				const float cx = p.x * V._11 + p.y * V._21 + p.z * V._31 + V._41;
+				const float cy = p.x * V._12 + p.y * V._22 + p.z * V._32 + V._42;
+				const float cz = p.x * V._13 + p.y * V._23 + p.z * V._33 + V._43;
+				D = sqrtf(cx * cx + cy * cy + cz * cz);
+			}
+			Order.push_back({ D, (int)i });
+		}
+		std::sort(Order.begin(), Order.end(), [](const Near &A, const Near &B) { return A.D < B.D; });
+		for (size_t k = 0; k < Order.size() && k < 4; k++)
+		{
+			const D3DLIGHT9 &L = GlossLights[Order[k].I];
+			float *Pos = C[8 + 2 * k], *Col = C[9 + 2 * k];
+			if (L.Type == D3DLIGHT_DIRECTIONAL)
+			{
+				const D3DVECTOR &d = L.Direction;
+				Pos[0] = -(d.x * V._11 + d.y * V._21 + d.z * V._31);
+				Pos[1] = -(d.x * V._12 + d.y * V._22 + d.z * V._32);
+				Pos[2] = -(d.x * V._13 + d.y * V._23 + d.z * V._33);
+				Pos[3] = 0;
+			}
+			else
+			{
+				const D3DVECTOR &p = L.Position;
+				Pos[0] = p.x * V._11 + p.y * V._21 + p.z * V._31 + V._41;
+				Pos[1] = p.x * V._12 + p.y * V._22 + p.z * V._32 + V._42;
+				Pos[2] = p.x * V._13 + p.y * V._23 + p.z * V._33 + V._43;
+				Pos[3] = L.Range > 1 ? L.Range : 1000;
+			}
+			Col[0] = L.Diffuse.r; Col[1] = L.Diffuse.g; Col[2] = L.Diffuse.b; Col[3] = 1;
+		}
+	}
+
+	bool SheenBegin(IDirect3DDevice9 *Dev, DWORD Hash, bool FixedFunction)
+	{
+		U2Rule *R = nullptr;
+		for (U2Rule &G : SheenRules)
+			if (G.Hash == Hash)
+				R = &G;
+		if (R == nullptr || !FixedFunction || Offscreen(Dev))
+			return false;
+		DWORD Blending = 0, Z = 0;
+		Dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &Blending);
+		Dev->GetRenderState(D3DRS_ZENABLE, &Z);
+		if (Blending || !Z)
+			return false;
+		D3DMATRIX P, V;
+		Dev->GetTransform(D3DTS_PROJECTION, &P);
+		if (P._34 != 1.0f || P._44 != 0.0f)
+			return false;
+		IDirect3DPixelShader9 *PS = Compile(Dev, *R);
+		if (PS == nullptr)
+			return false;
+		Dev->GetTransform(D3DTS_VIEW, &V);
+		float C[19][4] = {};
+		C[0][0] = (GetTickCount() % 3600000) / 1000.0f;
+		C[0][1] = 1;
+		C[0][2] = SceneW ? 1.0f / SceneW : 0;
+		C[0][3] = SceneH ? 1.0f / SceneH : 0;
+		memcpy(C[2], SheenFx, sizeof(SheenFx));
+		memcpy(C[3], SheenEnv, sizeof(SheenEnv));
+		for (int r = 0; r < 4; r++)
+			for (int c = 0; c < 4; c++)
+				C[4 + r][c] = P.m[r][c];
+		PackLights(V, C);
+		// stage 1: the lightmap (its own coordinates stay), and how it was combined
+		DWORD Op1 = D3DTOP_DISABLE;
+		IDirect3DBaseTexture9 *T1 = nullptr;
+		Dev->GetTextureStageState(1, D3DTSS_COLOROP, &Op1);
+		Dev->GetTexture(1, &T1);
+		if (T1 != nullptr && Op1 != D3DTOP_DISABLE)
+		{
+			C[16][0] = 1;
+			C[16][1] = Op1 == D3DTOP_MODULATE4X ? 4.0f : Op1 == D3DTOP_MODULATE2X ? 2.0f : 1.0f;
+		}
+		if (T1) T1->Release();
+		C[17][0] = V._31; C[17][1] = V._32; C[17][2] = V._33;     // world +z, turned into camera space
+		memcpy(C[18], R->Levels, sizeof(R->Levels));
+		static const D3DRENDERSTATETYPE RS[7] = { D3DRS_ALPHABLENDENABLE, D3DRS_SRCBLEND, D3DRS_DESTBLEND, D3DRS_BLENDOP, D3DRS_FOGCOLOR, D3DRS_ZWRITEENABLE, D3DRS_ZFUNC };
+		for (int i = 0; i < 7; i++)
+			Dev->GetRenderState(RS[i], &SheenOldRS[i]);
+		Dev->GetPixelShader(&SheenOldPS);
+		Dev->GetPixelShaderConstantF(0, SheenOldConst[0], 19);
+		static const D3DMATRIX Identity = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+		for (DWORD s = 4; s <= 5; s++)
+		{
+			Dev->GetTextureStageState(s, D3DTSS_TEXCOORDINDEX, &SheenOldTCI[s - 4]);
+			Dev->GetTextureStageState(s, D3DTSS_TEXTURETRANSFORMFLAGS, &SheenOldTTF[s - 4]);
+			Dev->GetTransform((D3DTRANSFORMSTATETYPE)(D3DTS_TEXTURE0 + s), &SheenOldTexMat[s - 4]);
+			Dev->SetTextureStageState(s, D3DTSS_TEXCOORDINDEX, (s == 4 ? D3DTSS_TCI_CAMERASPACENORMAL : D3DTSS_TCI_CAMERASPACEPOSITION) | s);
+			Dev->SetTextureStageState(s, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT3);
+			Dev->SetTransform((D3DTRANSFORMSTATETYPE)(D3DTS_TEXTURE0 + s), &Identity);
+		}
+		Dev->SetPixelShaderConstantF(0, C[0], 19);
+		Dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+		Dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);
+		Dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);
+		Dev->SetRenderState(D3DRS_BLENDOP, D3DBLENDOP_ADD);
+		Dev->SetRenderState(D3DRS_FOGCOLOR, 0);
+		Dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+		Dev->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+		Dev->SetPixelShader(PS);
+		if (SheenDraws++ == 0)
+			Message("sheen: first draw (%08x with %s, lightmap %s x%.0f, %d of the game's lights)", Hash, R->File.c_str(),
+				C[16][0] > 0 ? "on stage 1" : "none (vertex light)", C[16][1], (int)GlossLights.size());
+		return true;
+	}
+	void SheenEnd(IDirect3DDevice9 *Dev)
+	{
+		static const D3DRENDERSTATETYPE RS[7] = { D3DRS_ALPHABLENDENABLE, D3DRS_SRCBLEND, D3DRS_DESTBLEND, D3DRS_BLENDOP, D3DRS_FOGCOLOR, D3DRS_ZWRITEENABLE, D3DRS_ZFUNC };
+		for (int i = 0; i < 7; i++)
+			Dev->SetRenderState(RS[i], SheenOldRS[i]);
+		Dev->SetPixelShader(SheenOldPS);
+		if (SheenOldPS) { SheenOldPS->Release(); SheenOldPS = nullptr; }
+		Dev->SetPixelShaderConstantF(0, SheenOldConst[0], 19);
+		for (DWORD s = 4; s <= 5; s++)
+		{
+			Dev->SetTextureStageState(s, D3DTSS_TEXCOORDINDEX, SheenOldTCI[s - 4]);
+			Dev->SetTextureStageState(s, D3DTSS_TEXTURETRANSFORMFLAGS, SheenOldTTF[s - 4]);
+			Dev->SetTransform((D3DTRANSFORMSTATETYPE)(D3DTS_TEXTURE0 + s), &SheenOldTexMat[s - 4]);
+		}
+	}
+
 	// ---- live command channel: console commands from outside, run on the game's thread ---------
 	// A tool (U2Avalon's live.py, AdventMod's live tools) writes lines to System\U2Live.cmd
 	// (atomically: a temporary file renamed into place). At the next Present the fork reads the
@@ -1929,6 +2071,8 @@ public:
 		if (!Core || !Engine)
 			return false;
 		LiveObjs = (ObjArray *)GetProcAddress(Core, "?GObjObjects@UObject@@1V?$TArray@PAVUObject@@@@A");
+		if (LiveObjs == nullptr)                   // Unreal II exports it as private (0V), Advent as protected (1V)
+			LiveObjs = (ObjArray *)GetProcAddress(Core, "?GObjObjects@UObject@@0V?$TArray@PAVUObject@@@@A");
 		LiveGetName = (ObjGetName_t)GetProcAddress(Core, "?GetName@UObject@@QBEPBGXZ");
 		LiveGetClass = (ObjGetClass_t)GetProcAddress(Core, "?GetClass@UObject@@QBEPAVUClass@@XZ");
 		LiveLog = (void **)GetProcAddress(Core, "?GLog@@3PAVFOutputDevice@@A");
@@ -5861,6 +6005,11 @@ public:
 
 	void End(IDirect3DDevice9 *Dev)
 	{
+		if (Mode == 9)
+		{
+			SoftEnd(Dev);
+			return;
+		}
 		if (Mode == 8)
 		{
 			Dev->SetPixelShader(OldPS);
@@ -6640,6 +6789,7 @@ public:
 			RunGi(Dev, Saved.DS);
 			RunSsao(Dev, Saved.DS);
 			RunSss(Dev, Saved.DS);
+			RunAtmos(Dev, Saved.DS);
 			IDirect3DTexture9 *AAFrame = RunSmaa(Dev);
 
 			float c[6][4] = {};
@@ -7140,7 +7290,7 @@ public:
 	// lights are in world space)
 	void GiGatherLights(IDirect3DDevice9 *Dev)
 	{
-		if (!Gi)
+		if (!Gi && !Atmos)                              // atmos=1 finds the sun among them
 			return;
 		GiSlotDirty = false;
 		DWORD Lit = 0;
@@ -7502,7 +7652,7 @@ public:
 	IDirect3DTexture9 *SsaoGBuf = nullptr, *SsaoA = nullptr, *SsaoB = nullptr, *SsaoOut = nullptr;
 	IDirect3DVertexBuffer9 *SsaoVB = nullptr;
 
-	bool NeedDepth() const { return Gi || Ssao || Sss; }
+	bool NeedDepth() const { return Gi || Ssao || Sss || Atmos; }
 
 	void SsaoReleaseTargets()
 	{
@@ -7707,6 +7857,477 @@ public:
 		if (OldTex3) OldTex3->Release();
 		for (int i = 0; i < 6; i++)
 			Dev->SetSamplerState(3, Samp3[i], Old3[i]);
+	}
+
+	// ---- height fog and light shafts (atmos=1) ---------------------------------------------
+	// atmos.hlsl on the frame copy, after ssao/sss and before SMAA, from the same readable depth:
+	//   height fog: exponential in the world's height (Inigo Quilez, "better fog"): thick low
+	//   down, thin up high, more of the sun's colour toward the sun; the sky gets the fog of
+	//   atmosfog2's sky distance, so the horizon hazes and the zenith stays clear;
+	//   light shafts: the sky's bright parts near the sun, at half size, blurred along lines
+	//   toward the sun three times (Mitchell, GPU Gems 3 ch.13, as a 3-pass radial blur), added
+	//   in the sun's colour; they fade out as the sun leaves the screen or goes behind.
+	// The sun: the brightest directional light the game set for lit draws this frame (UE2's
+	// Sunlight lights characters with one), or atmossun= azimuth elevation (degrees, world) to
+	// set it by hand (per map with map= parts); none = no shafts, fog only.
+	//   atmos=1                       on (default off)
+	//   atmosfog=r g b density        fog colour (0..1) and density per world unit at the base
+	//   atmosfog2=falloff height most sky   per-unit height falloff, the camera's height over the
+	//                                 densest air (the fog layer moves with the camera: levels sit at
+	//                                 any z; what lies below still gets thicker fog), most fog
+	//                                 allowed (0..1), how far the sky counts as (world units)
+	//   atmosshafts=strength length threshold suntint   shaft brightness, how far toward the
+	//                                 sun the blur reaches (0..1 of the way), how bright sky must
+	//                                 be to shine, how much the fog takes the sun's colour
+	//   atmossun=az el                the sun by hand (0 0 = from the game's lights)
+	//   atmosdebug=1|2|3              1 fog amount, 2 shafts alone, 3 the shaft mask
+	bool Atmos = false, AtmosBroken = false;
+	float AtmosFog[4] = { 0.62f, 0.66f, 0.72f, 0.00004f };
+	float AtmosFog2[4] = { 0.0006f, 400.0f, 0.5f, 30000.0f };
+	float AtmosShafts[4] = { 0.6f, 0.75f, 0.55f, 0.5f };
+	float AtmosSun[2] = { 0, 0 };
+	float AtmosDebug = 0;
+	UINT AtmosW = 0, AtmosH = 0;
+	IDirect3DVertexShader9 *AtmosVS = nullptr;
+	IDirect3DPixelShader9 *AtmosPS[3] = {};
+	IDirect3DTexture9 *AtmosA = nullptr, *AtmosB = nullptr, *AtmosOut = nullptr;
+	bool AtmosToldSun = false;
+
+	void AtmosReleaseTargets()
+	{
+		IDirect3DTexture9 **All[] = { &AtmosA, &AtmosB, &AtmosOut };
+		for (IDirect3DTexture9 **T : All)
+			if (*T) { (*T)->Release(); *T = nullptr; }
+		AtmosW = AtmosH = 0;
+	}
+
+	void AtmosReleaseAll()
+	{
+		AtmosReleaseTargets();
+		if (AtmosVS) { AtmosVS->Release(); AtmosVS = nullptr; }
+		for (int i = 0; i < 3; i++)
+			if (AtmosPS[i]) { AtmosPS[i]->Release(); AtmosPS[i] = nullptr; }
+	}
+
+	bool AtmosBuild(IDirect3DDevice9 *Dev)
+	{
+		if (AtmosBroken)
+			return false;
+		if (AtmosPS[2] != nullptr)
+			return true;
+		const std::string Lib = ReadShaderFile("atmos.hlsl");
+		if (Lib.empty())
+		{
+			Message("atmos: atmos.hlsl missing in U2Shaders, fog and shafts off");
+			AtmosBroken = true;
+			return false;
+		}
+		static const char *Names[4] = { "AtmosVS", "MaskPS", "RayPS", "ApplyPS" };
+		for (int i = 0; i < 4; i++)
+		{
+			char Head[96];
+			sprintf_s(Head, "#define ATMOS_PASS %d\n#line 1 \"atmos.hlsl\"\n", i == 0 ? 1 : i);
+			const std::string Src = std::string(Head) + Lib;
+			ID3DBlob *Code = nullptr, *Errors = nullptr;
+			const HRESULT hr = D3DCompile(Src.data(), Src.size(), "atmos", nullptr, nullptr, Names[i], i == 0 ? "vs_3_0" : "ps_3_0",
+				D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &Code, &Errors);
+			if (FAILED(hr) || Code == nullptr)
+			{
+				Message("atmos: %s failed: %s", Names[i], Errors ? (const char *)Errors->GetBufferPointer() : "?");
+				if (Errors) Errors->Release();
+				if (Code) Code->Release();
+				AtmosBroken = true;
+				return false;
+			}
+			if (Errors) Errors->Release();
+			const HRESULT cr = i == 0 ? Dev->CreateVertexShader((const DWORD *)Code->GetBufferPointer(), &AtmosVS)
+				: Dev->CreatePixelShader((const DWORD *)Code->GetBufferPointer(), &AtmosPS[i - 1]);
+			Code->Release();
+			if (FAILED(cr))
+			{
+				Message("atmos: the card refused %s (%08x)", Names[i], (unsigned)cr);
+				AtmosBroken = true;
+				return false;
+			}
+		}
+		Message("atmos: ready");
+		return true;
+	}
+
+	// the sun in world space (unit vector toward it) and its colour; false = none
+	bool AtmosFindSun(float Dir[3], float Col[3])
+	{
+		if (AtmosSun[0] != 0 || AtmosSun[1] != 0)
+		{
+			const float Az = AtmosSun[0] * 0.0174533f, El = AtmosSun[1] * 0.0174533f;
+			Dir[0] = cosf(El) * cosf(Az); Dir[1] = cosf(El) * sinf(Az); Dir[2] = sinf(El);
+			Col[0] = 1.0f; Col[1] = 0.93f; Col[2] = 0.8f;
+			return true;
+		}
+		const D3DLIGHT9 *Best = nullptr;
+		float BestI = 0.05f;
+		for (const D3DLIGHT9 &L : GiFrameLights)
+			if (L.Type == D3DLIGHT_DIRECTIONAL)
+			{
+				const float I = L.Diffuse.r + L.Diffuse.g + L.Diffuse.b;
+				if (I > BestI) { BestI = I; Best = &L; }
+			}
+		if (Best == nullptr)
+			return false;
+		const float x = -Best->Direction.x, y = -Best->Direction.y, z = -Best->Direction.z;
+		const float n = sqrtf(x * x + y * y + z * z);
+		if (n < 1e-6f)
+			return false;
+		Dir[0] = x / n; Dir[1] = y / n; Dir[2] = z / n;
+		// the colour, brightest channel at 1 (how bright the shafts are is atmosshafts' job)
+		const float m = (std::max)((std::max)(Best->Diffuse.r, Best->Diffuse.g), (std::max)(Best->Diffuse.b, 0.001f));
+		Col[0] = Best->Diffuse.r / m; Col[1] = Best->Diffuse.g / m; Col[2] = Best->Diffuse.b / m;
+		if (!AtmosToldSun)
+		{
+			AtmosToldSun = true;
+			Message("atmos: the sun from the game's directional light: toward (%.2f %.2f %.2f), colour %.2f %.2f %.2f",
+				Dir[0], Dir[1], Dir[2], Best->Diffuse.r, Best->Diffuse.g, Best->Diffuse.b);
+		}
+		return true;
+	}
+
+	// the passes; afterwards SceneTex is the fogged frame with the shafts (copy and result trade
+	// places), and the post chain's own vertex setup is back, as after RunSsao
+	void RunAtmos(IDirect3DDevice9 *Dev, IDirect3DSurface9 *BoundDepth)
+	{
+		if (!Atmos || AtmosBroken || SceneTex == nullptr)
+			return;
+		IDirect3DTexture9 *Depth = DepthTexOf(BoundDepth), *Over = nullptr;
+		D3DMATRIX Proj = SceneProj, View = SceneView;
+		if (Depth != nullptr && KeptDepth != nullptr && KeptDepth != Depth && KeptDraws > SegDraws)
+		{
+			Over = Depth;
+			Depth = KeptDepth;
+			Proj = KeptProj;
+			View = KeptView;
+		}
+		static int Told = 0;
+		if (Depth == nullptr || !SceneProjOk)
+		{
+			if (Told++ < 3)
+				Message("atmos: skipped (%s)", Depth == nullptr ? "the scene's depth isn't one of the readable ones yet" : "no perspective projection seen");
+			return;
+		}
+		D3DSURFACE_DESC DD = {};
+		Depth->GetLevelDesc(0, &DD);
+		if (DD.Width != SceneW || DD.Height != SceneH || !AtmosBuild(Dev))
+			return;
+		if (SsaoVB == nullptr)
+		{
+			const SmaaVertex q[4] = { { -1, 1, 0, 0, 0 }, { 1, 1, 0, 1, 0 }, { -1, -1, 0, 0, 1 }, { 1, -1, 0, 1, 1 } };
+			void *Mem = nullptr;
+			if (FAILED(Dev->CreateVertexBuffer(sizeof(q), D3DUSAGE_WRITEONLY, D3DFVF_XYZ | D3DFVF_TEX1, D3DPOOL_MANAGED, &SsaoVB, nullptr))
+				|| FAILED(SsaoVB->Lock(0, sizeof(q), &Mem, 0)))
+			{
+				if (SsaoVB) { SsaoVB->Release(); SsaoVB = nullptr; }
+				Message("atmos: the quad couldn't be made, fog and shafts off");
+				AtmosBroken = true;
+				return;
+			}
+			memcpy(Mem, q, sizeof(q));
+			SsaoVB->Unlock();
+		}
+		const UINT W = (std::max)(SceneW / 2, 8u), H = (std::max)(SceneH / 2, 8u);
+		if (AtmosOut == nullptr || AtmosW != SceneW || AtmosH != SceneH)
+		{
+			AtmosReleaseTargets();
+			const bool Ok = SUCCEEDED(Dev->CreateTexture(W, H, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &AtmosA, nullptr))
+				&& SUCCEEDED(Dev->CreateTexture(W, H, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &AtmosB, nullptr))
+				&& SUCCEEDED(Dev->CreateTexture(SceneW, SceneH, 1, D3DUSAGE_RENDERTARGET, SceneFmt, D3DPOOL_DEFAULT, &AtmosOut, nullptr));
+			if (!Ok)
+			{
+				Message("atmos: targets couldn't be made (%ux%u), fog and shafts off", SceneW, SceneH);
+				AtmosReleaseTargets();
+				AtmosBroken = true;
+				return;
+			}
+			AtmosW = SceneW;
+			AtmosH = SceneH;
+		}
+		// c1 projection, c3 frame size, c4-c6 settings, c7 sun on screen, c8 its colour,
+		// c9 its direction (camera), c10-c12 camera -> world rows (as psreplace's c1-c3), c13 debug
+		const D3DMATRIX Inv = InvView(View);
+		float C[14][4] = {};
+		C[1][0] = Proj._11; C[1][1] = Proj._22; C[1][2] = Proj._33; C[1][3] = Proj._43;
+		C[3][0] = 1.0f / SceneW; C[3][1] = 1.0f / SceneH; C[3][2] = (float)SceneW; C[3][3] = (float)SceneH;
+		memcpy(C[4], AtmosFog, sizeof(AtmosFog));
+		memcpy(C[5], AtmosFog2, sizeof(AtmosFog2));
+		memcpy(C[6], AtmosShafts, sizeof(AtmosShafts));
+		for (int r = 0; r < 3; r++)
+		{
+			C[10 + r][0] = Inv.m[0][r]; C[10 + r][1] = Inv.m[1][r]; C[10 + r][2] = Inv.m[2][r]; C[10 + r][3] = Inv.m[3][r];
+		}
+		C[13][0] = AtmosDebug;
+		float SunW[3] = {}, SunCol[3] = { 1, 1, 1 };
+		float Vis = 0;
+		if (AtmosFindSun(SunW, SunCol))
+		{
+			// world direction -> camera (the view's rotation)
+			const float sx = SunW[0] * View._11 + SunW[1] * View._21 + SunW[2] * View._31;
+			const float sy = SunW[0] * View._12 + SunW[1] * View._22 + SunW[2] * View._32;
+			const float sz = SunW[0] * View._13 + SunW[1] * View._23 + SunW[2] * View._33;
+			C[9][0] = sx; C[9][1] = sy; C[9][2] = sz; C[9][3] = 1;
+			memcpy(C[8], SunCol, sizeof(SunCol));
+			if (sz > 0.05f)
+			{
+				const float u = 0.5f + 0.5f * Proj._11 * sx / sz, v = 0.5f - 0.5f * Proj._22 * sy / sz;
+				C[7][0] = u; C[7][1] = v;
+				// fades as it leaves the screen (gone half a screen out) and as it turns away
+				const float ox = (std::max)(0.0f, fabsf(u - 0.5f) - 0.5f), oy = (std::max)(0.0f, fabsf(v - 0.5f) - 0.5f);
+				const float Out = (std::min)(1.0f, sqrtf(ox * ox + oy * oy) / 0.5f);
+				Vis = (1 - Out) * (std::min)(1.0f, (sz - 0.05f) / 0.3f);
+			}
+		}
+		C[7][2] = Vis;
+		const bool Shafts = Vis > 0.001f && AtmosShafts[0] > 0;
+		const float Small[4] = { 1.0f / W, 1.0f / H, (float)W, (float)H };
+		const float Full[4] = { 1.0f / SceneW, 1.0f / SceneH, (float)SceneW, (float)SceneH };
+		// stage 3 isn't part of the post chain's saved state: put it back afterwards
+		static const D3DSAMPLERSTATETYPE Samp3[6] = { D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DSAMP_SRGBTEXTURE };
+		DWORD Old3[6] = {};
+		IDirect3DBaseTexture9 *OldTex3 = nullptr;
+		Dev->GetTexture(3, &OldTex3);
+		for (int i = 0; i < 6; i++)
+			Dev->GetSamplerState(3, Samp3[i], &Old3[i]);
+		Dev->SetFVF(D3DFVF_XYZ | D3DFVF_TEX1);
+		Dev->SetStreamSource(0, SsaoVB, 0, sizeof(SmaaVertex));
+		Dev->SetVertexShader(AtmosVS);
+		Dev->SetPixelShaderConstantF(1, C[1], 13);
+		for (DWORD t = 0; t < 4; t++)
+			SmaaSampler(Dev, t, D3DTEXF_POINT);
+		Dev->SetTexture(2, nullptr);
+		Dev->SetTexture(3, nullptr);
+		if (Shafts)
+		{
+			// 1: the sky's bright parts around the sun, half size
+			Dev->SetVertexShaderConstantF(0, Small, 1);
+			Dev->SetPixelShaderConstantF(0, Small, 1);
+			Target(Dev, AtmosA);
+			Dev->SetPixelShader(AtmosPS[0]);
+			Dev->SetTexture(0, Depth);
+			Dev->SetTexture(1, SceneTex);
+			Dev->SetTexture(2, Over);
+			SmaaSampler(Dev, 1, D3DTEXF_LINEAR);
+			Dev->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
+			Dev->SetTexture(1, nullptr);
+			Dev->SetTexture(2, nullptr);
+			// 2: three radial blurs toward the sun, each reaching further
+			Dev->SetPixelShader(AtmosPS[1]);
+			SmaaSampler(Dev, 0, D3DTEXF_LINEAR);
+			IDirect3DTexture9 *From = AtmosA, *To = AtmosB;
+			static const float Reach[3] = { 1.0f / 64, 1.0f / 8, 1.0f };
+			for (int k = 0; k < 3; k++)
+			{
+				const float S[4] = { C[7][0], C[7][1], Vis, Reach[k] };
+				Dev->SetPixelShaderConstantF(7, S, 1);
+				Target(Dev, To);
+				Dev->SetTexture(0, From);
+				Dev->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
+				std::swap(From, To);
+			}
+			Dev->SetTexture(0, nullptr);
+			if (From != AtmosA)
+				std::swap(AtmosA, AtmosB);          // AtmosA = the shafts
+			const float S[4] = { C[7][0], C[7][1], Vis, 0 };
+			Dev->SetPixelShaderConstantF(7, S, 1);
+		}
+		// 3: fog and shafts over the frame, full size
+		Target(Dev, AtmosOut);
+		Dev->SetVertexShaderConstantF(0, Full, 1);
+		Dev->SetPixelShaderConstantF(0, Full, 1);
+		Dev->SetPixelShaderConstantF(2, Small, 1);
+		Dev->SetPixelShader(AtmosPS[2]);
+		Dev->SetTexture(0, Depth);
+		Dev->SetTexture(1, SceneTex);
+		Dev->SetTexture(2, Shafts ? AtmosA : nullptr);
+		Dev->SetTexture(3, Over);
+		SmaaSampler(Dev, 2, D3DTEXF_LINEAR);
+		Dev->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
+		std::swap(SceneTex, AtmosOut);
+		static int Ran = 0;
+		if (Ran++ < 1)
+			Message("atmos: running (%ux%u, shafts %ux%u, sun %s)", SceneW, SceneH, W, H, Shafts ? "on screen" : "not on screen or none");
+
+		// back to the post chain's setup
+		Dev->SetVertexShader(nullptr);
+		Dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+		Dev->SetStreamSource(0, PostQuadVB, 0, sizeof(U2QuadVertex));
+		for (DWORD t = 0; t < 3; t++)
+			SmaaSampler(Dev, t, D3DTEXF_LINEAR);
+		Dev->SetTexture(0, nullptr);
+		Dev->SetTexture(1, nullptr);
+		Dev->SetTexture(2, nullptr);
+		Dev->SetTexture(3, OldTex3);
+		if (OldTex3) OldTex3->Release();
+		for (int i = 0; i < 6; i++)
+			Dev->SetSamplerState(3, Samp3[i], Old3[i]);
+	}
+
+	// ---- soft particles (soft=1) ---------------------------------------------------------
+	// Smoke, dust, flames and sparks are flat sprites: where one cuts into the floor or a wall the
+	// game draws a hard line. With soft=1 a blended, depth-tested, unlit fixed-function draw that
+	// doesn't write depth (sprites, beams, translucent water and glass; not projector decals) is
+	// drawn with soft.hlsl instead of the texture stages: it does what stage 0 did (texture and
+	// vertex colour combined by the stage's own operation), then fades out where the scene behind
+	// is within softparams' distance of the sprite, read from the scene's readable depth (gi,
+	// ssao or atmos make it readable; nothing else needs it). The fade goes where the draw's
+	// blending reads it: alpha for alpha blending, the colour for additive glow, toward "no
+	// change" for multiply. Draws whose stage 0 does anything else (more stages, a texture factor,
+	// complemented arguments) are left alone.
+	//   soft=1                        on (default off)
+	//   softparams=distance debug     the fade's reach in world units (default 40); debug 1 =
+	//                                 soft draws in flat green
+	bool Soft = false, SoftBroken = false, SoftTold = false;
+	float SoftParams[2] = { 40.0f, 0.0f };
+	U2Rule SoftRule;
+	IDirect3DBaseTexture9 *SoftOldTex7 = nullptr;
+	DWORD SoftOldSamp7[5] = {}, SoftOldTCI7 = 0, SoftOldTTF7 = 0;
+	D3DMATRIX SoftOldTexMat7 = {};
+	unsigned SoftDraws = 0, SoftSkipped = 0;
+
+	// what a stage argument reads: 1 texture, 0 the vertex colour, -1 something we don't redo
+	static int SoftArg(DWORD A)
+	{
+		if (A & ~D3DTA_SELECTMASK)
+			return -1;                    // complement / alpha replicate
+		if (A == D3DTA_TEXTURE)
+			return 1;
+		if (A == D3DTA_DIFFUSE || A == D3DTA_CURRENT)
+			return 0;                     // stage 0's "current" is the vertex colour
+		return -1;
+	}
+	// a stage operation as (op, arg1, arg2): op 0 arg1, 1 arg2, 2 multiply, 3 multiply x2; false = not ours
+	static bool SoftOp(IDirect3DDevice9 *Dev, bool Alpha, float Out[4])
+	{
+		DWORD Op = 0, A1 = 0, A2 = 0;
+		Dev->GetTextureStageState(0, Alpha ? D3DTSS_ALPHAOP : D3DTSS_COLOROP, &Op);
+		Dev->GetTextureStageState(0, Alpha ? D3DTSS_ALPHAARG1 : D3DTSS_COLORARG1, &A1);
+		Dev->GetTextureStageState(0, Alpha ? D3DTSS_ALPHAARG2 : D3DTSS_COLORARG2, &A2);
+		const int a1 = SoftArg(A1), a2 = SoftArg(A2);
+		switch (Op)
+		{
+		case D3DTOP_SELECTARG1: if (a1 < 0) return false; Out[0] = 0; break;
+		case D3DTOP_SELECTARG2: if (a2 < 0) return false; Out[0] = 1; break;
+		case D3DTOP_MODULATE: if (a1 < 0 || a2 < 0) return false; Out[0] = 2; break;
+		case D3DTOP_MODULATE2X: if (a1 < 0 || a2 < 0) return false; Out[0] = 3; break;
+		default: return false;
+		}
+		Out[1] = (float)(a1 > 0 ? 1 : 0);
+		Out[2] = (float)(a2 > 0 ? 1 : 0);
+		Out[3] = 0;
+		return true;
+	}
+
+	bool SoftBegin(IDirect3DDevice9 *Dev, bool FixedFunction, bool Textured)
+	{
+		if (!Soft || SoftBroken || !FixedFunction || !Textured || Offscreen(Dev))
+			return false;
+		DWORD Blend = 0, Z = 0, ZW = 0, Lit = 0, Fvf = 0, Op1 = 0, Ttf0 = 0;
+		Dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &Blend);
+		Dev->GetRenderState(D3DRS_ZENABLE, &Z);
+		Dev->GetRenderState(D3DRS_ZWRITEENABLE, &ZW);
+		Dev->GetRenderState(D3DRS_LIGHTING, &Lit);
+		if (!Blend || !Z || ZW || Lit)
+			return false;
+		Dev->GetFVF(&Fvf);
+		if ((Fvf & D3DFVF_POSITION_MASK) == D3DFVF_XYZRHW)
+			return false;
+		D3DMATRIX P = {};
+		Dev->GetTransform(D3DTS_PROJECTION, &P);
+		if (P._34 != 1.0f || P._44 != 0.0f)
+			return false;                 // not a perspective 3D draw
+		Dev->GetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, &Ttf0);
+		Dev->GetTextureStageState(1, D3DTSS_COLOROP, &Op1);
+		if ((Ttf0 & D3DTTFF_PROJECTED) || Op1 != D3DTOP_DISABLE)
+		{
+			SoftSkipped++;
+			return false;                 // projector decals, multi-stage draws
+		}
+		float C[8][4] = {};
+		if (!SoftOp(Dev, false, C[0]) || !SoftOp(Dev, true, C[1]))
+		{
+			SoftSkipped++;
+			return false;
+		}
+		// the scene's depth, readable (the bound depth surface is one of ours)
+		IDirect3DSurface9 *DS = nullptr;
+		if (FAILED(Dev->GetDepthStencilSurface(&DS)) || DS == nullptr)
+			return false;
+		IDirect3DTexture9 *Depth = DepthTexOf(DS);
+		DS->Release();
+		if (Depth == nullptr)
+			return false;
+		if (SoftRule.File.empty())
+			SoftRule.File = "soft.hlsl";
+		IDirect3DPixelShader9 *PS = Compile(Dev, SoftRule);
+		if (PS == nullptr)
+		{
+			Message("soft: soft.hlsl missing or broken in U2Shaders, soft particles off");
+			SoftBroken = true;
+			return false;
+		}
+		// how the draw blends: where the fade has to go
+		DWORD Src = 0, Dst = 0;
+		Dev->GetRenderState(D3DRS_SRCBLEND, &Src);
+		Dev->GetRenderState(D3DRS_DESTBLEND, &Dst);
+		float Kind = 0;                                       // 0 alpha blending: fade the alpha
+		if (Dst == D3DBLEND_ONE || (Src == D3DBLEND_ONE && Dst == D3DBLEND_INVSRCALPHA))
+			Kind = 1;                                         // added (or premultiplied): fade colour and alpha
+		else if ((Src == D3DBLEND_DESTCOLOR && Dst == D3DBLEND_ZERO) || (Src == D3DBLEND_ZERO && Dst == D3DBLEND_SRCCOLOR))
+			Kind = 2;                                         // multiply: toward white
+		else if ((Src == D3DBLEND_DESTCOLOR && Dst == D3DBLEND_SRCCOLOR) || (Src == D3DBLEND_SRCCOLOR && Dst == D3DBLEND_DESTCOLOR))
+			Kind = 3;                                         // multiply x2: toward grey
+		C[2][0] = P._11; C[2][1] = P._22; C[2][2] = P._33; C[2][3] = P._43;
+		C[3][0] = (std::max)(SoftParams[0], 1.0f); C[3][1] = Kind; C[3][2] = SoftParams[1]; C[3][3] = 0;
+		Dev->GetPixelShader(&OldPS);
+		Dev->GetPixelShaderConstantF(0, OldConst[0], 8);
+		Dev->SetPixelShaderConstantF(0, C[0], 4);
+		// stage 7: the depth texture and the camera-space position
+		static const D3DSAMPLERSTATETYPE Samp[5] = { D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER };
+		static const DWORD Val[5] = { D3DTADDRESS_CLAMP, D3DTADDRESS_CLAMP, D3DTEXF_POINT, D3DTEXF_POINT, D3DTEXF_NONE };
+		Dev->GetTexture(7, &SoftOldTex7);
+		for (int i = 0; i < 5; i++)
+		{
+			Dev->GetSamplerState(7, Samp[i], &SoftOldSamp7[i]);
+			Dev->SetSamplerState(7, Samp[i], Val[i]);
+		}
+		Dev->SetTexture(7, Depth);
+		static const D3DMATRIX Identity = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+		Dev->GetTextureStageState(7, D3DTSS_TEXCOORDINDEX, &SoftOldTCI7);
+		Dev->GetTextureStageState(7, D3DTSS_TEXTURETRANSFORMFLAGS, &SoftOldTTF7);
+		Dev->GetTransform(D3DTS_TEXTURE7, &SoftOldTexMat7);
+		Dev->SetTextureStageState(7, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_CAMERASPACEPOSITION | 7);
+		Dev->SetTextureStageState(7, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT3);
+		Dev->SetTransform(D3DTS_TEXTURE7, &Identity);
+		Dev->SetPixelShader(PS);
+		Mode = 9;
+		SoftDraws++;
+		if (!SoftTold)
+		{
+			SoftTold = true;
+			Message("soft: first soft draw (blend %u/%u: kind %.0f, colour op %.0f, alpha op %.0f)", Src, Dst, Kind, C[0][0], C[1][0]);
+		}
+		return true;
+	}
+	void SoftEnd(IDirect3DDevice9 *Dev)
+	{
+		static const D3DSAMPLERSTATETYPE Samp[5] = { D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER };
+		Dev->SetPixelShader(OldPS);
+		Dev->SetPixelShaderConstantF(0, OldConst[0], 8);
+		if (OldPS != nullptr) { OldPS->Release(); OldPS = nullptr; }
+		Dev->SetTexture(7, SoftOldTex7);
+		if (SoftOldTex7) { SoftOldTex7->Release(); SoftOldTex7 = nullptr; }
+		for (int i = 0; i < 5; i++)
+			Dev->SetSamplerState(7, Samp[i], SoftOldSamp7[i]);
+		Dev->SetTextureStageState(7, D3DTSS_TEXCOORDINDEX, SoftOldTCI7);
+		Dev->SetTextureStageState(7, D3DTSS_TEXTURETRANSFORMFLAGS, SoftOldTTF7);
+		Dev->SetTransform(D3DTS_TEXTURE7, &SoftOldTexMat7);
+		Mode = 0;
 	}
 
 	// ---- subsurface scattering for skin (sss=1) -------------------------------------------
@@ -8802,6 +9423,8 @@ public:
 			if (HMODULE Core = GetModuleHandleA("Core.dll"))
 			{
 				EngObjs = (ObjList *)GetProcAddress(Core, "?GObjObjects@UObject@@1V?$TArray@PAVUObject@@@@A");
+				if (EngObjs == nullptr)            // Unreal II: private (0V)
+					EngObjs = (ObjList *)GetProcAddress(Core, "?GObjObjects@UObject@@0V?$TArray@PAVUObject@@@@A");
 				EngName = (ObjName_t)GetProcAddress(Core, "?GetName@UObject@@QBEPBGXZ");
 				EngClass = (ObjPtr_t)GetProcAddress(Core, "?GetClass@UObject@@QBEPAVUClass@@XZ");
 				EngOuter = (ObjPtr_t)GetProcAddress(Core, "?GetOuter@UObject@@QBEPAV1@XZ");
@@ -8936,12 +9559,16 @@ public:
 		}
 		for (U2Rule &R : GlossRules)
 			DropShader(R);
+		for (U2Rule &R : SheenRules)
+			DropShader(R);
+		DropShader(SoftRule);
 		for (auto &It : PsReplace)
 			DropShader(It.second);
 		for (auto &It : Replacements)
 			if (It.second.Tex) { It.second.Tex->Release(); It.second.Tex = nullptr; }
 		Rules.clear();
 		GlossRules.clear();
+		SheenRules.clear();
 		PsReplace.clear();
 		Replacements.clear();
 		FILE *F = nullptr;
@@ -8962,6 +9589,8 @@ public:
 		std::vector<U2Rule *> All;
 		for (U2Rule &R : Rules) All.push_back(&R);
 		for (U2Rule &R : GlossRules) All.push_back(&R);
+		for (U2Rule &R : SheenRules) All.push_back(&R);
+		All.push_back(&SoftRule);
 		for (auto &It : PsReplace) All.push_back(&It.second);
 		U2Rule *Fixed[] = { &PostBright, &PostBlur, &PostFinal, &PostDown, &PostUp, &CharRule, &MapRule, &ProjRule };
 		for (U2Rule *R : Fixed) All.push_back(R);
@@ -9094,6 +9723,26 @@ public:
 				SsaoFx[1] = (std::max)(SsaoFx[1], 4.0f);
 			else if (sscanf_s(Line, " ssaores=%u", &V) == 1)
 				SsaoRes = V >= 2 ? 2 : 1;
+			else if (sscanf_s(Line, " atmos=%u", &V) == 1)
+			{
+				if ((V != 0) != Atmos)
+					DepthDirty = true;
+				Atmos = V != 0;
+			}
+			else if (sscanf_s(Line, " atmosfog=%f %f %f %f", &AtmosFog[0], &AtmosFog[1], &AtmosFog[2], &AtmosFog[3]) >= 1)
+				;
+			else if (sscanf_s(Line, " atmosfog2=%f %f %f %f", &AtmosFog2[0], &AtmosFog2[1], &AtmosFog2[2], &AtmosFog2[3]) >= 1)
+				;
+			else if (sscanf_s(Line, " atmosshafts=%f %f %f %f", &AtmosShafts[0], &AtmosShafts[1], &AtmosShafts[2], &AtmosShafts[3]) >= 1)
+				;
+			else if (sscanf_s(Line, " atmossun=%f %f", &AtmosSun[0], &AtmosSun[1]) >= 1)
+				AtmosToldSun = false;
+			else if (sscanf_s(Line, " atmosdebug=%f", &AtmosDebug) == 1)
+				;
+			else if (sscanf_s(Line, " soft=%u", &V) == 1)
+				Soft = V != 0;
+			else if (sscanf_s(Line, " softparams=%f %f", &SoftParams[0], &SoftParams[1]) >= 1)
+				;
 			else if (sscanf_s(Line, " sss=%u", &V) == 1)
 			{
 				if ((V != 0) != Sss)
@@ -9366,10 +10015,19 @@ public:
 		}
 		for (U2Rule *R : { &MapRule, &ProjRule, &PostBright, &PostBlur, &PostFinal, &PostDown, &PostUp })
 			if (R->PS != nullptr) { R->PS->Release(); R->PS = nullptr; R->Tried = false; }
+		// the decal/surface passes' shaders belong to this device too
+		for (U2Rule &R : GlossRules)
+			DropShader(R);
+		for (U2Rule &R : SheenRules)
+			DropShader(R);
 		SmaaReleaseAll();
 		SmaaBroken = false;
 		GiReleaseAll();
 		SsaoReleaseAll();
+		AtmosReleaseAll();
+		AtmosBroken = false;
+		DropShader(SoftRule);
+		SoftBroken = false;
 		SssReleaseAll();
 		SssBroken = false;
 		GiBroken = false;
