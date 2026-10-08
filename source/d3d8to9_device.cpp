@@ -14,12 +14,15 @@
 static U2Shaders U2;
 // blood.hpp logs through the layer's log, and the mod's native DLL reaches it by this export
 static void U2BloodLog(const char *S) { U2.Message("%s", S); }
-static int U2BloodLogSet = (U2Blood::Log = U2BloodLog, U2Runs::Log = U2BloodLog, 0);
-// the mod's blood commands: floor pools (blood.hpp) and wall runs (runs.hpp: run, drip, rstop)
+static int U2BloodLogSet = (U2Blood::Log = U2BloodLog, U2Runs::Log = U2BloodLog, U2Streaks::Log = U2BloodLog, 0);
+// the mod's blood commands: floor pools (blood.hpp), wall runs (runs.hpp: run, drip, rstop) and
+// streaks down characters (streaks.hpp: streak, streaks, streakclear)
 extern "C" __declspec(dllexport) int __cdecl U2BloodCommand(const char *Cmd)
 {
 	char Word[16] = "";
 	sscanf_s(Cmd, "%15s", Word, (unsigned)sizeof(Word));
+	if (U2Streaks::Handles(Word))
+		return U2Streaks::Command(Cmd);
 	return U2Runs::Handles(Word) ? U2Runs::Command(Cmd) : U2Blood::Command(Cmd);
 }
 // a shotp from outside (AdventNative's "Capture"): the next presented frame saved as System\ShotP#####.bmp;
@@ -1362,6 +1365,15 @@ bool Direct3DDevice8::U2MaskBegin(UINT Prims)
 		FixedFunction = reinterpret_cast<VertexShaderInfo *>(CurrentVertexShaderHandle << 1)->Shader == nullptr;
 	return U2.MaskBegin(ProxyInterface, FixedFunction, U2Stage0 != nullptr, U2Stage0 ? U2Stage0->U2Hash : 0, Prims);
 }
+bool Direct3DDevice8::U2StreakBegin(int Pass)
+{
+	if (!U2Streaks::On || U2Streaks::Live == 0)
+		return false;
+	bool FixedFunction = CurrentVertexShaderHandle == 0;
+	if (!FixedFunction)
+		FixedFunction = reinterpret_cast<VertexShaderInfo *>(CurrentVertexShaderHandle << 1)->Shader == nullptr;
+	return U2.StreakBegin(ProxyInterface, Pass, FixedFunction, U2Stage0 != nullptr);
+}
 bool Direct3DDevice8::U2GlossBegin()
 {
 	if (U2.GlossRules.empty() || U2Stage0 == nullptr)
@@ -1434,6 +1446,11 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawPrimitive(D3DPRIMITIVETYPE Primit
 		ProxyInterface->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
 		U2.GlossEnd(ProxyInterface);
 	}
+	for (int Pass = 0; U2StreakBegin(Pass); Pass++)   // streaks=1: blood running down characters (a pass per two sources)
+	{
+		ProxyInterface->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
+		U2Streaks::End(ProxyInterface);
+	}
 	if (U2MaskBegin(PrimitiveCount))                // shotmask=1: the same geometry into the character mask
 	{
 		ProxyInterface->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
@@ -1502,6 +1519,11 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawIndexedPrimitive(D3DPRIMITIVETYPE
 		ProxyInterface->DrawIndexedPrimitive(PrimitiveType, CurrentBaseVertexIndex, MinIndex, NumVertices, StartIndex, PrimitiveCount);
 		U2.GlossEnd(ProxyInterface);
 	}
+	for (int Pass = 0; U2StreakBegin(Pass); Pass++)   // streaks=1: blood running down characters (a pass per two sources)
+	{
+		ProxyInterface->DrawIndexedPrimitive(PrimitiveType, CurrentBaseVertexIndex, MinIndex, NumVertices, StartIndex, PrimitiveCount);
+		U2Streaks::End(ProxyInterface);
+	}
 	if (U2MaskBegin(PrimitiveCount))                // shotmask=1: the same geometry into the character mask
 	{
 		ProxyInterface->DrawIndexedPrimitive(PrimitiveType, CurrentBaseVertexIndex, MinIndex, NumVertices, StartIndex, PrimitiveCount);
@@ -1545,6 +1567,11 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawPrimitiveUP(D3DPRIMITIVETYPE Prim
 		ProxyInterface->DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride);
 		U2.GlossEnd(ProxyInterface);
 	}
+	for (int Pass = 0; U2StreakBegin(Pass); Pass++)   // streaks=1: blood running down characters (a pass per two sources)
+	{
+		ProxyInterface->DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride);
+		U2Streaks::End(ProxyInterface);
+	}
 	if (U2MaskBegin(PrimitiveCount))                // shotmask=1: the same geometry into the character mask
 	{
 		ProxyInterface->DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride);
@@ -1572,6 +1599,11 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawIndexedPrimitiveUP(D3DPRIMITIVETY
 	{
 		ProxyInterface->DrawIndexedPrimitiveUP(PrimitiveType, MinVertexIndex, NumVertexIndices, PrimitiveCount, pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride);
 		U2.GlossEnd(ProxyInterface);
+	}
+	for (int Pass = 0; U2StreakBegin(Pass); Pass++)   // streaks=1: blood running down characters (a pass per two sources)
+	{
+		ProxyInterface->DrawIndexedPrimitiveUP(PrimitiveType, MinVertexIndex, NumVertexIndices, PrimitiveCount, pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride);
+		U2Streaks::End(ProxyInterface);
 	}
 	if (U2MaskBegin(PrimitiveCount))                // shotmask=1: the same geometry into the character mask
 	{

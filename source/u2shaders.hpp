@@ -63,6 +63,7 @@
 #include "msaa.hpp"
 #include "blood.hpp"
 #include "runs.hpp"
+#include "streaks.hpp"
 #include <d3dcompiler.h>
 #include "fakefull.hpp"
 #include "crash.hpp"
@@ -223,6 +224,12 @@ public:
 			;
 		else if (sscanf_s(Line, " glossreflect=%f %f", &GlossReflect[0], &GlossReflect[1]) >= 1)
 			;
+		else if (sscanf_s(Line, " streakparams=%f %f %f %f", &U2Streaks::Params[0], &U2Streaks::Params[1], &U2Streaks::Params[2], &U2Streaks::Params[3]) >= 1)
+			;
+		else if (sscanf_s(Line, " streakfx=%f %f %f %f", &U2Streaks::Fx[0], &U2Streaks::Fx[1], &U2Streaks::Fx[2], &U2Streaks::Fx[3]) >= 1)
+			;
+		else if (sscanf_s(Line, " streaks=%u", &Hash) == 1)
+			U2Streaks::On = Hash != 0;        // blood running down characters (streaks.hpp)
 		else if (sscanf_s(Line, " relight=%u", &Hash) == 1)
 			Relight = Hash != 0;
 		else if (sscanf_s(Line, " pcssprobe=%u", &Hash) == 1)
@@ -4657,6 +4664,13 @@ public:
 	bool MaskBroken = false;
 	std::string LastShotPath;
 	std::set<std::string> MaskSeen;          // shotmask: each kind of draw taken into the mask, logged once
+	// streaks=1: blood running down characters, a pass (or more) over a character draw (streaks.hpp)
+	bool StreakBegin(IDirect3DDevice9 *Dev, int Pass, bool FixedFunction, bool Textured)
+	{
+		if (Pass == 0 && (!U2Streaks::Wants(Dev, FixedFunction, Textured) || Offscreen(Dev)))
+			return false;
+		return U2Streaks::Begin(Dev, Pass);
+	}
 	bool MaskBegin(IDirect3DDevice9 *Dev, bool FixedFunction, bool Textured, DWORD Hash, UINT Prims)
 	{
 		if (MaskState != 1 || MaskBroken || !FixedFunction || !Textured || Offscreen(Dev))
@@ -8927,6 +8941,8 @@ public:
 			U2Blood::Step(Dev);
 		if (U2Runs::Count > 0)
 			U2Runs::Step(Dev);
+		if (U2Streaks::On)
+			U2Streaks::NewFrame();             // (marks itself for crash reports: "blood streaks")
 		DepthDirty = true;
 		SceneProjOk = false;
 		GlossLights = GiFrameLights;             // gloss=: the game's lights of the frame just shown
