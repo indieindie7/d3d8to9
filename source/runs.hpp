@@ -134,7 +134,7 @@ namespace U2Runs
 			{
 				const float off = (Rnd() - 0.5f) * r * 1.4f;        // across the splat
 				const float x = cx + S.Gx * r * 0.7f - S.Gy * off, y = cy + S.Gy * r * 0.7f + S.Gx * off;
-				AddDrop(S, x, y, amount * (0.5f + 0.6f * Rnd()) / n * 3.2f, 0.0f, kind);
+				AddDrop(S, x, y, amount * (0.5f + 0.6f * Rnd()) / n * 8.0f, 0.0f, kind);
 			}
 			S.Frozen = false; S.Dirty = true;
 			return 1;
@@ -168,18 +168,21 @@ namespace U2Runs
 			const float dx = (S.Gx * P.Along - S.Gy * across) * dt, dy = (S.Gy * P.Along + S.Gx * across) * dt;
 			const float dist = sqrtf(dx * dx + dy * dy);
 			// the trail: some of the drop stays in every cell it crosses (half to each side for width)
-			const float leave = fminf(P.Mass, dist * (0.016f + 0.010f * P.Mass));
+			const float leave = fminf(P.Mass, dist * (0.030f + 0.012f * P.Mass));
 			const int steps = 1 + (int)dist;
 			for (int s = 0; s < steps; s++)
 			{
 				const float x = P.X + dx * (s + 0.5f) / steps, y = P.Y + dy * (s + 0.5f) / steps;
-				// as wide as the drop: a centre lane and two lanes each side
-				const float w = 0.8f + 1.2f * fminf(1.0f, P.Mass);
-				Deposit(S, x, y, leave / steps * 0.4f, P.Kind);
-				for (int sg = -1; sg <= 1; sg += 2)
+				// as wide as the drop: lanes 0.7 cells apart across it, heavier in the middle (runs_sim.py)
+				const float w = 1.0f + 1.4f * fminf(1.0f, P.Mass);
+				const int lanes = 1 + (int)(w / 0.7f);
+				float tot = 0;
+				for (int k = -lanes; k <= lanes; k++)
+					tot += 1.0f - 0.6f * fabsf((float)k) / lanes;
+				for (int k = -lanes; k <= lanes; k++)
 				{
-					Deposit(S, x - S.Gy * w * 0.5f * sg, y + S.Gx * w * 0.5f * sg, leave / steps * 0.18f, P.Kind);
-					Deposit(S, x - S.Gy * w * sg, y + S.Gx * w * sg, leave / steps * 0.12f, P.Kind);
+					const float o = w * k / lanes;
+					Deposit(S, x - S.Gy * o, y + S.Gx * o, leave / steps * (1.0f - 0.6f * fabsf((float)k) / lanes) / tot, P.Kind);
 				}
 			}
 			P.X += dx; P.Y += dy;
