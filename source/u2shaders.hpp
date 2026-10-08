@@ -61,6 +61,7 @@
 #pragma once
 
 #include "msaa.hpp"
+extern "C" __declspec(dllexport) int __cdecl U2BloodCommand(const char *Cmd);   // d3d8to9_device.cpp: the mod's blood commands (gorelink=)
 #include "blood.hpp"
 #include "runs.hpp"
 #include "streaks.hpp"
@@ -192,6 +193,8 @@ public:
 			ShotMask = Hash != 0;
 		else if (sscanf_s(Line, " live=%u", &Hash) == 1)
 			LiveOn = Hash != 0;
+		else if (sscanf_s(Line, " gorelink=%u", &Hash) == 1)
+			GoreLinkOn = Hash != 0;
 		else if (sscanf_s(Line, " gmterrain=%u", &Hash) == 1)
 			GmTerrainOn = Hash != 0;
 		else if (sscanf_s(Line, " gmpanelscale=%f", &GmPanelScale) == 1)
@@ -2103,6 +2106,124 @@ public:
 		{
 			fprintf(F, "up %lld %s %s\n", (long long)time(nullptr), Base, CurMap.empty() ? "?" : CurMap.c_str());
 			fclose(F);
+		}
+	}
+	// ---- gorelink=1: blood commands from UnrealScript without a native DLL -------------------
+	// Advent's script reaches U2BloodCommand() through AdventNative.dll; Unreal II has no native
+	// bridge. Instead the mod keeps one actor of a class named GoreLink with a string property
+	// (any name) that it rewrites every tick as
+	//     "GL1 <seq>;<command>;<command>;..."
+	// (the commands of blood.hpp/runs.hpp/streaks.hpp/strings.hpp/lens.hpp, ';' between them).
+	// Each frame the layer finds that object in GObjects (the live channel's exports), finds the
+	// string by its "GL1 " prefix (an FString {Data, Num, Max} inside the object; the offset is
+	// remembered), and runs the commands once per new <seq>. The layer only reads: it never
+	// writes the game's memory. No return values (wet, lens's 1/0): the mod decides by its own
+	// settings. At most GoreLinkMax characters a frame; longer text is cut at the last ';'.
+	bool GoreLinkOn = false, GoreLinkTold = false;
+	void *GoreLinkObj = nullptr;
+	int GoreLinkIdx = -1, GoreLinkOff = -1;
+	DWORD GoreLinkScanTick = 0;
+	std::wstring GoreLinkSeq;
+	unsigned GoreLinkRuns = 0, GoreLinkCmds = 0;
+	static const int GoreLinkMax = 16384;
+	static bool GoreLinkIsLink(U2Shaders *S, void *O)
+	{
+		if (O == nullptr || !Readable(O, 64))
+			return false;
+		void *C = S->LiveGetClass(O, nullptr);
+		const wchar_t *CN = C ? S->LiveGetName(C, nullptr) : nullptr;
+		if (CN == nullptr || wcscmp(CN, L"GoreLink") != 0)
+			return false;
+		const wchar_t *N = S->LiveGetName(O, nullptr);
+		return N != nullptr && wcsncmp(N, L"Default__", 9) != 0;
+	}
+	// the FString at Off in the object, if it is one and starts with "GL1 "
+	static const wchar_t *GoreLinkText(void *O, int Off, int &Len)
+	{
+		struct FStr { wchar_t *Data; int Num, Max; };
+		const FStr *F = (const FStr *)((BYTE *)O + Off);
+		if (!Readable(F, sizeof(FStr)) || F->Data == nullptr || F->Num < 5 || F->Num > (1 << 20) || F->Max < F->Num)
+			return nullptr;
+		if (!Readable(F->Data, F->Num * sizeof(wchar_t)) || wcsncmp(F->Data, L"GL1 ", 4) != 0)
+			return nullptr;
+		Len = F->Num - 1;                        // Num counts the terminating zero
+		return F->Data;
+	}
+	void GoreLinkPoll()
+	{
+		if (!LiveBind())
+			return;
+		// the cached object: still in its GObjects slot and still a GoreLink (a new map frees it)
+		if (GoreLinkObj != nullptr && (GoreLinkIdx >= LiveObjs->Num || LiveObjs->Data[GoreLinkIdx] != GoreLinkObj || !GoreLinkIsLink(this, GoreLinkObj)))
+		{
+			Message("gorelink: the GoreLink object went (%u batches, %u commands run)", GoreLinkRuns, GoreLinkCmds);
+			GoreLinkObj = nullptr;
+			GoreLinkOff = -1;
+		}
+		if (GoreLinkObj == nullptr)
+		{
+			const DWORD Now = GetTickCount();
+			if (Now - GoreLinkScanTick < 1000)
+				return;
+			GoreLinkScanTick = Now;
+			for (int i = 0; i < LiveObjs->Num; i++)
+				if (GoreLinkIsLink(this, LiveObjs->Data[i]))
+				{
+					GoreLinkObj = LiveObjs->Data[i];
+					GoreLinkIdx = i;
+					Message("gorelink: found %ls", LiveGetName(GoreLinkObj, nullptr));
+					break;
+				}
+			if (GoreLinkObj == nullptr)
+				return;
+		}
+		int Len = 0;
+		const wchar_t *T = GoreLinkOff >= 0 ? GoreLinkText(GoreLinkObj, GoreLinkOff, Len) : nullptr;
+		if (T == nullptr)
+		{
+			// find the string: past UObject's header, within the first 8 KB that can be read
+			GoreLinkOff = -1;
+			for (int Off = 0x24; Off < 0x2000 && T == nullptr; Off += 4)
+				if ((T = GoreLinkText(GoreLinkObj, Off, Len)) != nullptr)
+					GoreLinkOff = Off;
+			if (T == nullptr)
+				return;                          // nothing sent yet (or "" this tick)
+			Message("gorelink: commands string at +0x%x", GoreLinkOff);
+		}
+		// "GL1 <seq>;": once per new seq
+		int i = 4;
+		while (i < Len && T[i] != L';')
+			i++;
+		const std::wstring Seq(T + 4, T + i);
+		if (Seq == GoreLinkSeq)
+			return;
+		GoreLinkSeq = Seq;
+		GoreLinkRuns++;
+		if (Len > GoreLinkMax)
+		{
+			int Cut = GoreLinkMax;
+			while (Cut > i && T[Cut] != L';')
+				Cut--;
+			if (!GoreLinkTold)
+				Message("gorelink: a batch of %d characters cut to %d (the cap is %d a frame)", Len, Cut, GoreLinkMax);
+			GoreLinkTold = true;
+			Len = Cut;
+		}
+		std::string Cmd;
+		for (int k = i + 1; k <= Len; k++)
+		{
+			if (k == Len || T[k] == L';')
+			{
+				size_t a = Cmd.find_first_not_of(' '), b = Cmd.find_last_not_of(' ');
+				if (a != std::string::npos && Cmd.size() < 1024)
+				{
+					U2BloodCommand(Cmd.substr(a, b - a + 1).c_str());
+					GoreLinkCmds++;
+				}
+				Cmd.clear();
+			}
+			else
+				Cmd += T[k] < 128 ? (char)T[k] : ' ';
 		}
 	}
 	void LivePoll(IDirect3DDevice9 *Dev)
@@ -9074,6 +9195,8 @@ public:
 			WatchShaders();
 		if (Loaded)
 			LivePoll(Dev);
+		if (Loaded && GoreLinkOn)
+			GoreLinkPoll();
 		if (Loaded && GmTerrainOn && Frame % 10 == 5)
 			GmPoll(Dev);
 		if (U2Blood::Count > 0)
