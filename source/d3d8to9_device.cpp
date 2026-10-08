@@ -1136,6 +1136,13 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::SetTextureStageState(DWORD Stage, D3D
 			Value = D3DTEXF_LINEAR;
 		return ProxyInterface->SetSamplerState(Stage, D3DSAMP_MAGFILTER, Value);
 	case D3DTSS_MINFILTER:
+		// aniso=N: a smoothly filtered texture gets anisotropic filtering (floors and terrain at an angle
+		// stay sharp; the game asks for 4x at most). Point filtering (UI, lookup tables) is left alone.
+		if (U2.Aniso > 1 && (Value == D3DTEXF_LINEAR || Value == D3DTEXF_ANISOTROPIC))
+		{
+			ProxyInterface->SetSamplerState(Stage, D3DSAMP_MAXANISOTROPY, U2.Aniso);
+			Value = D3DTEXF_ANISOTROPIC;
+		}
 		return ProxyInterface->SetSamplerState(Stage, D3DSAMP_MINFILTER, Value);
 	case D3DTSS_MIPFILTER:
 		return ProxyInterface->SetSamplerState(Stage, D3DSAMP_MIPFILTER, Value);
@@ -1144,6 +1151,8 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::SetTextureStageState(DWORD Stage, D3D
 	case D3DTSS_MAXMIPLEVEL:
 		return ProxyInterface->SetSamplerState(Stage, D3DSAMP_MAXMIPLEVEL, Value);
 	case D3DTSS_MAXANISOTROPY:
+		if (U2.Aniso > Value)
+			Value = U2.Aniso;
 		return ProxyInterface->SetSamplerState(Stage, D3DSAMP_MAXANISOTROPY, Value);
 	default:
 		return ProxyInterface->SetTextureStageState(Stage, Type, Value);

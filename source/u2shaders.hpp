@@ -134,6 +134,7 @@ class U2Shaders
 {
 public:
 	bool Loaded = false, Log = false, LogSolid = false, StageLog = false;
+	DWORD Aniso = 0;            // aniso=N: smooth texture filtering forced to N x anisotropic (0 = the game's)
 	std::string Dir;           // "<exe dir>\"
 	std::map<DWORD, U2TexInfo> Seen;
 	std::vector<U2Rule> Rules;
@@ -327,6 +328,8 @@ public:
 			R.File = Name;
 			Rules.push_back(R);
 		}
+		else if (sscanf_s(Line, " aniso=%u", &Hash) == 1)
+			Aniso = Hash > 16 ? 16 : Hash;
 		else if (sscanf_s(Line, " stagelog=%u", &Hash) == 1)
 			StageLog = Hash != 0;
 		else if (sscanf_s(Line, " stagetrace=%u", &Hash) == 1)
