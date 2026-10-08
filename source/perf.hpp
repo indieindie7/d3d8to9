@@ -2,10 +2,11 @@
 /**
  * U2Perf - frame times, measured at Present: every 30 s one line in U2Shaders.log with the average
  * frame rate, the 1% low, the worst frame and how many frames went past 50 ms (a hitch you feel),
- * plus a line for each frame over 250 ms (a freeze), at most 20 of those per minute.
+ * plus a line for each frame over 80 ms (a hitch), with the tick count (GetTickCount, the same
+ * clock as AdventNative.log's line stamps), at most 20 of those per minute.
  *
  *   perf: 30 s, 1650 frames: avg 55.0 fps, 1% low 31.2 fps, worst 92 ms, 3 over 50 ms
- *   perf: frame 18234 took 1310 ms (freeze)
+ *   perf: frame 18234 took 1310 ms (hitch)
  *
  * Always on (one line per 30 s).
  */
@@ -40,11 +41,11 @@ struct U2Perf
 			MinuteStart = Now;
 			FreezesThisMinute = 0;
 		}
-		if (Dt > 250 && Frame > 30 && FreezesThisMinute < 20)
+		if (Dt > 80 && Frame > 30 && FreezesThisMinute < 20)
 		{
 			FreezesThisMinute++;
 			char B[96];
-			sprintf_s(B, "perf: frame %u took %.0f ms (freeze)", Frame, Dt);
+			sprintf_s(B, "perf: [%lu] frame %u took %.0f ms (hitch)", (unsigned long)GetTickCount(), Frame, Dt);
 			Message(B);
 		}
 		const double Window = (double)(Now.QuadPart - WindowStart.QuadPart) / Freq.QuadPart;
