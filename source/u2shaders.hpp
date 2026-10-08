@@ -64,6 +64,7 @@
 #include "blood.hpp"
 #include "runs.hpp"
 #include "streaks.hpp"
+#include "strings.hpp"
 #include <d3dcompiler.h>
 #include "fakefull.hpp"
 #include "crash.hpp"
@@ -230,6 +231,12 @@ public:
 			;
 		else if (sscanf_s(Line, " streaks=%u", &Hash) == 1)
 			U2Streaks::On = Hash != 0;        // blood running down characters (streaks.hpp)
+		else if (sscanf_s(Line, " stringparams=%f %f %f %f", &U2Strings::Params[0], &U2Strings::Params[1], &U2Strings::Params[2], &U2Strings::Params[3]) >= 1)
+			;
+		else if (sscanf_s(Line, " stringfx=%f %f %f %f", &U2Strings::Fx[0], &U2Strings::Fx[1], &U2Strings::Fx[2], &U2Strings::Fx[3]) >= 1)
+			;
+		else if (sscanf_s(Line, " strings=%u", &Hash) == 1)
+			U2Strings::On = Hash != 0;        // goo strings between body parts (strings.hpp)
 		else if (sscanf_s(Line, " relight=%u", &Hash) == 1)
 			Relight = Hash != 0;
 		else if (sscanf_s(Line, " pcssprobe=%u", &Hash) == 1)
@@ -530,6 +537,16 @@ public:
 			fclose(F);
 		}
 
+		// one compile per shader source: rules on many textures share the file (decal/gloss/layer rules), and a
+		// compile takes 100-200 ms - done per texture, each new blood texture in a fight was a hitch
+		const auto Hit = PsCache.find(Source);
+		if (Hit != PsCache.end())
+		{
+			R.PS = Hit->second;
+			if (R.PS != nullptr)
+				R.PS->AddRef();
+			return R.PS;
+		}
 		ID3DBlob *Code = nullptr, *Errors = nullptr;
 		HRESULT hr = D3DCompile(Source.data(), Source.size(), R.File.c_str(), nullptr, nullptr, "main", "ps_2_a", 0, 0, &Code, &Errors);
 		if (FAILED(hr))
@@ -544,13 +561,58 @@ public:
 			Errors->Release();
 		}
 		if (FAILED(hr) || Code == nullptr)
+		{
+			PsCache[Source] = nullptr;      // a broken file isn't compiled again on every rule
 			return nullptr;
+		}
 		if (FAILED(Dev->CreatePixelShader(static_cast<const DWORD *>(Code->GetBufferPointer()), &R.PS)))
 			Message("shader %s: CreatePixelShader failed", R.File.c_str());
 		else
+		{
 			Message("shader %s: ready for texture %08x", R.File.empty() ? "(tint)" : R.File.c_str(), R.Hash);
+			R.PS->AddRef();                 // the cache's reference
+			PsCache[Source] = R.PS;
+		}
 		Code->Release();
 		return R.PS;
+	}
+	std::map<std::string, IDirect3DPixelShader9 *> PsCache;   // shader source text -> its compiled shader
+
+	// at load: every rule's shader file compiled once into the cache, so the first draw of each texture
+	// in play costs nothing (the rules then pick theirs from the cache)
+	bool Warmed = false;
+	void WarmShaders(IDirect3DDevice9 *Dev)
+	{
+		if (Warmed || Dev == nullptr)
+			return;
+		Warmed = true;
+		std::set<std::string> Done;
+		unsigned n = 0;
+		LARGE_INTEGER T0, T1, Fq;
+		QueryPerformanceCounter(&T0);
+		auto Warm = [&](const U2Rule &Src)
+		{
+			if (Src.File.empty() || Done.count(Src.File))
+				return;
+			Done.insert(Src.File);
+			U2Rule Tmp;
+			Tmp.File = Src.File;
+			Tmp.Hash = Src.Hash;
+			if (Compile(Dev, Tmp) != nullptr)
+				n++;
+			if (Tmp.PS)
+				Tmp.PS->Release();
+		};
+		for (const U2Rule &R : Rules) Warm(R);
+		for (const U2Rule &R : GlossRules) Warm(R);
+		for (const auto &It : PsReplace) Warm(It.second);
+		if (U2Streaks::On)
+			U2Streaks::Compile(Dev);   // the body-streak shader (first wound was a 130 ms hitch)
+		if (U2Strings::On)
+			U2Strings::Compile(Dev);   // and the goo strings'
+		QueryPerformanceCounter(&T1);
+		QueryPerformanceFrequency(&Fq);
+		Message("shaders: %u rule shader file(s) compiled at load in %.0f ms", n, (T1.QuadPart - T0.QuadPart) * 1000.0 / Fq.QuadPart);
 	}
 
 	// Copies the current render target into SceneTex; false if the copy failed (SceneTex then
@@ -627,6 +689,8 @@ public:
 	{
 		if (!Loaded)
 			Load();
+		if (U2Strings::On && U2Strings::Live > 0 && !U2Strings::Drawn)
+			StringsCheck(Dev);               // strings=1: goo strings, after the world, before the post chain
 		PostCheck(Dev);
 		if (SkGrabWant)
 			SketchDraw(Dev);                 // sketch=1: a frame to freeze, at its first 2D draw
@@ -6046,6 +6110,36 @@ public:
 	std::string PostTraceLine, PostTraceLast;
 	int PostTraceRun = 0;
 
+	// strings=1 (strings.hpp), before every draw while strings live: a perspective world draw on the
+	// screen gives the view (and an opaque one the fog); the first HUD draw after them (2D, no depth
+	// test: posthud=z0's rule, Advent has z-tested 2D draws in its scene) draws the strings
+	void StringsCheck(IDirect3DDevice9 *Dev)
+	{
+		DWORD fvf = 0, z = 0;
+		Dev->GetFVF(&fvf);
+		IDirect3DVertexShader9 *VS = nullptr;
+		Dev->GetVertexShader(&VS);
+		const bool programmable = VS != nullptr;
+		if (VS) VS->Release();
+		D3DMATRIX P = {};
+		Dev->GetTransform(D3DTS_PROJECTION, &P);
+		Dev->GetRenderState(D3DRS_ZENABLE, &z);
+		const bool rhw = (fvf & D3DFVF_POSITION_MASK) == D3DFVF_XYZRHW;
+		const bool ortho = !programmable && !rhw && P._34 == 0.0f && P._44 == 1.0f;
+		if (!programmable && !rhw && P._34 == 1.0f && P._44 == 0.0f)
+		{
+			if (z && !Offscreen(Dev))
+			{
+				DWORD blend = 0;
+				Dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &blend);
+				U2Strings::Capture(Dev, !blend);
+			}
+			return;
+		}
+		if ((rhw || ortho) && !z && U2Strings::Saw3D && !Offscreen(Dev))
+			U2Strings::Draw(Dev);
+	}
+
 	void PostCheck(IDirect3DDevice9 *Dev)
 	{
 		if (!Post || PostDone)
@@ -8671,6 +8765,7 @@ public:
 	}
 	void ReloadRules()
 	{
+		Warmed = false;
 		for (U2Rule &R : Rules)
 		{
 			DropShader(R);
@@ -8925,6 +9020,8 @@ public:
 	void OnPresent(IDirect3DDevice9 *Dev)
 	{
 		U2Crash::Where("the layer's end-of-frame work (post, GI, panel)");
+		if (Loaded && Frame > 5 && !Warmed)
+			WarmShaders(Dev);
 		if (Loaded && Frame % 10 == 0)
 		{
 			if (WatchMap())
@@ -8943,6 +9040,18 @@ public:
 			U2Runs::Step(Dev);
 		if (U2Streaks::On)
 			U2Streaks::NewFrame();             // (marks itself for crash reports: "blood streaks")
+		if (U2Strings::On)
+		{
+			// a frame without a HUD draw: the goo strings now (before the post chain's own fallback
+			// below); not with msaa, whose scene is resolved by now
+			if (U2Strings::Saw3D && !U2Strings::Drawn && U2Strings::Live > 0 && U2Msaa::Wanted() == 0 && Dev != nullptr && !Offscreen(Dev))
+			{
+				Dev->BeginScene();
+				U2Strings::Draw(Dev);
+				Dev->EndScene();
+			}
+			U2Strings::NewFrame();
+		}
 		DepthDirty = true;
 		SceneProjOk = false;
 		GlossLights = GiFrameLights;             // gloss=: the game's lights of the frame just shown
@@ -9074,6 +9183,13 @@ public:
 	void OnDestroy()
 	{
 		OnLost();
+		U2Strings::Release();                    // its pixel shader belongs to this device
+		U2Streaks::Release();                    // the same for the body-streak shader
+		for (auto &It : PsCache)                 // the compile cache's shaders too (and warm again on the next device)
+			if (It.second != nullptr)
+				It.second->Release();
+		PsCache.clear();
+		Warmed = false;
 		for (U2Rule &R : Rules)
 		{
 			if (R.PS != nullptr) { R.PS->Release(); R.PS = nullptr; R.Tried = false; }

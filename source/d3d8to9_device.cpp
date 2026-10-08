@@ -16,15 +16,18 @@ static U2Perf Perf;   // frame times at Present -> U2Shaders.log (perf.hpp)
 static U2Shaders U2;
 // blood.hpp logs through the layer's log, and the mod's native DLL reaches it by this export
 static void U2BloodLog(const char *S) { U2.Message("%s", S); }
-static int U2BloodLogSet = (U2Blood::Log = U2BloodLog, U2Runs::Log = U2BloodLog, U2Streaks::Log = U2BloodLog, 0);
+static int U2BloodLogSet = (U2Blood::Log = U2BloodLog, U2Runs::Log = U2BloodLog, U2Streaks::Log = U2BloodLog, U2Strings::Log = U2BloodLog, 0);
 // the mod's blood commands: floor pools (blood.hpp), wall runs (runs.hpp: run, drip, rstop) and
-// streaks down characters (streaks.hpp: streak, streaks, streakclear)
+// streaks down characters (streaks.hpp: streak, streaks, streakclear) and goo strings between body
+// parts (strings.hpp: string, stringoff, stringclear)
 extern "C" __declspec(dllexport) int __cdecl U2BloodCommand(const char *Cmd)
 {
 	char Word[16] = "";
 	sscanf_s(Cmd, "%15s", Word, (unsigned)sizeof(Word));
 	if (U2Streaks::Handles(Word))
 		return U2Streaks::Command(Cmd);
+	if (U2Strings::Handles(Word))
+		return U2Strings::Command(Cmd);
 	return U2Runs::Handles(Word) ? U2Runs::Command(Cmd) : U2Blood::Command(Cmd);
 }
 // a shotp from outside (AdventNative's "Capture"): the next presented frame saved as System\ShotP#####.bmp;
