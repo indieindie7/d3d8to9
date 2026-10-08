@@ -6084,6 +6084,27 @@ public:
 			Message("live: %s changed, compiled again at its next draw", F.c_str());
 	}
 
+	// U2Shaders.ini without its runtime switches (pcss=, shotp=), plus the map its map= parts are read for
+	std::string LastRuleText;
+	std::string RuleText()
+	{
+		std::string T = CurMap + "\n";
+		FILE *F = nullptr;
+		if (fopen_s(&F, (Dir + "U2Shaders.ini").c_str(), "r") || F == nullptr)
+			return T;
+		char Line[512];
+		while (fgets(Line, sizeof(Line), F))
+		{
+			const char *c = Line;
+			while (*c == ' ' || *c == '\t')
+				c++;
+			if (_strnicmp(c, "pcss=", 5) == 0 || _strnicmp(c, "shotp=", 6) == 0)
+				continue;
+			T += c;
+		}
+		fclose(F);
+		return T;
+	}
 	void ReloadPost(bool Force)
 	{
 		WIN32_FILE_ATTRIBUTE_DATA A = {};
@@ -6099,8 +6120,13 @@ public:
 		if (Force)
 			Message("post: watching U2Shaders.ini for changes (frame %u)", Frame);
 		IniTime = A.ftLastWriteTime;
-		if (!Force)
+		// the rules again only when a rule line changed: the mod flips pcss= (indoors/outdoors) and the
+		// pilot bumps shotp= while the game runs, and a full reload compiles every shader again (a hitch
+		// of a second or more each time)
+		std::string Text = RuleText();
+		if (!Force && Text != LastRuleText)
 			ReloadRules();
+		LastRuleText = Text;
 		FILE *F = nullptr;
 		if (fopen_s(&F, (Dir + "U2Shaders.ini").c_str(), "r") || F == nullptr)
 			return;
