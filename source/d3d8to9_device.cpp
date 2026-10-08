@@ -10,6 +10,8 @@
 #include <regex>
 #include <assert.h>
 #include "u2shaders.hpp"
+#include "perf.hpp"
+static U2Perf Perf;   // frame times at Present -> U2Shaders.log (perf.hpp)
 
 static U2Shaders U2;
 // blood.hpp logs through the layer's log, and the mod's native DLL reaches it by this export
@@ -286,6 +288,7 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::Present(const RECT *pSourceRect, cons
 		U2.MsaaSelfTest(ProxyInterface);
 	TexEd().OnPresent(U2, ProxyInterface);   // texedit: pick readback, ini/journal watch, adjust bakes
 	U2.OnPresent(ProxyInterface);
+	Perf.OnPresent([](const char *Line) { U2.Message("%s", Line); });
 	U2Crash::Where("the driver's Present");
 	const HRESULT Hr = ProxyInterface->Present(pSourceRect, pDestRect, hDestWindowOverride, nullptr);
 	U2Crash::Where("the game's own code or draws (between frames)");
