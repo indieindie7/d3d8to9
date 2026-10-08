@@ -134,7 +134,7 @@ namespace U2Runs
 			{
 				const float off = (Rnd() - 0.5f) * r * 1.4f;        // across the splat
 				const float x = cx + S.Gx * r * 0.7f - S.Gy * off, y = cy + S.Gy * r * 0.7f + S.Gx * off;
-				AddDrop(S, x, y, amount * (0.5f + 0.6f * Rnd()) / n * 1.6f, 0.0f, kind);
+				AddDrop(S, x, y, amount * (0.5f + 0.6f * Rnd()) / n * 3.2f, 0.0f, kind);
 			}
 			S.Frozen = false; S.Dirty = true;
 			return 1;
@@ -159,7 +159,7 @@ namespace U2Runs
 			if (!P.Live)
 				continue;
 			// speed along "down": gravity against a drag that a heavier drop overcomes better
-			const float top = 1.5f + 12.0f * P.Mass;          // cells/s: a heavy run is quick, a thin one creeps
+			const float top = 0.8f + 3.0f * P.Mass;           // cells/s: slow, so a run plays out over ~10 s (runs_sim.py)
 			P.Along = fminf(top, P.Along + Gravity * dt * fminf(1.0f, P.Mass * 1.5f));
 			// a wobble across, and the side speed a branch was given dying away
 			P.Wobble += dt * (3.0f + Rnd() * 4.0f);
@@ -168,14 +168,19 @@ namespace U2Runs
 			const float dx = (S.Gx * P.Along - S.Gy * across) * dt, dy = (S.Gy * P.Along + S.Gx * across) * dt;
 			const float dist = sqrtf(dx * dx + dy * dy);
 			// the trail: some of the drop stays in every cell it crosses (half to each side for width)
-			const float leave = fminf(P.Mass, dist * (0.015f + 0.010f * P.Mass));
+			const float leave = fminf(P.Mass, dist * (0.016f + 0.010f * P.Mass));
 			const int steps = 1 + (int)dist;
 			for (int s = 0; s < steps; s++)
 			{
 				const float x = P.X + dx * (s + 0.5f) / steps, y = P.Y + dy * (s + 0.5f) / steps;
-				Deposit(S, x, y, leave / steps * 0.6f, P.Kind);
-				Deposit(S, x - S.Gy * 0.8f, y + S.Gx * 0.8f, leave / steps * 0.2f, P.Kind);
-				Deposit(S, x + S.Gy * 0.8f, y - S.Gx * 0.8f, leave / steps * 0.2f, P.Kind);
+				// as wide as the drop: a centre lane and two lanes each side
+				const float w = 0.8f + 1.2f * fminf(1.0f, P.Mass);
+				Deposit(S, x, y, leave / steps * 0.4f, P.Kind);
+				for (int sg = -1; sg <= 1; sg += 2)
+				{
+					Deposit(S, x - S.Gy * w * 0.5f * sg, y + S.Gx * w * 0.5f * sg, leave / steps * 0.18f, P.Kind);
+					Deposit(S, x - S.Gy * w * sg, y + S.Gx * w * sg, leave / steps * 0.12f, P.Kind);
+				}
 			}
 			P.X += dx; P.Y += dy;
 			P.Mass -= leave;
@@ -184,7 +189,7 @@ namespace U2Runs
 			{
 				const float part = P.Mass * 0.35f;
 				P.Mass -= part;
-				AddDrop(S, P.X, P.Y, part, (Rnd() < 0.5f ? -1.0f : 1.0f) * (5.0f + Rnd() * 6.0f), P.Kind);
+				AddDrop(S, P.X, P.Y, part, (Rnd() < 0.5f ? -1.0f : 1.0f) * (1.5f + Rnd() * 2.5f), P.Kind);
 			}
 			// stopped: the last of it stays as a bead; off the sheet: gone
 			if (P.Mass < 0.06f || P.X < 0 || P.Y < 0 || P.X >= N || P.Y >= N)
