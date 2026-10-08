@@ -332,6 +332,8 @@ public:
 			{
 				LutFile = F;
 				if (LutTex) { LutTex->Release(); LutTex = nullptr; }
+		if (TerrainDetailTex) { TerrainDetailTex->Release(); TerrainDetailTex = nullptr; }
+		TerrainDetailTried = false;
 				LutTried = false;
 			}
 		}
@@ -6021,7 +6023,16 @@ public:
 		if (Mode == 7)
 		{
 			Dev->SetPixelShader(OldPS);
-			Dev->SetPixelShaderConstantF(0, OldTerrConst[0], 9);
+			Dev->SetPixelShaderConstantF(0, OldTerrConst[0], 10);
+			if (TerrDetailBound)
+			{
+				static const D3DSAMPLERSTATETYPE SS[6] = { D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DSAMP_MAXANISOTROPY };
+				Dev->SetTexture(6, OldTerrTex6);
+				if (OldTerrTex6) { OldTerrTex6->Release(); OldTerrTex6 = nullptr; }
+				for (int i = 0; i < 6; i++)
+					Dev->SetSamplerState(6, SS[i], OldTerrSamp6[i]);
+				TerrDetailBound = false;
+			}
 			Dev->SetTextureStageState(5, D3DTSS_TEXCOORDINDEX, OldTerrTCI5);
 			Dev->SetTextureStageState(5, D3DTSS_TEXTURETRANSFORMFLAGS, OldTerrTTF5);
 			Dev->SetTransform(D3DTS_TEXTURE5, &OldTerrTexMat5);
@@ -6227,7 +6238,15 @@ public:
 	float TerrainFog2[4] = { 0, 0, 0, 0 };
 	float TerrainFx2[4] = { 0, 0, 0, 0 };                // c7 terrainfx2=: relief, relief scale, slope rock, strata
 	float TerrainTone[4] = { 0, 0, 0, 0 };               // c8 terraintone=: ground lift, desaturate, rock brightness, 0
-	float OldTerrConst[9][4] = {};
+	// terraindetail=FILE (a DDS in U2Shaders, make_terrain_detail.py) on s6 for the psreplace shaders,
+	// c9 terraindetailfx= strength, near repeat, far repeat (world units), fade distance (0 strength = off)
+	float TerrainDetail[4] = { 0, 40, 170, 900 };
+	std::string TerrainDetailFile;
+	IDirect3DTexture9 *TerrainDetailTex = nullptr;
+	bool TerrainDetailTried = false, TerrDetailBound = false;
+	IDirect3DBaseTexture9 *OldTerrTex6 = nullptr;
+	DWORD OldTerrSamp6[6] = {};
+	float OldTerrConst[10][4] = {};
 	DWORD OldTerrTCI5 = 0, OldTerrTTF5 = 0;
 	D3DMATRIX OldTerrTexMat5 = {};
 
@@ -6262,7 +6281,7 @@ public:
 		if (PS == nullptr)
 			return false;
 		Dev->GetPixelShader(&OldPS);
-		Dev->GetPixelShaderConstantF(0, OldTerrConst[0], 9);
+		Dev->GetPixelShaderConstantF(0, OldTerrConst[0], 10);
 		Dev->GetTextureStageState(5, D3DTSS_TEXCOORDINDEX, &OldTerrTCI5);
 		Dev->GetTextureStageState(5, D3DTSS_TEXTURETRANSFORMFLAGS, &OldTerrTTF5);
 		Dev->GetTransform(D3DTS_TEXTURE5, &OldTerrTexMat5);
@@ -6270,7 +6289,7 @@ public:
 		Dev->SetTextureStageState(5, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_CAMERASPACEPOSITION | 5);
 		Dev->SetTextureStageState(5, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT3);
 		Dev->SetTransform(D3DTS_TEXTURE5, &Identity);
-		float c[9][4] = {};
+		float c[10][4] = {};
 		c[0][0] = (GetTickCount() % 100000) / 1000.0f;
 		D3DMATRIX V;
 		Dev->GetTransform(D3DTS_VIEW, &V);
@@ -6284,7 +6303,32 @@ public:
 		memcpy(c[6], TerrainFog2, sizeof(TerrainFog2));
 		memcpy(c[7], TerrainFx2, sizeof(TerrainFx2));
 		memcpy(c[8], TerrainTone, sizeof(TerrainTone));
-		Dev->SetPixelShaderConstantF(0, c[0], 9);
+		// the close-up detail texture on s6
+		TerrDetailBound = false;
+		if (TerrainDetail[0] > 0 && !TerrainDetailFile.empty())
+		{
+			if (!TerrainDetailTried)
+			{
+				TerrainDetailTried = true;
+				TerrainDetailTex = LoadDDS(Dev, TerrainDetailFile);
+				Message("terrain: detail %s %s", TerrainDetailFile.c_str(), TerrainDetailTex ? "loaded" : "missing: no close-up detail");
+			}
+			if (TerrainDetailTex != nullptr)
+			{
+				static const D3DSAMPLERSTATETYPE SS[6] = { D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DSAMP_MAXANISOTROPY };
+				static const DWORD Val[6] = { D3DTADDRESS_WRAP, D3DTADDRESS_WRAP, D3DTEXF_LINEAR, D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR, 8 };
+				Dev->GetTexture(6, &OldTerrTex6);
+				for (int i = 0; i < 6; i++)
+				{
+					Dev->GetSamplerState(6, SS[i], &OldTerrSamp6[i]);
+					Dev->SetSamplerState(6, SS[i], Val[i]);
+				}
+				Dev->SetTexture(6, TerrainDetailTex);
+				TerrDetailBound = true;
+				memcpy(c[9], TerrainDetail, sizeof(TerrainDetail));
+			}
+		}
+		Dev->SetPixelShaderConstantF(0, c[0], 10);
 		Dev->SetPixelShader(PS);
 		Mode = 7;
 		return true;
@@ -9792,6 +9836,23 @@ public:
 				;
 			else if (sscanf_s(Line, " terraintone=%f %f %f %f", &TerrainTone[0], &TerrainTone[1], &TerrainTone[2], &TerrainTone[3]) >= 1)
 				;
+			else if (sscanf_s(Line, " terraindetailfx=%f %f %f %f", &TerrainDetail[0], &TerrainDetail[1], &TerrainDetail[2], &TerrainDetail[3]) >= 1)
+			{
+				TerrainDetail[1] = (std::max)(TerrainDetail[1], 1.0f);
+				TerrainDetail[2] = (std::max)(TerrainDetail[2], 1.0f);
+				TerrainDetail[3] = (std::max)(TerrainDetail[3], 1.0f);
+			}
+			else if (strncmp(Line + strspn(Line, " \t"), "terraindetail=", 14) == 0)
+			{
+				char F[260] = "";
+				sscanf_s(Line + strspn(Line, " \t") + 14, "%259s", F, (unsigned)sizeof(F));
+				if (TerrainDetailFile != F)
+				{
+					TerrainDetailFile = F;
+					if (TerrainDetailTex) { TerrainDetailTex->Release(); TerrainDetailTex = nullptr; }
+					TerrainDetailTried = false;
+				}
+			}
 			else if (strncmp(Line + strspn(Line, " \t"), "lut=", 4) == 0)
 			{
 				char F[260] = "";
@@ -9800,6 +9861,8 @@ public:
 				{
 					LutFile = F;
 					if (LutTex) { LutTex->Release(); LutTex = nullptr; }
+		if (TerrainDetailTex) { TerrainDetailTex->Release(); TerrainDetailTex = nullptr; }
+		TerrainDetailTried = false;
 					LutTried = false;
 				}
 			}
@@ -10036,6 +10099,8 @@ public:
 		// on every fullscreen/windowed switch, and a texture from the old one bound to the new one
 		// broke it (black screen, then a crash in the game's resource cleanup)
 		if (LutTex) { LutTex->Release(); LutTex = nullptr; }
+		if (TerrainDetailTex) { TerrainDetailTex->Release(); TerrainDetailTex = nullptr; }
+		TerrainDetailTried = false;
 		LutTried = false;
 		for (auto &It : Replacements)
 		{
