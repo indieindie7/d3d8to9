@@ -23,7 +23,9 @@
  *                                 geometry is drawn once more with the shader, added on top
  *                                 (ONE/ONE): wet highlights on blood that the game multiplies
  *                                 into the floor. See GlossBegin; glossfx= / glossenv= tune it
- *     surface=1a2b3c4d world_parallax.hlsl
+ *     surface=1a2b3c4d world_parallax.hlsl [detail.dds]
+ *                                 (with a detail DDS: bound on s3, c4..c7 = camera -> world rows,
+ *                                 for world-space detail such as world_detail.hlsl)
  *                                 a solid surface (wall, floor) drawn with parallax: the
  *                                 shader redoes the texture stages (texture x vertex colour
  *                                 x lightmap in s1, see SurfaceBegin); the lightmap and the
@@ -448,6 +450,11 @@ public:
 			R.Hash = Hash;
 			R.File = Name;
 			R.Surface = true;
+			// a third value names a detail texture (a DDS in U2Shaders) bound on sampler 3, for shaders
+			// that lay it on in world space (world_detail.hlsl: Avalon Q81, the flat-palette buildings)
+			char Detail[256] = "";
+			if (sscanf_s(Line, " surface=%*x %*s %255s", Detail, (unsigned)sizeof(Detail)) == 1)
+				R.MapFile = Detail;
 			Rules.push_back(R);
 		}
 	}
@@ -5789,6 +5796,9 @@ public:
 		return true;
 	}
 
+	IDirect3DBaseTexture9 *OldDetailTex = nullptr;   // surface= with a detail DDS: sampler 3 put back after
+	DWORD OldDetailSS[5] = {};
+	bool DetailBound = false;
 	bool SurfaceBegin(IDirect3DDevice9 *Dev, U2Rule &R, bool FixedFunction)
 	{
 		DWORD Blending = 0;
@@ -5879,6 +5889,34 @@ public:
 		}
 		memcpy(Const[3], R.Levels, sizeof(R.Levels));
 		Dev->SetPixelShaderConstantF(0, Const[0], 4);
+		DetailBound = false;
+		if (!R.MapFile.empty())
+		{
+			if (!R.MapTried)
+			{
+				R.MapTried = true;
+				R.Map = LoadDDS(Dev, R.MapFile);
+				Message("surface %08x: detail %s %s", R.Hash, R.MapFile.c_str(), R.Map ? "loaded" : "missing: no detail");
+			}
+			if (R.Map)
+			{
+				Dev->GetTexture(3, &OldDetailTex);
+				const D3DSAMPLERSTATETYPE Ss[5] = { D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MINFILTER, D3DSAMP_MAGFILTER, D3DSAMP_MIPFILTER };
+				for (int i = 0; i < 5; i++)
+					Dev->GetSamplerState(3, Ss[i], &OldDetailSS[i]);
+				Dev->SetTexture(3, R.Map);
+				Dev->SetSamplerState(3, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+				Dev->SetSamplerState(3, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+				Dev->SetSamplerState(3, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+				Dev->SetSamplerState(3, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+				Dev->SetSamplerState(3, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
+				D3DMATRIX V;
+				Dev->GetTransform(D3DTS_VIEW, &V);
+				const D3DMATRIX Inv = InvView(V);
+				Dev->SetPixelShaderConstantF(4, &Inv.m[0][0], 4);     // c4..c7: camera -> world, row vectors
+				DetailBound = true;
+			}
+		}
 		Dev->SetPixelShader(PS);
 		Mode = 5;
 		return true;
@@ -6171,6 +6209,15 @@ public:
 		}
 		if (Mode == 5)
 		{
+			if (DetailBound)
+			{
+				const D3DSAMPLERSTATETYPE Ss[5] = { D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MINFILTER, D3DSAMP_MAGFILTER, D3DSAMP_MIPFILTER };
+				Dev->SetTexture(3, OldDetailTex);
+				for (int i = 0; i < 5; i++)
+					Dev->SetSamplerState(3, Ss[i], OldDetailSS[i]);
+				if (OldDetailTex) { OldDetailTex->Release(); OldDetailTex = nullptr; }
+				DetailBound = false;
+			}
 			Dev->SetPixelShader(OldPS);
 			Dev->SetPixelShaderConstantF(0, OldConst[0], 8);
 			Dev->SetTextureStageState(2, D3DTSS_TEXCOORDINDEX, OldTCI[2]);
