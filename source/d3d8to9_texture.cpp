@@ -47,7 +47,13 @@ ULONG STDMETHODCALLTYPE Direct3DTexture8::AddRef()
 }
 ULONG STDMETHODCALLTYPE Direct3DTexture8::Release()
 {
-	return ProxyInterface->Release();
+	const ULONG Left = ProxyInterface->Release();
+	// U2Shaders: this wrapper outlives its texture, and D3D9 can hand the same address to a new texture later
+	// (a FLUSH, a map load): the new one must be hashed again, or it inherits the old one's rules (replace=,
+	// glass=...): Dalton's armour maps showed up on the command deck's floor pits (Avalon Q57/Q82)
+	if (Left == 0)
+		U2Hash = 0;
+	return Left;
 }
 
 HRESULT STDMETHODCALLTYPE Direct3DTexture8::GetDevice(IDirect3DDevice8 **ppDevice)
