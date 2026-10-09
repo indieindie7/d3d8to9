@@ -4200,6 +4200,8 @@ public:
 	unsigned SkConsoleSeq = 0, SkPixSeq = 0; // console openings; the one the frozen frame is from (0 none)
 	D3DMATRIX SkPixView = {};                // the camera when the frame was frozen
 	bool SkPixViewOk = false, SkConStale = false; // con= said open but the camera moved since: a missed close
+	D3DMATRIX SkConView = {};                // the camera when con= went to open
+	bool SkConViewOk = false;
 	bool SkGrabWant = false, SkGrabSaw3D = false, SkGrabPending = false, SkGrabFull = false;
 	bool SkGrabForConsole = false, SkOpenOnGrab = false;
 	int SkGrabAge = 0;
@@ -4451,7 +4453,7 @@ public:
 		// away from the console's frame means it is shut: no strip, and the key freezes a fresh frame.
 		if (!ConRaw)
 			SkConStale = false;
-		else if (SkConsole && !SkOpen && !SkGrabWant && !SkGrabPending && SkPixSeq == SkConsoleSeq && SkViewMoved())
+		else if (SkConsole && !SkOpen && SkConMoved())
 		{
 			SkConStale = true;
 			Message("sketch: the camera moved with con= still open: taken as a missed console close");
@@ -4459,11 +4461,24 @@ public:
 		const bool Con = ConRaw && !SkConStale;
 		if (Con && !SkConsole)
 		{
+			SkConView = GmView;
+			SkConViewOk = GmViewOk;
 			SkConsoleSeq++;
 			if (!SkOpen && !SkGrabWant)
 				SkWantGrab(true);
 		}
 		SkConsole = Con;
+	}
+	// the camera moved away from where it was when con= went to open (the open console holds the camera still)
+	bool SkConMoved() const
+	{
+		if (!GmViewOk || !SkConViewOk)
+			return false;
+		for (int r = 0; r < 4; r++)
+			for (int c = 0; c < 3; c++)
+				if (fabsf(GmView.m[r][c] - SkConView.m[r][c]) > (r == 3 ? 4.0f : 0.01f))
+					return true;
+		return false;
 	}
 	bool SkViewMoved() const
 	{
