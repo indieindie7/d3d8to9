@@ -1159,18 +1159,21 @@ public:
 	// zwrite=: the texture's blended draws write depth where they're solid enough (alpha test)
 	std::map<DWORD, DWORD> ZWriteTex;
 	bool ZwOn = false;
-	DWORD ZwOld[4] = {};
-	void ZWriteBegin(IDirect3DDevice9 *Dev, DWORD Hash)
+	DWORD ZwOld[5] = {};
+	// after the game's own (soft, unchanged) draw: the same geometry again, depth only, where alpha > ref
+	bool ZWriteBegin(IDirect3DDevice9 *Dev, DWORD Hash)
 	{
 		if (ZWriteTex.empty())
-			return;
+			return false;
 		auto It = ZWriteTex.find(Hash);
 		if (It == ZWriteTex.end())
-			return;
+			return false;
 		DWORD Blend = 0;
 		Dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &Blend);
 		if (!Blend)
-			return;
+			return false;
+		Dev->GetRenderState(D3DRS_COLORWRITEENABLE, &ZwOld[4]);
+		Dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0);
 		Dev->GetRenderState(D3DRS_ZWRITEENABLE, &ZwOld[0]);
 		Dev->GetRenderState(D3DRS_ALPHATESTENABLE, &ZwOld[1]);
 		Dev->GetRenderState(D3DRS_ALPHAREF, &ZwOld[2]);
@@ -1180,6 +1183,7 @@ public:
 		Dev->SetRenderState(D3DRS_ALPHAREF, It->second);
 		Dev->SetRenderState(D3DRS_ALPHAFUNC, D3DCMP_GREATER);
 		ZwOn = true;
+		return true;
 	}
 	void ZWriteEnd(IDirect3DDevice9 *Dev)
 	{
@@ -1190,6 +1194,7 @@ public:
 		Dev->SetRenderState(D3DRS_ALPHATESTENABLE, ZwOld[1]);
 		Dev->SetRenderState(D3DRS_ALPHAREF, ZwOld[2]);
 		Dev->SetRenderState(D3DRS_ALPHAFUNC, ZwOld[3]);
+		Dev->SetRenderState(D3DRS_COLORWRITEENABLE, ZwOld[4]);
 	}
 
 	bool Begin(IDirect3DDevice9 *Dev, IDirect3DTexture9 *Tex, DWORD &Hash, bool FixedFunction)

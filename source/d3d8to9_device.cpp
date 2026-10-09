@@ -1338,8 +1338,6 @@ bool Direct3DDevice8::U2Begin()
 				U2Swapped |= 1u << s;
 			}
 	U2.LogTargetDraw(ProxyInterface, FixedFunction, U2Stage0 != nullptr);
-	if (U2Stage0 != nullptr)
-		U2.ZWriteBegin(ProxyInterface, U2Stage0->U2Hash);   // zwrite=: undone in U2After
 	if (U2.StageLog)
 	{
 		// stagelog=1: each distinct on-screen draw setup once: what sits on stages 0-3 (2D texture
@@ -1542,6 +1540,11 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawPrimitive(D3DPRIMITIVETYPE Primit
 			PrimitiveType == D3DPT_TRIANGLELIST ? PrimitiveCount * 3 : PrimitiveCount + 2);
 	U2PerfScope PerfAfter(U2PerfC().Draw, PerfScale);   // (until the return: the layer's extra passes on this geometry)
 	U2After(Shaded);
+	if (U2Stage0 != nullptr && U2.ZWriteBegin(ProxyInterface, U2Stage0->U2Hash))   // zwrite=: depth only, the soft edges stay
+	{
+		ProxyInterface->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
+		U2.ZWriteEnd(ProxyInterface);
+	}
 	if (U2GlossBegin())                             // gloss=: the same geometry again, added on top
 	{
 		ProxyInterface->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
@@ -1626,6 +1629,11 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawIndexedPrimitive(D3DPRIMITIVETYPE
 	U2.LastDrawHR = ProxyInterface->DrawIndexedPrimitive(PrimitiveType, CurrentBaseVertexIndex, MinIndex, NumVertices, StartIndex, PrimitiveCount);
 	U2PerfScope PerfAfter(U2PerfC().Draw, PerfScale);   // (until the return: the layer's extra passes on this geometry)
 	U2After(Shaded);
+	if (U2Stage0 != nullptr && U2.ZWriteBegin(ProxyInterface, U2Stage0->U2Hash))   // zwrite=: depth only, the soft edges stay
+	{
+		ProxyInterface->DrawIndexedPrimitive(PrimitiveType, CurrentBaseVertexIndex, MinIndex, NumVertices, StartIndex, PrimitiveCount);
+		U2.ZWriteEnd(ProxyInterface);
+	}
 	if (U2GlossBegin())                             // gloss=: the same geometry again, added on top
 	{
 		ProxyInterface->DrawIndexedPrimitive(PrimitiveType, CurrentBaseVertexIndex, MinIndex, NumVertices, StartIndex, PrimitiveCount);
@@ -1685,6 +1693,11 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawPrimitiveUP(D3DPRIMITIVETYPE Prim
 	U2ProbeVerts(pVertexStreamZeroData, VertexStreamZeroStride, 0, PrimitiveType == D3DPT_TRIANGLELIST ? PrimitiveCount * 3 : PrimitiveCount + 2);
 	U2PerfScope PerfAfter(U2PerfC().Draw, PerfScale);   // (until the return: the layer's extra passes on this geometry)
 	U2After(Shaded);
+	if (U2Stage0 != nullptr && U2.ZWriteBegin(ProxyInterface, U2Stage0->U2Hash))   // zwrite=: depth only, the soft edges stay
+	{
+		ProxyInterface->DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride);
+		U2.ZWriteEnd(ProxyInterface);
+	}
 	if (U2GlossBegin())                             // gloss=: the same geometry again, added on top
 	{
 		ProxyInterface->DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride);
@@ -1729,6 +1742,11 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawIndexedPrimitiveUP(D3DPRIMITIVETY
 	U2ProbeVerts(pVertexStreamZeroData, VertexStreamZeroStride, MinVertexIndex, NumVertexIndices);
 	U2PerfScope PerfAfter(U2PerfC().Draw, PerfScale);   // (until the return: the layer's extra passes on this geometry)
 	U2After(Shaded);
+	if (U2Stage0 != nullptr && U2.ZWriteBegin(ProxyInterface, U2Stage0->U2Hash))   // zwrite=: depth only, the soft edges stay
+	{
+		ProxyInterface->DrawIndexedPrimitiveUP(PrimitiveType, MinVertexIndex, NumVertexIndices, PrimitiveCount, pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride);
+		U2.ZWriteEnd(ProxyInterface);
+	}
 	if (U2GlossBegin())                             // gloss=: the same geometry again, added on top
 	{
 		ProxyInterface->DrawIndexedPrimitiveUP(PrimitiveType, MinVertexIndex, NumVertexIndices, PrimitiveCount, pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride);
