@@ -1338,6 +1338,8 @@ bool Direct3DDevice8::U2Begin()
 				U2Swapped |= 1u << s;
 			}
 	U2.LogTargetDraw(ProxyInterface, FixedFunction, U2Stage0 != nullptr);
+	if (U2Stage0 != nullptr)
+		U2.ZWriteBegin(ProxyInterface, U2Stage0->U2Hash);   // zwrite=: undone in U2After
 	if (U2.StageLog)
 	{
 		// stagelog=1: each distinct on-screen draw setup once: what sits on stages 0-3 (2D texture
@@ -1480,6 +1482,7 @@ void Direct3DDevice8::U2After(bool Shaded)
 	U2.RelightEnd(ProxyInterface);
 	if (Shaded)
 		U2.End(ProxyInterface);
+	U2.ZWriteEnd(ProxyInterface);
 	for (DWORD s = 0; s < 4; s++)
 		if ((U2Swapped & (1u << s)) && U2Stages[s] != nullptr)
 			ProxyInterface->SetTexture(s, U2Stages[s]->GetProxyInterface());

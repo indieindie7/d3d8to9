@@ -8,6 +8,9 @@
  *     log=1                       list alpha-blended textures in U2Shaders.log and
  *                                 save each one to U2Shaders\dump\<hash>_<w>x<h>.dds
  *     tint=1a2b3c4d               draw everything using that texture in flat magenta
+ *     zwrite=1a2b3c4d [ref]       alpha-blended draws of that texture also write depth where their
+ *                                 alpha > ref (default 24): smoke out at sea stops being painted over
+ *                                 by the translucent sea surface drawn after it (Avalon Q59)
  *     shader=1a2b3c4d core.hlsl   draw it with U2Shaders\core.hlsl (entry "main", ps_2_a)
  *     layer=1a2b3c4d terrain_hex.hlsl   bind only the shader: stages, coordinates, transforms,
  *                                 samplers and blending stay the game's (Unreal II terrain layers)
@@ -336,6 +339,12 @@ public:
 		TerrainDetailTried = false;
 				LutTried = false;
 			}
+		}
+		else if (strncmp(Line + strspn(Line, " 	"), "zwrite=", 7) == 0)
+		{
+			DWORD Ref = 24;
+			if (sscanf_s(Line, " zwrite=%x %u", &Hash, &Ref) >= 1)
+				ZWriteTex[Hash] = Ref;
 		}
 		else if (sscanf_s(Line, " tint=%x", &Hash) == 1)
 		{
@@ -1145,6 +1154,42 @@ public:
 		Dev->SetPixelShader(PS);
 		Mode = 8;
 		return true;
+	}
+
+	// zwrite=: the texture's blended draws write depth where they're solid enough (alpha test)
+	std::map<DWORD, DWORD> ZWriteTex;
+	bool ZwOn = false;
+	DWORD ZwOld[4] = {};
+	void ZWriteBegin(IDirect3DDevice9 *Dev, DWORD Hash)
+	{
+		if (ZWriteTex.empty())
+			return;
+		auto It = ZWriteTex.find(Hash);
+		if (It == ZWriteTex.end())
+			return;
+		DWORD Blend = 0;
+		Dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &Blend);
+		if (!Blend)
+			return;
+		Dev->GetRenderState(D3DRS_ZWRITEENABLE, &ZwOld[0]);
+		Dev->GetRenderState(D3DRS_ALPHATESTENABLE, &ZwOld[1]);
+		Dev->GetRenderState(D3DRS_ALPHAREF, &ZwOld[2]);
+		Dev->GetRenderState(D3DRS_ALPHAFUNC, &ZwOld[3]);
+		Dev->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+		Dev->SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);
+		Dev->SetRenderState(D3DRS_ALPHAREF, It->second);
+		Dev->SetRenderState(D3DRS_ALPHAFUNC, D3DCMP_GREATER);
+		ZwOn = true;
+	}
+	void ZWriteEnd(IDirect3DDevice9 *Dev)
+	{
+		if (!ZwOn)
+			return;
+		ZwOn = false;
+		Dev->SetRenderState(D3DRS_ZWRITEENABLE, ZwOld[0]);
+		Dev->SetRenderState(D3DRS_ALPHATESTENABLE, ZwOld[1]);
+		Dev->SetRenderState(D3DRS_ALPHAREF, ZwOld[2]);
+		Dev->SetRenderState(D3DRS_ALPHAFUNC, ZwOld[3]);
 	}
 
 	bool Begin(IDirect3DDevice9 *Dev, IDirect3DTexture9 *Tex, DWORD &Hash, bool FixedFunction)
