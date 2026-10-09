@@ -140,6 +140,18 @@ static void ImGui_ImplDX9_SetupRenderState(ImDrawData* draw_data)
     device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
     device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
     device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+    // d3d8to9 fork: Unreal II leaves stage 0's texture transform on (terrain layers, panning) and may leave a mip
+    // bias / wrap mode; drawn after the game, ImGui's font and the sketch's frozen frame came out smeared and blocky
+    device->SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+    device->SetTextureStageState(0, D3DTSS_TEXCOORDINDEX, 0);
+    device->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+    device->SetSamplerState(0, D3DSAMP_MIPMAPLODBIAS, 0);
+    device->SetSamplerState(0, D3DSAMP_MAXMIPLEVEL, 0);
+    device->SetSamplerState(0, D3DSAMP_SRGBTEXTURE, FALSE);
+    device->SetRenderState(D3DRS_WRAP0, 0);
+    device->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
+    device->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+    device->SetRenderState(D3DRS_STENCILENABLE, FALSE);
 
     // Setup orthographic projection matrix
     // Our visible imgui space lies from draw_data->DisplayPos (top left) to draw_data->DisplayPos+data_data->DisplaySize (bottom right). DisplayPos is (0,0) for single viewport apps.
