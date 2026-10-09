@@ -3940,6 +3940,24 @@ public:
 		}
 		if (GmPanelMode != 0 && (M == WM_KEYUP || M == WM_SYSKEYUP) && A == VK_F7)
 			return true;
+		// the console from its keys (Avalon Q72c): Console.ui's triggers reach U2GM only when the console closes,
+		// and PC.bIsTyping never changes in Unreal II. User.ini: Tilde = ShowConsole (the big console), Tab = Type
+		// (the one-line one); the big one closes on Escape or Tilde, the one-line one on Enter or Escape. Each change
+		// goes to U2GM as "gm con big|quick 1|0" (GMCine pauses a cinematic while it is open)
+		if (GmPanelStarted && !GmPanelShown && !SkOpen && (M == WM_KEYDOWN || M == WM_SYSKEYDOWN) && !(B & (1 << 30)))
+		{
+			int Next = KeyCon;
+			if (KeyCon == 0 && A == VK_OEM_3) Next = 1;
+			else if (KeyCon == 0 && A == VK_TAB) Next = 2;
+			else if (KeyCon == 1 && (A == VK_ESCAPE || A == VK_OEM_3)) Next = 0;
+			else if (KeyCon == 2 && (A == VK_RETURN || A == VK_ESCAPE)) Next = 0;
+			if (Next != KeyCon)
+			{
+				const char *Which = (Next == 2 || KeyCon == 2) ? "quick" : "big";
+				KeyCon = Next;
+				GmSend("con %s %d", Which, Next != 0 ? 1 : 0);
+			}
+		}
 		if (SketchOn && GmPanelStarted)
 		{
 			// sketch=1: its key (never reaches the game: U2 binds F8 to QuickLoad), the console's strip, Escape
@@ -4201,6 +4219,7 @@ public:
 	D3DMATRIX SkPixView = {};                // the camera when the frame was frozen
 	bool SkPixViewOk = false, SkConStale = false; // con= said open but the camera moved since: a missed close
 	D3DMATRIX SkConView = {};                // the camera when con= went to open
+	int KeyCon = 0;                          // the console from its keys: 0 closed, 1 the big one, 2 the one-line one
 	bool SkConViewOk = false;
 	bool SkGrabWant = false, SkGrabSaw3D = false, SkGrabPending = false, SkGrabFull = false;
 	bool SkGrabForConsole = false, SkOpenOnGrab = false;
