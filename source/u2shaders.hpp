@@ -4437,14 +4437,10 @@ public:
 		SkGrabSaw3D = false;
 		SkGrabForConsole = ForConsole;
 	}
-	// the key or the strip: the console's frame if there is one, else a fresh one first
+	// the key or the strip: always a fresh frame, the game camera as it is now (the user's rule: never
+	// an older frame, e.g. the one frozen when the console opened to type "avalon mark")
 	void SkRequestOpen()
 	{
-		if (SkConsole && SkPixSeq != 0 && SkPixSeq == SkConsoleSeq && !SkPix.empty())
-		{
-			SkSetOpen(true);
-			return;
-		}
 		if (!(SkGrabWant && SkGrabForConsole))
 			SkWantGrab(SkConsole);
 		SkOpenOnGrab = true;
