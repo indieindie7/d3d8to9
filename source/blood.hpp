@@ -59,6 +59,10 @@ namespace U2Blood
 		float PourRate = 0;                        // the sum over the sources (0: nothing pouring)
 		int Kind = 0;                              // the region's default kind
 		float Still = 0;                           // seconds without motion
+		// the cells that were ever wet (a box): steps and uploads skip the dry rest of the sheet,
+		// which in a fight was most of the layer's cost (8 full 128x128 sheets solved and uploaded)
+		int WI0 = N, WI1 = -1, WJ0 = N, WJ1 = -1;
+		bool Full = true;                          // the next upload writes the whole texture
 		IDirect3DTexture9 *Tex = nullptr;
 	};
 	static Sheet *Slots = new Sheet[MaxSlots];       // on the heap: 8 x 100 KB of grids would bloat the dll as static data
@@ -91,6 +95,14 @@ namespace U2Blood
 				S.Mix[j * N + i] = (float)S.Kind;
 			}
 		S.PourRate = 0; S.Still = 0; S.Frozen = false; S.Dirty = true;
+		S.WI0 = N; S.WI1 = -1; S.WJ0 = N; S.WJ1 = -1; S.Full = true;
+	}
+
+	// the box around (cx, cy) of radius r in cells, clamped to the sheet
+	inline void Box(float cx, float cy, float r, int &i0, int &i1, int &j0, int &j1)
+	{
+		i0 = (int)fmaxf(0.0f, cx - r - 1); i1 = (int)fminf((float)N, cx + r + 2);
+		j0 = (int)fmaxf(0.0f, cy - r - 1); j1 = (int)fminf((float)N, cy + r + 2);
 	}
 
 	// U2BloodCommand(): see the header comment
@@ -142,8 +154,9 @@ namespace U2Blood
 			// something lies in the blood at (u, v), radius C (texture units), height D: the bed
 			// rises under it so the blood flows around and against it, not through it
 			const float cx = A * N, cy = Bq * N, r = fmaxf(C * N, 1.0f);
-			for (int j = 0; j < N; j++)
-				for (int i = 0; i < N; i++)
+			int i0, i1, j0, j1; Box(cx, cy, r, i0, i1, j0, j1);
+			for (int j = j0; j < j1; j++)
+				for (int i = i0; i < i1; i++)
 				{
 					const float d2 = (i + 0.5f - cx) * (i + 0.5f - cx) + (j + 0.5f - cy) * (j + 0.5f - cy);
 					if (d2 < r * r)
@@ -158,8 +171,9 @@ namespace U2Blood
 			const float cx = A * N, cy = Bq * N, r = fmaxf(E * N, 1.0f);
 			const float vx = C * N, vy = D * N;
 			float moved = 0; int ring = 0;
-			for (int j = 0; j < N; j++)
-				for (int i = 0; i < N; i++)
+			int i0, i1, j0, j1; Box(cx, cy, r + 1.5f, i0, i1, j0, j1);
+			for (int j = j0; j < j1; j++)
+				for (int i = i0; i < i1; i++)
 				{
 					const float d2 = (i + 0.5f - cx) * (i + 0.5f - cx) + (j + 0.5f - cy) * (j + 0.5f - cy);
 					float &h = S.H[j * N + i];
@@ -177,8 +191,8 @@ namespace U2Blood
 						ring++;
 				}
 			if (ring > 0 && moved > 0)
-				for (int j = 0; j < N; j++)
-					for (int i = 0; i < N; i++)
+				for (int j = j0; j < j1; j++)
+					for (int i = i0; i < i1; i++)
 					{
 						const float d2 = (i + 0.5f - cx) * (i + 0.5f - cx) + (j + 0.5f - cy) * (j + 0.5f - cy);
 						if (d2 >= r * r && d2 < (r + 1.5f) * (r + 1.5f))
@@ -225,11 +239,15 @@ namespace U2Blood
 	{
 		static float U[N * N], V[N * N];
 		float smax = 1e-6f;
+		int wi0 = N, wi1 = -1, wj0 = N, wj1 = -1;
 		for (int c = 0; c < N * N; c++)
 		{
 			const float h = S.H[c];
 			if (h > Dry)
 			{
+				const int i = c % N, j = c / N;
+				if (i < wi0) wi0 = i; if (i > wi1) wi1 = i;
+				if (j < wj0) wj0 = j; if (j > wj1) wj1 = j;
 				const float cap = 20.0f * h;        // a speed cap: a thick liquid never races
 				S.Hu[c] = fmaxf(-cap, fminf(cap, S.Hu[c]));
 				S.Hv[c] = fmaxf(-cap, fminf(cap, S.Hv[c]));
@@ -241,14 +259,28 @@ namespace U2Blood
 				U[c] = V[c] = 0; S.Hu[c] = S.Hv[c] = 0;
 			}
 		}
+		if (wi1 < 0)
+		{
+			// a dry sheet: nothing moves
+			if (S.PourRate <= 0)
+				S.Still += Dt;
+			return Dt;
+		}
+		// only the wet box and a ring of one dry cell around it: a face between two dry cells
+		// carries nothing (both reconstructed depths are 0), so the rest is skipped exactly
+		const int i0 = wi0 > 0 ? wi0 - 1 : 0, i1 = wi1 < N - 1 ? wi1 + 1 : N - 1;
+		const int j0 = wj0 > 0 ? wj0 - 1 : 0, j1 = wj1 < N - 1 ? wj1 + 1 : N - 1;
+		if (i0 < S.WI0) S.WI0 = i0; if (i1 > S.WI1) S.WI1 = i1;
+		if (j0 < S.WJ0) S.WJ0 = j0; if (j1 > S.WJ1) S.WJ1 = j1;
 		const float dt = fminf(Dt, Cfl / smax);
-		memcpy(S.H2, S.H, sizeof(S.H)); memcpy(S.Hu2, S.Hu, sizeof(S.Hu)); memcpy(S.Hv2, S.Hv, sizeof(S.Hv));
+		const size_t Off = (size_t)j0 * N, Rows = (size_t)(j1 - j0 + 1) * N * sizeof(float);
+		memcpy(S.H2 + Off, S.H + Off, Rows); memcpy(S.Hu2 + Off, S.Hu + Off, Rows); memcpy(S.Hv2 + Off, S.Hv + Off, Rows);
 		float F[3], sL, sR;
-		for (int j = 0; j < N; j++)
-			for (int i = 0; i < N; i++)
+		for (int j = j0; j <= j1; j++)
+			for (int i = i0; i <= i1; i++)
 			{
 				const int c = j * N + i;
-				if (i + 1 < N)
+				if (i + 1 <= i1)
 				{
 					const int r = c + 1;
 					Face(S.H[c], S.H[r], U[c], U[r], V[c], V[r], S.B[c], S.B[r], F, sL, sR);
@@ -256,7 +288,7 @@ namespace U2Blood
 					S.Hu2[c] -= dt * (F[1] - sL); S.Hu2[r] += dt * (F[1] - sR);
 					S.Hv2[c] -= dt * F[2]; S.Hv2[r] += dt * F[2];
 				}
-				if (j + 1 < N)
+				if (j + 1 <= j1)
 				{
 					const int d = c + N;
 					Face(S.H[c], S.H[d], V[c], V[d], U[c], U[d], S.B[c], S.B[d], F, sL, sR);
@@ -267,7 +299,7 @@ namespace U2Blood
 			}
 		const float damp = powf(1.0f - Friction, dt);
 		float motion = 0;
-		for (int c = 0; c < N * N; c++)
+		for (int c = (int)Off; c < (j1 + 1) * N; c++)
 		{
 			S.H[c] = fmaxf(0.0f, S.H2[c]);
 			S.Hu[c] = S.Hu2[c] * damp; S.Hv[c] = S.Hv2[c] * damp;
@@ -317,19 +349,32 @@ namespace U2Blood
 	// as deeper), alpha the coverage
 	inline void Upload(IDirect3DDevice9 *Dev, Sheet &S)
 	{
-		if (S.Tex == nullptr && FAILED(Dev->CreateTexture(N, N, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &S.Tex, nullptr)))
-			return;
+		if (S.Tex == nullptr)
+		{
+			if (FAILED(Dev->CreateTexture(N, N, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &S.Tex, nullptr)))
+				return;
+			S.Full = true;
+		}
+		// after one full write only the ever-wet box (+1 for the highlight's neighbours) changes
+		int ui0 = 0, ui1 = N - 1, uj0 = 0, uj1 = N - 1;
+		if (!S.Full)
+		{
+			if (S.WI1 < 0) { S.Dirty = false; return; }
+			ui0 = S.WI0 > 0 ? S.WI0 - 1 : 0; ui1 = S.WI1 < N - 1 ? S.WI1 + 1 : N - 1;
+			uj0 = S.WJ0 > 0 ? S.WJ0 - 1 : 0; uj1 = S.WJ1 < N - 1 ? S.WJ1 + 1 : N - 1;
+		}
+		RECT R = { ui0, uj0, ui1 + 1, uj1 + 1 };
 		D3DLOCKED_RECT L;
-		if (FAILED(S.Tex->LockRect(0, &L, nullptr, 0)))
+		if (FAILED(S.Tex->LockRect(0, &L, S.Full ? nullptr : &R, 0)))
 			return;
 		// a puddle, not paint: dark where deep, a thin lighter meniscus at the wet edge, and a
 		// baked highlight from a fixed light over the surface's slope (the decal multiplies the
 		// floor x2, so a highlight can reach twice the floor's brightness, no more)
 		const float hx = -0.35f, hy = -0.30f, hz = 0.89f;        // the half vector of a light up and to one side
-		for (int j = 0; j < N; j++)
+		for (int j = uj0; j <= uj1; j++)
 		{
-			DWORD *row = (DWORD *)((BYTE *)L.pBits + j * L.Pitch);
-			for (int i = 0; i < N; i++)
+			DWORD *row = (DWORD *)((BYTE *)L.pBits + (j - uj0) * L.Pitch) - ui0;
+			for (int i = ui0; i <= ui1; i++)
 			{
 				const float d = S.H[j * N + i];
 				float cov = fmaxf(0.0f, fminf(1.0f, (d - 0.01f) / 0.02f));
@@ -357,7 +402,7 @@ namespace U2Blood
 			}
 		}
 		S.Tex->UnlockRect(0);
-		S.Dirty = false;
+		S.Dirty = false; S.Full = false;
 	}
 
 	// each frame, from the device's Present: the active sheets step and re-upload
