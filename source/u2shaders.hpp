@@ -5373,6 +5373,11 @@ public:
 			return false;
 		T->GetDesc(&D);
 		T->Release();
+		if (MsaaBound >= 0 && T == MsaaProxies[MsaaBound].Multi)
+		{
+			D.Width = MsaaProxies[MsaaBound].W;     // msaa: the padded stand-in counts as the game's own size
+			D.Height = MsaaProxies[MsaaBound].H;
+		}
 		if (SUCCEEDED(Dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &BB)) && BB) { BB->GetDesc(&B); BB->Release(); }
 		return D.Width != B.Width || D.Height != B.Height;
 	}
@@ -6982,6 +6987,7 @@ public:
 				Dev->SetTextureStageState(s, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
 			}
 			Dev->SetTexture(1, nullptr);
+			MsaaDepthProbe(Dev, Saved.DS);
 			RunGi(Dev, Saved.DS);
 			RunSsao(Dev, Saved.DS);
 			RunSss(Dev, Saved.DS);
@@ -7523,6 +7529,38 @@ public:
 				Dev->Clear(0, nullptr, D3DCLEAR_STENCIL, 0, 1.0f, 0);
 			return;
 		}
+	}
+
+	// test (msaa on, once): which ways of copying the multisampled depth into a readable one the
+	// card takes - RESZ (a resolve through a point draw) and StretchRect into INTZ or plain depth
+	void MsaaDepthProbe(IDirect3DDevice9 *Dev, IDirect3DSurface9 *DS)
+	{
+		static bool Done = false;
+		if (Done || U2Msaa::Wanted() == 0 || DS == nullptr)
+			return;
+		Done = true;
+		D3DSURFACE_DESC D = {};
+		DS->GetDesc(&D);
+		IDirect3D9 *D3 = nullptr;
+		HRESULT resz = E_FAIL;
+		if (SUCCEEDED(Dev->GetDirect3D(&D3)) && D3)
+		{
+			resz = D3->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, D3DUSAGE_RENDERTARGET, D3DRTYPE_SURFACE, (D3DFORMAT)MAKEFOURCC('R', 'E', 'S', 'Z'));
+			D3->Release();
+		}
+		HRESULT intz = E_FAIL, plain = E_FAIL;
+		IDirect3DTexture9 *T = nullptr;
+		IDirect3DSurface9 *TS = nullptr, *P = nullptr;
+		if (SUCCEEDED(Dev->CreateTexture(D.Width, D.Height, 1, D3DUSAGE_DEPTHSTENCIL, (D3DFORMAT)MAKEFOURCC('I', 'N', 'T', 'Z'), D3DPOOL_DEFAULT, &T, nullptr)) && T
+			&& SUCCEEDED(T->GetSurfaceLevel(0, &TS)) && TS)
+			intz = Dev->StretchRect(DS, nullptr, TS, nullptr, D3DTEXF_NONE);
+		if (SUCCEEDED(Dev->CreateDepthStencilSurface(D.Width, D.Height, D.Format, D3DMULTISAMPLE_NONE, 0, FALSE, &P, nullptr)) && P)
+			plain = Dev->StretchRect(DS, nullptr, P, nullptr, D3DTEXF_NONE);
+		Message("msaa depth probe: depth %ux%u format %u sampled %u; RESZ %s, StretchRect into INTZ 0x%08x, into plain depth 0x%08x",
+			D.Width, D.Height, (unsigned)D.Format, (unsigned)D.MultiSampleType, SUCCEEDED(resz) ? "yes" : "no", (unsigned)intz, (unsigned)plain);
+		if (TS) TS->Release();
+		if (T) T->Release();
+		if (P) P->Release();
 	}
 
 	IDirect3DTexture9 *DepthTexOf(IDirect3DSurface9 *Ours)
