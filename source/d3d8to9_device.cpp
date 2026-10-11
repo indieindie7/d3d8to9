@@ -802,6 +802,10 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::Clear(DWORD Count, const D3DRECT *pRe
 }
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::SetTransform(D3DTRANSFORMSTATETYPE State, const D3DMATRIX *pMatrix)
 {
+	// taa=: the frame's sub-pixel offset on the world's projection (U2Shaders::TaaJitter)
+	D3DMATRIX Jittered;
+	if (State == D3DTS_PROJECTION && pMatrix != nullptr && (Jittered = *pMatrix, U2.TaaJitter(Jittered)))
+		pMatrix = &Jittered;
 	return ProxyInterface->SetTransform(State, pMatrix);
 }
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::GetTransform(D3DTRANSFORMSTATETYPE State, D3DMATRIX *pMatrix)

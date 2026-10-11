@@ -6701,7 +6701,7 @@ public:
 			SceneProj = P;                    // gi.hlsl / ssao.hlsl rebuild positions from depth with it
 			Dev->GetTransform(D3DTS_VIEW, &SceneView);
 			SceneProjOk = true;
-			if (BlurFx[0] > 0 || SsrFx[0] > 0)
+			if (BlurFx[0] > 0 || SsrFx[0] > 0 || TaaFx[0] > 0)
 			{
 				// motion blur wants the world's own camera: the last perspective draw of a frame
 				// can be something with a fixed view, so take the view of draws with no world matrix
@@ -7170,7 +7170,9 @@ public:
 			RunSss(Dev, Saved.DS);
 			RunAtmos(Dev, Saved.DS);
 			RunSsr(Dev, Saved.DS);
+			RunTaa(Dev, Saved.DS);
 			RunBlur(Dev, Saved.DS);
+			BlurViewOk = false;            // the view is taken again each frame
 			IDirect3DTexture9 *AAFrame = RunSmaa(Dev);
 			IDirect3DTexture9 *Eye = RunEye(Dev);
 
@@ -9335,6 +9337,185 @@ public:
 		Dev->SetTexture(1, nullptr);
 	}
 
+	// ---- temporal anti-aliasing (taa=share jitter sharpen debug; share 0 = off) ---------------
+	// The projection moves by a sub-pixel offset each frame (TaaJitter, from SetTransform); taa.hlsl
+	// blends the frame copy into a history carried along with the camera (as the motion blur does)
+	// and clamped to the colours around each pixel. Runs after the floor reflections, before the
+	// motion blur, so the blur never goes into the history. The history is two targets in turn,
+	// the newest copied back into the frame copy.
+	float TaaFx[4] = { 0.0f, 1.0f, 0.25f, 0.0f };
+	bool TaaBroken = false, TaaHavePrev = false;
+	IDirect3DVertexShader9 *TaaVS = nullptr;
+	IDirect3DPixelShader9 *TaaPS = nullptr;
+	IDirect3DTexture9 *TaaHist[2] = {};
+	int TaaNow = 0;
+	UINT TaaW = 0, TaaH = 0, TaaFrame = 0;
+	float TaaJx = 0, TaaJy = 0;          // this frame's offset in pixels (right, down)
+	D3DMATRIX TaaPrevView = {}, TaaPrevProj = {};
+
+	void TaaRelease()
+	{
+		for (IDirect3DTexture9 *&T : TaaHist)
+			if (T) { T->Release(); T = nullptr; }
+		if (TaaVS) { TaaVS->Release(); TaaVS = nullptr; }
+		if (TaaPS) { TaaPS->Release(); TaaPS = nullptr; }
+		TaaW = TaaH = 0;
+		TaaHavePrev = false;
+	}
+	static float Halton(UINT i, UINT b)
+	{
+		float f = 1, r = 0;
+		for (; i > 0; i /= b) { f /= b; r += f * (i % b); }
+		return r;
+	}
+	// SetTransform(D3DTS_PROJECTION): the frame's sub-pixel offset added to a perspective
+	// projection (row vectors with w = z, so _31/_32 shift the whole picture in clip space)
+	bool TaaJitter(D3DMATRIX &M) const
+	{
+		if (TaaFx[0] <= 0 || TaaBroken || TaaW == 0 || M._34 != 1.0f || M._44 != 0.0f)
+			return false;
+		M._31 += TaaJx * 2.0f / TaaW;
+		M._32 -= TaaJy * 2.0f / TaaH;
+		return true;
+	}
+	bool TaaBuild(IDirect3DDevice9 *Dev)
+	{
+		if (TaaBroken)
+			return false;
+		if (TaaPS != nullptr)
+			return true;
+		const std::string Src = ReadShaderFile("taa.hlsl");
+		if (Src.empty())
+		{
+			Message("taa: taa.hlsl missing in U2Shaders, off");
+			TaaBroken = true;
+			return false;
+		}
+		static const char *Names[2] = { "TaaVS", "TaaPS" };
+		for (int i = 0; i < 2; i++)
+		{
+			ID3DBlob *Code = nullptr, *Errors = nullptr;
+			const HRESULT hr = D3DCompile(Src.data(), Src.size(), "taa.hlsl", nullptr, nullptr, Names[i], i == 0 ? "vs_3_0" : "ps_3_0",
+				D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &Code, &Errors);
+			if (FAILED(hr) || Code == nullptr)
+			{
+				Message("taa: %s failed: %s", Names[i], Errors ? (const char *)Errors->GetBufferPointer() : "?");
+				if (Errors) Errors->Release();
+				TaaBroken = true;
+				return false;
+			}
+			if (Errors) Errors->Release();
+			const HRESULT cr = i == 0 ? Dev->CreateVertexShader((const DWORD *)Code->GetBufferPointer(), &TaaVS)
+				: Dev->CreatePixelShader((const DWORD *)Code->GetBufferPointer(), &TaaPS);
+			Code->Release();
+			if (FAILED(cr))
+			{
+				Message("taa: the card refused %s (%08x)", Names[i], (unsigned)cr);
+				TaaBroken = true;
+				return false;
+			}
+		}
+		Message("taa: ready (share %.2f, jitter %.2f px, sharpen %.2f)", TaaFx[0], TaaFx[1], TaaFx[2]);
+		return true;
+	}
+	void RunTaa(IDirect3DDevice9 *Dev, IDirect3DSurface9 *BoundDepth)
+	{
+		if (TaaFx[0] <= 0 || TaaBroken || SceneTex == nullptr || !SceneProjOk || !BlurViewOk)
+			return;
+		IDirect3DTexture9 *Depth = DepthTexOf(BoundDepth);
+		if (Depth != nullptr && KeptDepth != nullptr && KeptDepth != Depth && KeptDraws > SegDraws)
+			Depth = KeptDepth;
+		if (Depth == nullptr || SsaoVB == nullptr || !TaaBuild(Dev))
+			return;
+		if (TaaHist[0] == nullptr || TaaW != SceneW || TaaH != SceneH)
+		{
+			for (IDirect3DTexture9 *&T : TaaHist)
+			{
+				if (T) T->Release();
+				T = nullptr;
+				if (FAILED(Dev->CreateTexture(SceneW, SceneH, 1, D3DUSAGE_RENDERTARGET, SceneFmt, D3DPOOL_DEFAULT, &T, nullptr)))
+				{
+					Message("taa: history couldn't be made (%ux%u), off", SceneW, SceneH);
+					T = nullptr;
+					TaaBroken = true;
+					return;
+				}
+			}
+			TaaW = SceneW; TaaH = SceneH;
+			TaaHavePrev = false;
+		}
+		// this frame's projection without its offset, for carrying positions between frames
+		const D3DMATRIX View = BlurView;
+		D3DMATRIX P = SceneProj;
+		P._31 -= TaaJx * 2.0f / TaaW;
+		P._32 += TaaJy * 2.0f / TaaH;
+		bool Reset = !TaaHavePrev;
+		if (!Reset)
+		{
+			const D3DMATRIX Was = InvView(TaaPrevView), Now = InvView(View);
+			float Move = 0, Turn = 0;
+			for (int c = 0; c < 3; c++)
+			{
+				Move += (Now.m[3][c] - Was.m[3][c]) * (Now.m[3][c] - Was.m[3][c]);
+				Turn += View.m[c][2] * TaaPrevView.m[c][2];
+			}
+			Reset = Move > 400.0f * 400.0f || Turn < 0.7f;   // a camera cut
+			static int Logged = 0;
+			if (TaaFx[3] > 0.5f && (++Logged % 30) == 0 && Logged < 600)
+				Message("taa debug: turned %.2f deg, moved %.1f", acosf((std::min)(Turn, 1.0f)) * 57.2958f, sqrtf(Move));
+		}
+		const D3DMATRIX M = MatMul(MatMul(InvView(View), TaaHavePrev ? TaaPrevView : View), TaaHavePrev ? TaaPrevProj : P);
+		TaaPrevView = View; TaaPrevProj = P; TaaHavePrev = true;
+		float Mt[4][4];
+		for (int r = 0; r < 4; r++)
+			for (int c = 0; c < 4; c++)
+				Mt[r][c] = M.m[c][r];
+		const float full[4] = { 1.0f / SceneW, 1.0f / SceneH, (float)SceneW, (float)SceneH };
+		const float proj[4] = { P._11, P._22, P._33, P._43 };
+		const float reset[4] = { Reset ? 1.0f : 0.0f, 0, 0, 0 };
+		IDirect3DTexture9 *Prev = TaaHist[TaaNow], *Out = TaaHist[TaaNow ^ 1];
+		Dev->SetFVF(D3DFVF_XYZ | D3DFVF_TEX1);
+		Dev->SetStreamSource(0, SsaoVB, 0, sizeof(SmaaVertex));
+		Dev->SetVertexShader(TaaVS);
+		Dev->SetVertexShaderConstantF(0, full, 1);
+		Dev->SetPixelShader(TaaPS);
+		Dev->SetPixelShaderConstantF(0, full, 1);
+		Dev->SetPixelShaderConstantF(1, proj, 1);
+		Dev->SetPixelShaderConstantF(2, TaaFx, 1);
+		Dev->SetPixelShaderConstantF(3, &Mt[0][0], 4);
+		Dev->SetPixelShaderConstantF(7, reset, 1);
+		SmaaSampler(Dev, 0, D3DTEXF_POINT);
+		SmaaSampler(Dev, 1, D3DTEXF_POINT);
+		SmaaSampler(Dev, 2, D3DTEXF_LINEAR);
+		Target(Dev, Out);
+		Dev->SetTexture(0, SceneTex);
+		Dev->SetTexture(1, Depth);
+		Dev->SetTexture(2, Prev);
+		Dev->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
+		Dev->SetTexture(0, nullptr);
+		Dev->SetTexture(1, nullptr);
+		Dev->SetTexture(2, nullptr);
+		// the result back into the frame copy (the history keeps its own target)
+		IDirect3DSurface9 *From = nullptr, *To = nullptr;
+		if (SUCCEEDED(Out->GetSurfaceLevel(0, &From)) && SUCCEEDED(SceneTex->GetSurfaceLevel(0, &To)))
+			Dev->StretchRect(From, nullptr, To, nullptr, D3DTEXF_NONE);
+		if (From) From->Release();
+		if (To) To->Release();
+		TaaNow ^= 1;
+		// the next frame's offset: Halton 2,3 over 8 places, centred on the pixel
+		TaaFrame = (TaaFrame + 1) & 7;
+		TaaJx = (Halton(TaaFrame + 1, 2) - 0.5f) * TaaFx[1];
+		TaaJy = (Halton(TaaFrame + 1, 3) - 0.5f) * TaaFx[1];
+		static int Ran = 0;
+		if (Ran++ < 1)
+			Message("taa: running (%ux%u)", SceneW, SceneH);
+		Dev->SetVertexShader(nullptr);
+		Dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+		Dev->SetStreamSource(0, PostQuadVB, 0, sizeof(U2QuadVertex));
+		for (DWORD t = 0; t < 3; t++)
+			SmaaSampler(Dev, t, D3DTEXF_LINEAR);
+	}
+
 	// ---- camera motion blur (motionblur=strength nearfade maxpixels debug; strength 0 = off) ----
 	// motion_blur.hlsl on the frame copy, after atmos and before SMAA: each pixel's position from
 	// the depth is carried through last frame's camera, and the frame is averaged along the
@@ -10683,6 +10864,8 @@ public:
 				BlurFx[2] = (std::max)(BlurFx[2], 1.0f);
 			else if (sscanf_s(Line, " ssr=%f %f %f %f", &SsrFx[0], &SsrFx[1], &SsrFx[2], &SsrFx[3]) >= 1)
 				SsrFx[1] = (std::max)(SsrFx[1], 10.0f);
+			else if (sscanf_s(Line, " taa=%f %f %f %f", &TaaFx[0], &TaaFx[1], &TaaFx[2], &TaaFx[3]) >= 1)
+				TaaFx[0] = (std::min)(TaaFx[0], 1.0f);
 			else if (sscanf_s(Line, " hurtfx=%f %f %f %f", &HurtFx[0], &HurtFx[1], &HurtFx[2], &HurtFx[3]) >= 1)
 				HurtFx[3] = (std::max)(HurtFx[3], 0.05f);
 			else if (sscanf_s(Line, " ssaocontact=%f %f %f %f", &SsaoContact[0], &SsaoContact[1], &SsaoContact[2], &SsaoContact[3]) >= 1)
@@ -11020,6 +11203,7 @@ public:
 		SssReleaseAll();
 		BlurRelease();
 		SsrRelease();
+		TaaRelease();
 		SssBroken = false;
 		GiBroken = false;
 		DepthBroken = false;
