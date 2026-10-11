@@ -6142,7 +6142,7 @@ public:
 			Message("pbr %08x: %d lights on (%d used), ambient %.2f %.2f %.2f, texture factor %.0f", (unsigned)Pbr->Hash, LightsOn, Count, C[3][0], C[3][1], C[3][2], Factor);
 		}
 		Dev->SetPixelShader(PS);
-		if (Pbr != nullptr && Pbr->PbrBlend)
+		if (Pbr != nullptr)                     // char_pbr / char_skin write COLOR1: skin mask (sss) + normal (ssao)
 			SkinMaskBegin(Dev);
 		Mode = 6;
 		return true;
@@ -8080,8 +8080,14 @@ public:
 		Dev->SetPixelShader(SsaoPS[0]);
 		Dev->SetTexture(0, Depth);
 		Dev->SetTexture(1, Over);
+		// the characters' own normals; c2.x says they are there (a missing texture reads as alpha 1)
+		const bool charN = SsaoNormals && SkinMaskUsed && SkinMask != nullptr;
+		const float charOn[4] = { charN ? 1.0f : 0.0f, 0, 0, 0 };
+		Dev->SetPixelShaderConstantF(2, charOn, 1);
+		Dev->SetTexture(2, charN ? SkinMask : nullptr);
 		Dev->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
 		Dev->SetTexture(1, nullptr);
+		Dev->SetTexture(2, nullptr);
 
 		// 2: the occlusion
 		Target(Dev, SsaoA);
@@ -8619,6 +8625,11 @@ public:
 	UINT SssW = 0, SssH = 0;
 	bool SkinMaskBound = false, SkinMaskUsed = false;
 	IDirect3DSurface9 *OldRT1 = nullptr;
+	// SkinMask is really the characters' info target (A8R8G8B8): r, b = the camera-space normal's
+	// x, y (*0.5+0.5; char_pbr / char_skin COLOR1), g = skin (sss.hlsl reads only that), a = drawn.
+	// ssao.hlsl uses those normals in place of the ones guessed from depth (ssaonormals=0: off).
+	bool SsaoNormals = true;
+	bool CharInfoWanted() const { return (Sss && !SssBroken) || (Ssao && !SsaoBroken && SsaoNormals); }
 
 	void SssReleaseTargets()
 	{
@@ -8677,7 +8688,7 @@ public:
 	// the skin mask as render target 1 for a skin draw (CharBegin)
 	void SkinMaskBegin(IDirect3DDevice9 *Dev)
 	{
-		if (!Sss || SssBroken || SkinMask == nullptr || SkinMaskBound)
+		if (!CharInfoWanted() || SkinMask == nullptr || SkinMaskBound)
 			return;
 		IDirect3DSurface9 *RT0 = nullptr, *M = nullptr;
 		D3DSURFACE_DESC D0 = {};
@@ -8710,13 +8721,13 @@ public:
 
 	void RunSss(IDirect3DDevice9 *Dev, IDirect3DSurface9 *BoundDepth)
 	{
-		if (!Sss || SssBroken || SceneTex == nullptr)
+		if (!CharInfoWanted() || SceneTex == nullptr)
 			return;
-		// the targets first (the mask has to exist before the next frame's skin draws)
+		// the targets first (the mask has to exist before the next frame's character draws)
 		if (SkinMask == nullptr || SssW != SceneW || SssH != SceneH)
 		{
 			SssReleaseTargets();
-			const bool Ok = SUCCEEDED(Dev->CreateTexture(SceneW, SceneH, 1, D3DUSAGE_RENDERTARGET, SceneFmt, D3DPOOL_DEFAULT, &SkinMask, nullptr))
+			const bool Ok = SUCCEEDED(Dev->CreateTexture(SceneW, SceneH, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &SkinMask, nullptr))
 				&& SUCCEEDED(Dev->CreateTexture(SceneW, SceneH, 1, D3DUSAGE_RENDERTARGET, SceneFmt, D3DPOOL_DEFAULT, &SssTmp, nullptr))
 				&& SUCCEEDED(Dev->CreateTexture(SceneW, SceneH, 1, D3DUSAGE_RENDERTARGET, SceneFmt, D3DPOOL_DEFAULT, &SssOut, nullptr));
 			if (!Ok)
@@ -8748,7 +8759,7 @@ public:
 			}
 			else if (SsaoVB) { SsaoVB->Release(); SsaoVB = nullptr; }
 		}
-		const bool Go = SkinMaskUsed && Depth != nullptr && SceneProjOk && SsaoVB != nullptr && SssBuild(Dev);
+		const bool Go = Sss && !SssBroken && SkinMaskUsed && Depth != nullptr && SceneProjOk && SsaoVB != nullptr && SssBuild(Dev);
 		if (Go)
 		{
 			const float full[4] = { 1.0f / SceneW, 1.0f / SceneH, (float)SceneW, (float)SceneH };
@@ -8789,7 +8800,7 @@ public:
 			Dev->SetTexture(1, nullptr);
 			Dev->SetTexture(2, nullptr);
 		}
-		else if (SkinMaskUsed)
+		else if (SkinMaskUsed && Sss && !SssBroken)
 		{
 			static int Told = 0;
 			if (Told++ < 3)
@@ -9996,6 +10007,8 @@ public:
 			}
 			else if (sscanf_s(Line, " ssaofx=%f %f %f %f", &SsaoFx[0], &SsaoFx[1], &SsaoFx[2], &SsaoFx[3]) >= 1)
 				SsaoFx[1] = (std::max)(SsaoFx[1], 4.0f);
+			else if (sscanf_s(Line, " ssaonormals=%u", &V) == 1)
+				SsaoNormals = V != 0;
 			else if (sscanf_s(Line, " ssaores=%u", &V) == 1)
 				SsaoRes = V >= 2 ? 2 : 1;
 			else if (sscanf_s(Line, " atmos=%u", &V) == 1)
