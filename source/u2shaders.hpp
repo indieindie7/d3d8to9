@@ -6701,7 +6701,7 @@ public:
 			SceneProj = P;                    // gi.hlsl / ssao.hlsl rebuild positions from depth with it
 			Dev->GetTransform(D3DTS_VIEW, &SceneView);
 			SceneProjOk = true;
-			if (BlurFx[0] > 0)
+			if (BlurFx[0] > 0 || SsrFx[0] > 0)
 			{
 				// motion blur wants the world's own camera: the last perspective draw of a frame
 				// can be something with a fixed view, so take the view of draws with no world matrix
@@ -7169,6 +7169,7 @@ public:
 			RunSsao(Dev, Saved.DS);
 			RunSss(Dev, Saved.DS);
 			RunAtmos(Dev, Saved.DS);
+			RunSsr(Dev, Saved.DS);
 			RunBlur(Dev, Saved.DS);
 			IDirect3DTexture9 *AAFrame = RunSmaa(Dev);
 			IDirect3DTexture9 *Eye = RunEye(Dev);
@@ -9223,6 +9224,117 @@ public:
 		}
 	}
 
+	// ---- floor reflections (ssr=strength longest thickness debug; strength 0 = off) ------------
+	// ssr.hlsl on the frame copy, before the motion blur: floors found from the depth's normals
+	// reflect what is on screen, marched along the reflected ray. Uses the motion blur's view.
+	float SsrFx[4] = { 0.0f, 1500.0f, 40.0f, 0.0f };
+	bool SsrBroken = false;
+	IDirect3DVertexShader9 *SsrVS = nullptr;
+	IDirect3DPixelShader9 *SsrPS = nullptr;
+	IDirect3DTexture9 *SsrOut = nullptr;
+	UINT SsrW = 0, SsrH = 0;
+
+	void SsrRelease()
+	{
+		if (SsrOut) { SsrOut->Release(); SsrOut = nullptr; }
+		if (SsrVS) { SsrVS->Release(); SsrVS = nullptr; }
+		if (SsrPS) { SsrPS->Release(); SsrPS = nullptr; }
+		SsrW = SsrH = 0;
+	}
+	bool SsrBuild(IDirect3DDevice9 *Dev)
+	{
+		if (SsrBroken)
+			return false;
+		if (SsrPS != nullptr)
+			return true;
+		const std::string Src = ReadShaderFile("ssr.hlsl");
+		if (Src.empty())
+		{
+			Message("ssr: ssr.hlsl missing in U2Shaders, off");
+			SsrBroken = true;
+			return false;
+		}
+		static const char *Names[2] = { "SsrVS", "SsrPS" };
+		for (int i = 0; i < 2; i++)
+		{
+			ID3DBlob *Code = nullptr, *Errors = nullptr;
+			const HRESULT hr = D3DCompile(Src.data(), Src.size(), "ssr.hlsl", nullptr, nullptr, Names[i], i == 0 ? "vs_3_0" : "ps_3_0",
+				D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &Code, &Errors);
+			if (FAILED(hr) || Code == nullptr)
+			{
+				Message("ssr: %s failed: %s", Names[i], Errors ? (const char *)Errors->GetBufferPointer() : "?");
+				if (Errors) Errors->Release();
+				SsrBroken = true;
+				return false;
+			}
+			if (Errors) Errors->Release();
+			const HRESULT cr = i == 0 ? Dev->CreateVertexShader((const DWORD *)Code->GetBufferPointer(), &SsrVS)
+				: Dev->CreatePixelShader((const DWORD *)Code->GetBufferPointer(), &SsrPS);
+			Code->Release();
+			if (FAILED(cr))
+			{
+				Message("ssr: the card refused %s (%08x)", Names[i], (unsigned)cr);
+				SsrBroken = true;
+				return false;
+			}
+		}
+		Message("ssr: ready (strength %.2f, longest %.0f, thickness %.0f)", SsrFx[0], SsrFx[1], SsrFx[2]);
+		return true;
+	}
+	void RunSsr(IDirect3DDevice9 *Dev, IDirect3DSurface9 *BoundDepth)
+	{
+		if (SsrFx[0] <= 0 || SsrBroken || SceneTex == nullptr || !SceneProjOk || !BlurViewOk)
+			return;
+		IDirect3DTexture9 *Depth = DepthTexOf(BoundDepth);
+		if (Depth != nullptr && KeptDepth != nullptr && KeptDepth != Depth && KeptDraws > SegDraws)
+			Depth = KeptDepth;
+		if (Depth == nullptr || !SsrBuild(Dev) || SsaoVB == nullptr)
+			return;
+		if (SsrOut == nullptr || SsrW != SceneW || SsrH != SceneH)
+		{
+			if (SsrOut) { SsrOut->Release(); SsrOut = nullptr; }
+			if (FAILED(Dev->CreateTexture(SceneW, SceneH, 1, D3DUSAGE_RENDERTARGET, SceneFmt, D3DPOOL_DEFAULT, &SsrOut, nullptr)))
+			{
+				Message("ssr: target couldn't be made (%ux%u), off", SceneW, SceneH);
+				SsrOut = nullptr;
+				SsrBroken = true;
+				return;
+			}
+			SsrW = SceneW; SsrH = SceneH;
+		}
+		const D3DMATRIX &P = SceneProj;
+		const float full[4] = { 1.0f / SceneW, 1.0f / SceneH, (float)SceneW, (float)SceneH };
+		const float proj[4] = { P._11, P._22, P._33, P._43 };
+		// world up (0,0,1) as a row vector through the view: the view's third row
+		const float up[4] = { BlurView.m[2][0], BlurView.m[2][1], BlurView.m[2][2], 0 };
+		Dev->SetFVF(D3DFVF_XYZ | D3DFVF_TEX1);
+		Dev->SetStreamSource(0, SsaoVB, 0, sizeof(SmaaVertex));
+		Dev->SetVertexShader(SsrVS);
+		Dev->SetVertexShaderConstantF(0, full, 1);
+		Dev->SetPixelShader(SsrPS);
+		Dev->SetPixelShaderConstantF(0, full, 1);
+		Dev->SetPixelShaderConstantF(1, proj, 1);
+		Dev->SetPixelShaderConstantF(2, SsrFx, 1);
+		Dev->SetPixelShaderConstantF(3, up, 1);
+		SmaaSampler(Dev, 0, D3DTEXF_LINEAR);
+		SmaaSampler(Dev, 1, D3DTEXF_POINT);
+		Target(Dev, SsrOut);
+		Dev->SetTexture(0, SceneTex);
+		Dev->SetTexture(1, Depth);
+		Dev->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
+		std::swap(SceneTex, SsrOut);
+		static int Ran = 0;
+		if (Ran++ < 1)
+			Message("ssr: running (%ux%u)", SceneW, SceneH);
+		Dev->SetVertexShader(nullptr);
+		Dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+		Dev->SetStreamSource(0, PostQuadVB, 0, sizeof(U2QuadVertex));
+		for (DWORD t = 0; t < 2; t++)
+			SmaaSampler(Dev, t, D3DTEXF_LINEAR);
+		Dev->SetTexture(0, nullptr);
+		Dev->SetTexture(1, nullptr);
+	}
+
 	// ---- camera motion blur (motionblur=strength nearfade maxpixels debug; strength 0 = off) ----
 	// motion_blur.hlsl on the frame copy, after atmos and before SMAA: each pixel's position from
 	// the depth is carried through last frame's camera, and the frame is averaged along the
@@ -10569,6 +10681,8 @@ public:
 				EyeKey = (std::max)(EyeKey, 0.01f);
 			else if (sscanf_s(Line, " motionblur=%f %f %f %f", &BlurFx[0], &BlurFx[1], &BlurFx[2], &BlurFx[3]) >= 1)
 				BlurFx[2] = (std::max)(BlurFx[2], 1.0f);
+			else if (sscanf_s(Line, " ssr=%f %f %f %f", &SsrFx[0], &SsrFx[1], &SsrFx[2], &SsrFx[3]) >= 1)
+				SsrFx[1] = (std::max)(SsrFx[1], 10.0f);
 			else if (sscanf_s(Line, " hurtfx=%f %f %f %f", &HurtFx[0], &HurtFx[1], &HurtFx[2], &HurtFx[3]) >= 1)
 				HurtFx[3] = (std::max)(HurtFx[3], 0.05f);
 			else if (sscanf_s(Line, " ssaocontact=%f %f %f %f", &SsaoContact[0], &SsaoContact[1], &SsaoContact[2], &SsaoContact[3]) >= 1)
@@ -10905,6 +11019,7 @@ public:
 		SoftBroken = false;
 		SssReleaseAll();
 		BlurRelease();
+		SsrRelease();
 		SssBroken = false;
 		GiBroken = false;
 		DepthBroken = false;
