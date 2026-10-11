@@ -6920,6 +6920,137 @@ public:
 		}
 	}
 
+	// ---- eye adaptation (eyeadapt=strength min max speed; strength 0 = off, the default) ----
+	// eye_adapt.hlsl: the frame's average brightness (log average of a centre-weighted 24x14
+	// grid, linear light) into a 1x1 target, eased toward over time (speed per second, in
+	// log space) from the last frame's 1x1 (two of them, ping-pong); the exposure wanted is
+	// (eyekey / average) ^ strength, held to min..max. post_final multiplies the frame by it
+	// (s3, c6.x = 1), so a dark room opens up after a moment and a bright door is
+	// toned down, inside a small range: the frame is already tonemapped by the game.
+	float EyeFx[4] = { 0.0f, 0.8f, 1.6f, 1.5f };
+	float EyeKey = 0.18f;
+	bool EyeBroken = false, EyeFresh = true;
+	int EyeNow = 0;
+	DWORD EyeTick = 0;
+	IDirect3DVertexShader9 *EyeVS = nullptr;
+	IDirect3DPixelShader9 *EyePS = nullptr;
+	IDirect3DTexture9 *EyeTex[2] = {};
+	IDirect3DVertexBuffer9 *EyeVB = nullptr;
+
+	void EyeRelease()
+	{
+		for (IDirect3DTexture9 *&T : EyeTex)
+			if (T) { T->Release(); T = nullptr; }
+		if (EyeVB) { EyeVB->Release(); EyeVB = nullptr; }
+		if (EyeVS) { EyeVS->Release(); EyeVS = nullptr; }
+		if (EyePS) { EyePS->Release(); EyePS = nullptr; }
+		EyeFresh = true;
+	}
+
+	bool EyeBuild(IDirect3DDevice9 *Dev)
+	{
+		if (EyePS != nullptr)
+			return true;
+		const std::string Lib = ReadShaderFile("eye_adapt.hlsl");
+		if (Lib.empty())
+		{
+			Message("eyeadapt: eye_adapt.hlsl missing in U2Shaders, eye adaptation off");
+			EyeBroken = true;
+			return false;
+		}
+		static const char *Names[2] = { "EyeVS", "AdaptPS" };
+		for (int i = 0; i < 2; i++)
+		{
+			ID3DBlob *Code = nullptr, *Errors = nullptr;
+			const std::string &Src = Lib;
+			const HRESULT hr = D3DCompile(Src.data(), Src.size(), "eye_adapt.hlsl", nullptr, nullptr, Names[i], i == 0 ? "vs_3_0" : "ps_3_0",
+				D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &Code, &Errors);
+			if (FAILED(hr) || Code == nullptr)
+			{
+				Message("eyeadapt: %s failed: %s", Names[i], Errors ? (const char *)Errors->GetBufferPointer() : "?");
+				if (Errors) Errors->Release();
+				if (Code) Code->Release();
+				EyeBroken = true;
+				return false;
+			}
+			if (Errors) Errors->Release();
+			const HRESULT cr = i == 0 ? Dev->CreateVertexShader((const DWORD *)Code->GetBufferPointer(), &EyeVS)
+				: Dev->CreatePixelShader((const DWORD *)Code->GetBufferPointer(), &EyePS);
+			Code->Release();
+			if (FAILED(cr))
+			{
+				Message("eyeadapt: the card refused %s (%08x)", Names[i], (unsigned)cr);
+				EyeBroken = true;
+				return false;
+			}
+		}
+		Message("eyeadapt: ready (strength %.2f, exposure %.2f..%.2f, speed %.2f, key %.3f)", EyeFx[0], EyeFx[1], EyeFx[2], EyeFx[3], EyeKey);
+		return true;
+	}
+
+	// this frame's exposure as a 1x1 texture (r), or none; leaves the post chain's setup behind it
+	IDirect3DTexture9 *RunEye(IDirect3DDevice9 *Dev)
+	{
+		if (EyeFx[0] <= 0 || EyeBroken || SceneTex == nullptr || !EyeBuild(Dev))
+			return nullptr;
+		if (EyeTex[0] == nullptr)
+		{
+			EyeFresh = true;
+			for (IDirect3DTexture9 *&T : EyeTex)
+				if (FAILED(Dev->CreateTexture(1, 1, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &T, nullptr)))
+					T = nullptr;
+			if (EyeTex[0] == nullptr || EyeTex[1] == nullptr)
+			{
+				Message("eyeadapt: the 1x1 targets couldn't be made, eye adaptation off");
+				EyeRelease();
+				EyeBroken = true;
+				return nullptr;
+			}
+		}
+		if (EyeVB == nullptr)
+		{
+			const SmaaVertex q[4] = { { -1, 1, 0, 0, 0 }, { 1, 1, 0, 1, 0 }, { -1, -1, 0, 0, 1 }, { 1, -1, 0, 1, 1 } };
+			void *Mem = nullptr;
+			if (FAILED(Dev->CreateVertexBuffer(sizeof(q), D3DUSAGE_WRITEONLY, D3DFVF_XYZ | D3DFVF_TEX1, D3DPOOL_DEFAULT, &EyeVB, nullptr))
+				|| FAILED(EyeVB->Lock(0, sizeof(q), &Mem, 0)))
+			{
+				if (EyeVB) { EyeVB->Release(); EyeVB = nullptr; }
+				return nullptr;
+			}
+			memcpy(Mem, q, sizeof(q));
+			EyeVB->Unlock();
+		}
+		const DWORD Now = GetTickCount();
+		const float Dt = EyeTick != 0 ? (std::min)((Now - EyeTick) / 1000.0f, 0.5f) : 0.0f;
+		EyeTick = Now;
+		const float c[3][4] = { { 0, 0, 0, 0 }, { 1.0f - expf(-Dt * EyeFx[3]), EyeFx[0], EyeFx[1], EyeFx[2] }, { EyeKey, EyeFresh ? 1.0f : 0.0f, 0, 0 } };
+		Dev->SetFVF(D3DFVF_XYZ | D3DFVF_TEX1);
+		Dev->SetStreamSource(0, EyeVB, 0, sizeof(SmaaVertex));
+		Dev->SetVertexShader(EyeVS);
+		Dev->SetVertexShaderConstantF(0, c[0], 1);
+		Dev->SetPixelShader(EyePS);
+		Dev->SetPixelShaderConstantF(0, c[0], 3);
+		SmaaSampler(Dev, 0, D3DTEXF_LINEAR);
+		SmaaSampler(Dev, 1, D3DTEXF_POINT);
+		Target(Dev, EyeTex[1 - EyeNow]);
+		Dev->SetTexture(0, SceneTex);
+		Dev->SetTexture(1, EyeTex[EyeNow]);
+		Dev->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
+		EyeNow = 1 - EyeNow;
+		EyeFresh = false;
+		static int Ran = 0;
+		if (Ran++ < 1)
+			Message("eyeadapt: running");
+		Dev->SetVertexShader(nullptr);
+		Dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+		Dev->SetStreamSource(0, PostQuadVB, 0, sizeof(U2QuadVertex));
+		for (DWORD t = 0; t < 2; t++)
+			SmaaSampler(Dev, t, D3DTEXF_LINEAR);
+		Dev->SetTexture(0, nullptr);
+		Dev->SetTexture(1, nullptr);
+		return EyeTex[EyeNow];
+	}
+
 	void RunPost(IDirect3DDevice9 *Dev)
 	{
 		U2PerfScope PerfPost(U2PerfC().Post);   // perf: "post passes" (bloom, gi, ssao, sss, smaa, lens)
@@ -7002,8 +7133,10 @@ public:
 			RunSss(Dev, Saved.DS);
 			RunAtmos(Dev, Saved.DS);
 			IDirect3DTexture9 *AAFrame = RunSmaa(Dev);
+			IDirect3DTexture9 *Eye = RunEye(Dev);
 
-			float c[6][4] = {};
+			float c[7][4] = {};
+			c[6][0] = Eye != nullptr ? 1.0f : 0.0f;
 			c[0][0] = 1.0f / SceneW; c[0][1] = 1.0f / SceneH; c[0][2] = PostSplit;
 			c[0][3] = (GetTickCount() % 100000) / 1000.0f;     // seconds, wrapping every 100 s (grain)
 			memcpy(c[4], PostFx, sizeof(PostFx));
@@ -7057,11 +7190,32 @@ public:
 				Dev->SetSamplerState(2, D3DSAMP_SRGBTEXTURE, FALSE);
 			}
 			Dev->SetTexture(2, Lut);
+			// stage 3: the exposure (eyeadapt=), put back afterwards (not in the chain's saved state)
+			static const D3DSAMPLERSTATETYPE Samp3[3] = { D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER };
+			DWORD Old3[3] = {};
+			IDirect3DBaseTexture9 *OldTex3 = nullptr;
+			if (Eye != nullptr)
+			{
+				Dev->GetTexture(3, &OldTex3);
+				for (int i = 0; i < 3; i++)
+					Dev->GetSamplerState(3, Samp3[i], &Old3[i]);
+				Dev->SetSamplerState(3, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+				Dev->SetSamplerState(3, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+				Dev->SetSamplerState(3, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+				Dev->SetTexture(3, Eye);
+			}
 			Dev->SetPixelShader(Final);
-			Dev->SetPixelShaderConstantF(0, c[0], 6);
+			Dev->SetPixelShaderConstantF(0, c[0], 7);
 			if (Debug)
 				PostLog(Dev, "before the final pass (stage 0 the copy, stage 1 the bloom)");
 			Quad(Dev, SceneW, SceneH);
+			if (Eye != nullptr)
+			{
+				Dev->SetTexture(3, OldTex3);
+				if (OldTex3) OldTex3->Release();
+				for (int i = 0; i < 3; i++)
+					Dev->SetSamplerState(3, Samp3[i], Old3[i]);
+			}
 			RunLens(Dev);
 		}
 
@@ -9337,6 +9491,7 @@ public:
 
 	void PostRelease()
 	{
+		EyeRelease();
 		if (BloomA) { BloomA->Release(); BloomA = nullptr; }
 		if (BloomB) { BloomB->Release(); BloomB = nullptr; }
 		ReleaseChain();
@@ -10222,6 +10377,10 @@ public:
 			}
 			else if (sscanf_s(Line, " ssaofx=%f %f %f %f", &SsaoFx[0], &SsaoFx[1], &SsaoFx[2], &SsaoFx[3]) >= 1)
 				SsaoFx[1] = (std::max)(SsaoFx[1], 4.0f);
+			else if (sscanf_s(Line, " eyeadapt=%f %f %f %f", &EyeFx[0], &EyeFx[1], &EyeFx[2], &EyeFx[3]) >= 1)
+				EyeFresh = true;
+			else if (sscanf_s(Line, " eyekey=%f", &EyeKey) == 1)
+				EyeKey = (std::max)(EyeKey, 0.01f);
 			else if (sscanf_s(Line, " ssaocontact=%f %f %f %f", &SsaoContact[0], &SsaoContact[1], &SsaoContact[2], &SsaoContact[3]) >= 1)
 				;
 			else if (sscanf_s(Line, " ssaonormals=%u", &V) == 1)
