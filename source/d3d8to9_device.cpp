@@ -733,6 +733,7 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::SetRenderTarget(IDirect3DSurface8 *pR
 		ProxyInterface->SetDepthStencilSurface(nullptr);
 	}
 	U2.MatchDepth(ProxyInterface);                  // msaa=N: a plain target gets a plain depth buffer
+	U2.MsaaViewport(ProxyInterface);                // msaa=N: the padded stand-in keeps the game's viewport
 
 	return D3D_OK;
 }

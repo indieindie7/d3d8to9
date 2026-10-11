@@ -7209,7 +7209,12 @@ public:
 	// multisampled. While it is bound, a multisampled surface of the same size stands in for it;
 	// its samples are resolved into the texture before the game reads it (as a texture, by a copy,
 	// or at Present) and whenever another target is bound.
-	struct MsaaProxy { IDirect3DSurface9 *Plain, *Multi; IDirect3DBaseTexture9 *Tex; };
+	// The stand-in is MsaaPad pixels wider than the texture: NVIDIA's driver (RTX 4070 Ti, 2026-10)
+	// silently drops multisampling on targets exactly the screen's size (its anti-aliasing override
+	// heuristic) - a 1920x1080 4x target rasterised hard while 1952x1080, 1280x720 and 1024x1024 did
+	// not. The viewport keeps the game's size and only that part is resolved.
+	static const UINT MsaaPad = 32;
+	struct MsaaProxy { IDirect3DSurface9 *Plain, *Multi; IDirect3DBaseTexture9 *Tex; UINT W, H; };
 	std::vector<MsaaProxy> MsaaProxies;
 	int MsaaBound = -1;
 	unsigned MsaaCount[3] = {}, MsaaCountFrame = 0;
@@ -7221,8 +7226,65 @@ public:
 		{
 			if (U2Msaa::ShotTest() && Frame > 300)
 				MsaaStamp(Dev, MsaaProxies[MsaaBound].Multi);    // test: a triangle on what the game drew
-			Dev->StretchRect(MsaaProxies[MsaaBound].Multi, nullptr, MsaaProxies[MsaaBound].Plain, nullptr, D3DTEXF_NONE);
+			const RECT Game = { 0, 0, (LONG)MsaaProxies[MsaaBound].W, (LONG)MsaaProxies[MsaaBound].H };
+			Dev->StretchRect(MsaaProxies[MsaaBound].Multi, &Game, MsaaProxies[MsaaBound].Plain, nullptr, D3DTEXF_NONE);
 			MsaaDirty = false;
+			static int Read = 0;
+			if (U2Msaa::ShotTest() && Frame > 400 && Read < 2)
+			{
+				// test: the stamp's row y=100 just after the resolve (edges near x=11 and x=107)
+				Read++;
+				D3DSURFACE_DESC D = {};
+				MsaaProxies[MsaaBound].Plain->GetDesc(&D);
+				IDirect3DSurface9 *Sys = nullptr;
+				D3DLOCKED_RECT L = {};
+				if (SUCCEEDED(Dev->CreateOffscreenPlainSurface(D.Width, D.Height, D.Format, D3DPOOL_SYSTEMMEM, &Sys, nullptr)) && Sys
+					&& SUCCEEDED(U2PerfReadback(Dev, MsaaProxies[MsaaBound].Plain, Sys)) && SUCCEEDED(Sys->LockRect(&L, nullptr, D3DLOCK_READONLY)))
+				{
+					char Row[512] = {}, *P = Row;
+					const BYTE *B = static_cast<const BYTE *>(L.pBits) + 100 * L.Pitch;
+					for (int x = 4; x < 18; x++) P += sprintf_s(P, Row + sizeof(Row) - P, "%u ", B[x * 4 + 1]);
+					P += sprintf_s(P, Row + sizeof(Row) - P, "| ");
+					for (int x = 100; x < 114; x++) P += sprintf_s(P, Row + sizeof(Row) - P, "%u ", B[x * 4 + 1]);
+					Sys->UnlockRect();
+					Message("msaa resolve test: stand-in row 100 green after the resolve: %s", Row);
+					// the same stamp into a fresh multisampled target of the same size and format
+					IDirect3DSurface9 *M2 = nullptr, *P2 = nullptr;
+					D3DSURFACE_DESC MD = {};
+					MsaaProxies[MsaaBound].Multi->GetDesc(&MD);
+					if (SUCCEEDED(Dev->CreateRenderTarget(D.Width, D.Height, D.Format, MD.MultiSampleType, MD.MultiSampleQuality, FALSE, &M2, nullptr))
+						&& SUCCEEDED(Dev->CreateRenderTarget(D.Width, D.Height, D.Format, D3DMULTISAMPLE_NONE, 0, FALSE, &P2, nullptr)))
+					{
+						IDirect3DSurface9 *OldRT = nullptr;
+						Dev->GetRenderTarget(0, &OldRT);
+						Dev->SetRenderTarget(0, M2);
+						Dev->Clear(0, nullptr, D3DCLEAR_TARGET, 0xFF000000, 1.0f, 0);
+						Dev->SetRenderTarget(0, OldRT);
+						if (OldRT) OldRT->Release();
+						MsaaStamp(Dev, M2);
+						Dev->StretchRect(M2, nullptr, P2, nullptr, D3DTEXF_NONE);
+						if (SUCCEEDED(U2PerfReadback(Dev, P2, Sys)) && SUCCEEDED(Sys->LockRect(&L, nullptr, D3DLOCK_READONLY)))
+						{
+							P = Row;
+							B = static_cast<const BYTE *>(L.pBits) + 100 * L.Pitch;
+							for (int x = 4; x < 18; x++) P += sprintf_s(P, Row + sizeof(Row) - P, "%u ", B[x * 4 + 1]);
+							P += sprintf_s(P, Row + sizeof(Row) - P, "| ");
+							for (int x = 100; x < 114; x++) P += sprintf_s(P, Row + sizeof(Row) - P, "%u ", B[x * 4 + 1]);
+							Sys->UnlockRect();
+							Message("msaa resolve test: fresh target (sampled %u quality %u, stand-in's desc) row 100: %s", (unsigned)MD.MultiSampleType, MD.MultiSampleQuality, Row);
+						}
+					}
+					if (M2) M2->Release();
+					if (P2) P2->Release();
+					MsaaSelfTest(Dev); MsaaSelfTest(Dev, D.Width, D.Height); MsaaSelfTest(Dev, 1024, 1024); MsaaSelfTest(Dev, D.Width + 32, D.Height); MsaaSelfTest(Dev, 1280, 720);   // the startup self-test again, mid-game, small and full size
+					DWORD V = 0;
+					const D3DRENDERSTATETYPE Odd[] = { D3DRS_FILLMODE, D3DRS_POINTSIZE, D3DRS_ADAPTIVETESS_X, D3DRS_ADAPTIVETESS_Y, D3DRS_SCISSORTESTENABLE, D3DRS_SRGBWRITEENABLE, D3DRS_ANTIALIASEDLINEENABLE };
+					for (D3DRENDERSTATETYPE T : Odd) { Dev->GetRenderState(T, &V); Message("msaa resolve test: render state %u = %08x", (unsigned)T, V); }
+				}
+				else
+					Message("msaa resolve test: readback failed");
+				if (Sys) Sys->Release();
+			}
 		}
 	}
 
@@ -7252,8 +7314,8 @@ public:
 		if (FAILED(S->GetContainer(IID_IDirect3DTexture9, (void **)&Tex)) || Tex == nullptr)
 			return S;
 		Tex->Release();                             // the game keeps it alive
-		MsaaProxy P = { S, nullptr, Tex };
-		if (FAILED(Dev->CreateRenderTarget(D.Width, D.Height, D.Format, B.MultiSampleType, 0, FALSE, &P.Multi, nullptr)) || P.Multi == nullptr)
+		MsaaProxy P = { S, nullptr, Tex, D.Width, D.Height };
+		if (FAILED(Dev->CreateRenderTarget(D.Width + MsaaPad, D.Height, D.Format, B.MultiSampleType, 0, FALSE, &P.Multi, nullptr)) || P.Multi == nullptr)
 		{
 			static int Told = 0;
 			if (Told++ < 3)
@@ -7263,7 +7325,7 @@ public:
 		MsaaProxies.push_back(P);
 		MsaaBound = (int)MsaaProxies.size() - 1;
 		MsaaDirty = true;
-		Message("msaa: the game's %ux%u render texture (format %u) gets a multisampled stand-in", D.Width, D.Height, (unsigned)D.Format);
+		Message("msaa: the game's %ux%u render texture (format %u) gets a multisampled stand-in %u pixels wider", D.Width, D.Height, (unsigned)D.Format, MsaaPad);
 		return P.Multi;
 	}
 
@@ -7281,15 +7343,15 @@ public:
 	// in-between pixels on its edge? (no: something - often the driver's own settings - turns the
 	// sampling off)
 	bool MsaaTested = false;
-	void MsaaSelfTest(IDirect3DDevice9 *Dev)
+	void MsaaSelfTest(IDirect3DDevice9 *Dev, UINT W = 64, UINT H = 64)
 	{
 		MsaaTested = true;
 		IDirect3DSurface9 *Multi = nullptr, *Plain = nullptr, *Sys = nullptr, *OldRT = nullptr, *OldDS = nullptr;
 		IDirect3DStateBlock9 *SB = nullptr;
 		const D3DMULTISAMPLE_TYPE MS = (D3DMULTISAMPLE_TYPE)U2Msaa::Wanted();
-		if (FAILED(Dev->CreateRenderTarget(64, 64, D3DFMT_A8R8G8B8, MS, 0, FALSE, &Multi, nullptr))
-			|| FAILED(Dev->CreateRenderTarget(64, 64, D3DFMT_A8R8G8B8, D3DMULTISAMPLE_NONE, 0, FALSE, &Plain, nullptr))
-			|| FAILED(Dev->CreateOffscreenPlainSurface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, &Sys, nullptr))
+		if (FAILED(Dev->CreateRenderTarget(W, H, D3DFMT_A8R8G8B8, MS, 0, FALSE, &Multi, nullptr))
+			|| FAILED(Dev->CreateRenderTarget(W, H, D3DFMT_A8R8G8B8, D3DMULTISAMPLE_NONE, 0, FALSE, &Plain, nullptr))
+			|| FAILED(Dev->CreateOffscreenPlainSurface(W, H, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, &Sys, nullptr))
 			|| FAILED(Dev->CreateStateBlock(D3DSBT_ALL, &SB)))
 		{
 			Message("msaa self-test: couldn't make its targets");
@@ -7333,7 +7395,7 @@ public:
 					}
 				Sys->UnlockRect();
 			}
-			Message("msaa self-test (%ux): %d lit pixels, %d in-between on the edges -> %s", (unsigned)MS, Lit, Mid,
+			Message("msaa self-test %ux%u (%ux): %d lit pixels, %d in-between on the edges -> %s", W, H, (unsigned)MS, Lit, Mid,
 				Mid > 10 ? "the card multisamples" : "NOT multisampled (the driver's anti-aliasing settings may override the game: set it to 'application-controlled')");
 			Dev->SetRenderTarget(0, OldRT);
 			Dev->SetDepthStencilSurface(OldDS);
@@ -7373,6 +7435,14 @@ public:
 		Dev->SetRenderState(D3DRS_LIGHTING, FALSE);
 		Dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
 		Dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+		DWORD Aa = 0, Mask = 0;
+		Dev->GetRenderState(D3DRS_MULTISAMPLEANTIALIAS, &Aa);
+		Dev->GetRenderState(D3DRS_MULTISAMPLEMASK, &Mask);
+		static int Told = 0;
+		if (Told++ < 2)
+			Message("msaa stamp: device state MULTISAMPLEANTIALIAS %u MULTISAMPLEMASK %08x (forced to 1 / ffffffff for the stamp)", Aa, Mask);
+		Dev->SetRenderState(D3DRS_MULTISAMPLEANTIALIAS, TRUE);
+		Dev->SetRenderState(D3DRS_MULTISAMPLEMASK, 0xFFFFFFFF);
 		Dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, Tri, sizeof(V));
 		Dev->SetRenderTarget(0, OldRT);
 		Dev->SetDepthStencilSurface(OldDS);
@@ -7380,6 +7450,15 @@ public:
 		SB->Release();
 		if (OldRT) OldRT->Release();
 		if (OldDS) OldDS->Release();
+	}
+
+	// after binding a stand-in: the viewport the game expects (its texture's size, not the padded one)
+	void MsaaViewport(IDirect3DDevice9 *Dev)
+	{
+		if (MsaaBound < 0)
+			return;
+		const D3DVIEWPORT9 V = { 0, 0, MsaaProxies[MsaaBound].W, MsaaProxies[MsaaBound].H, 0.0f, 1.0f };
+		Dev->SetViewport(&V);
 	}
 
 	// the game's own target for a stand-in
