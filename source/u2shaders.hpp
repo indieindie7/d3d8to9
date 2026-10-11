@@ -6701,6 +6701,22 @@ public:
 			SceneProj = P;                    // gi.hlsl / ssao.hlsl rebuild positions from depth with it
 			Dev->GetTransform(D3DTS_VIEW, &SceneView);
 			SceneProjOk = true;
+			if (BlurFx[0] > 0)
+			{
+				// motion blur wants the world's own camera: the last perspective draw of a frame
+				// can be something with a fixed view, so take the view of draws with no world matrix
+				D3DMATRIX W;
+				Dev->GetTransform(D3DTS_WORLD, &W);
+				bool Ident = true;
+				for (int r = 0; r < 4 && Ident; r++)
+					for (int c = 0; c < 4; c++)
+						if (fabsf(W.m[r][c] - (r == c ? 1.0f : 0.0f)) > 1e-4f) { Ident = false; break; }
+				if (Ident)
+				{
+					BlurView = SceneView;
+					BlurViewOk = true;
+				}
+			}
 			if (GiSlotDirty)
 				GiGatherLights(Dev);
 		}
@@ -7153,6 +7169,7 @@ public:
 			RunSsao(Dev, Saved.DS);
 			RunSss(Dev, Saved.DS);
 			RunAtmos(Dev, Saved.DS);
+			RunBlur(Dev, Saved.DS);
 			IDirect3DTexture9 *AAFrame = RunSmaa(Dev);
 			IDirect3DTexture9 *Eye = RunEye(Dev);
 
@@ -9206,6 +9223,152 @@ public:
 		}
 	}
 
+	// ---- camera motion blur (motionblur=strength nearfade maxpixels debug; strength 0 = off) ----
+	// motion_blur.hlsl on the frame copy, after atmos and before SMAA: each pixel's position from
+	// the depth is carried through last frame's camera, and the frame is averaged along the
+	// line between (only the camera's motion; near the camera it fades out, for the player).
+	float BlurFx[4] = { 0.0f, 250.0f, 24.0f, 0.0f };
+	bool BlurBroken = false, BlurHavePrev = false, BlurViewOk = false;
+	D3DMATRIX BlurView = {};
+	D3DMATRIX BlurPrevView = {}, BlurPrevProj = {};
+	IDirect3DVertexShader9 *BlurVS = nullptr;
+	IDirect3DPixelShader9 *BlurPS = nullptr;
+	IDirect3DTexture9 *BlurOut = nullptr;
+	UINT BlurW = 0, BlurH = 0;
+
+	void BlurRelease()
+	{
+		if (BlurOut) { BlurOut->Release(); BlurOut = nullptr; }
+		if (BlurVS) { BlurVS->Release(); BlurVS = nullptr; }
+		if (BlurPS) { BlurPS->Release(); BlurPS = nullptr; }
+		BlurW = BlurH = 0;
+		BlurHavePrev = false;
+	}
+	bool BlurBuild(IDirect3DDevice9 *Dev)
+	{
+		if (BlurBroken)
+			return false;
+		if (BlurPS != nullptr)
+			return true;
+		const std::string Src = ReadShaderFile("motion_blur.hlsl");
+		if (Src.empty())
+		{
+			Message("motionblur: motion_blur.hlsl missing in U2Shaders, off");
+			BlurBroken = true;
+			return false;
+		}
+		static const char *Names[2] = { "BlurVS", "BlurPS" };
+		for (int i = 0; i < 2; i++)
+		{
+			ID3DBlob *Code = nullptr, *Errors = nullptr;
+			const HRESULT hr = D3DCompile(Src.data(), Src.size(), "motion_blur.hlsl", nullptr, nullptr, Names[i], i == 0 ? "vs_3_0" : "ps_3_0",
+				D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &Code, &Errors);
+			if (FAILED(hr) || Code == nullptr)
+			{
+				Message("motionblur: %s failed: %s", Names[i], Errors ? (const char *)Errors->GetBufferPointer() : "?");
+				if (Errors) Errors->Release();
+				BlurBroken = true;
+				return false;
+			}
+			if (Errors) Errors->Release();
+			const HRESULT cr = i == 0 ? Dev->CreateVertexShader((const DWORD *)Code->GetBufferPointer(), &BlurVS)
+				: Dev->CreatePixelShader((const DWORD *)Code->GetBufferPointer(), &BlurPS);
+			Code->Release();
+			if (FAILED(cr))
+			{
+				Message("motionblur: the card refused %s (%08x)", Names[i], (unsigned)cr);
+				BlurBroken = true;
+				return false;
+			}
+		}
+		Message("motionblur: ready (strength %.2f, near fade %.0f, longest %.0f px)", BlurFx[0], BlurFx[1], BlurFx[2]);
+		return true;
+	}
+	static D3DMATRIX MatMul(const D3DMATRIX &A, const D3DMATRIX &B)
+	{
+		D3DMATRIX R = {};
+		for (int r = 0; r < 4; r++)
+			for (int c = 0; c < 4; c++)
+				R.m[r][c] = A.m[r][0] * B.m[0][c] + A.m[r][1] * B.m[1][c] + A.m[r][2] * B.m[2][c] + A.m[r][3] * B.m[3][c];
+		return R;
+	}
+	void RunBlur(IDirect3DDevice9 *Dev, IDirect3DSurface9 *BoundDepth)
+	{
+		if (BlurFx[0] <= 0 || BlurBroken || SceneTex == nullptr || !SceneProjOk)
+			return;
+		IDirect3DTexture9 *Depth = DepthTexOf(BoundDepth);
+		if (Depth != nullptr && KeptDepth != nullptr && KeptDepth != Depth && KeptDraws > SegDraws)
+			Depth = KeptDepth;
+		if (!BlurViewOk)
+			return;
+		BlurViewOk = false;
+		const D3DMATRIX View = BlurView, P = SceneProj;
+		const bool HadPrev = BlurHavePrev;
+		const D3DMATRIX PrevView = BlurPrevView, PrevProj = BlurPrevProj;
+		BlurPrevView = View; BlurPrevProj = P; BlurHavePrev = true;
+		if (!HadPrev || Depth == nullptr || SsaoVB == nullptr || !BlurBuild(Dev))
+			return;
+		// a camera cut (moved far or turned a lot in one frame): no blur this frame
+		// (the view's translation row is the camera position turned into camera space, so compare the
+		// camera's world positions, or a small turn far from the origin reads as a jump)
+		const D3DMATRIX Was = InvView(PrevView), Now = InvView(View);
+		float Move = 0, Turn = 0;
+		for (int c = 0; c < 3; c++)
+		{
+			Move += (Now.m[3][c] - Was.m[3][c]) * (Now.m[3][c] - Was.m[3][c]);
+			Turn += View.m[c][2] * PrevView.m[c][2];
+		}
+		if (Move > 400.0f * 400.0f || Turn < 0.7f)
+			return;
+		if (BlurOut == nullptr || BlurW != SceneW || BlurH != SceneH)
+		{
+			if (BlurOut) { BlurOut->Release(); BlurOut = nullptr; }
+			if (FAILED(Dev->CreateTexture(SceneW, SceneH, 1, D3DUSAGE_RENDERTARGET, SceneFmt, D3DPOOL_DEFAULT, &BlurOut, nullptr)))
+			{
+				Message("motionblur: target couldn't be made (%ux%u), off", SceneW, SceneH);
+				BlurOut = nullptr;
+				BlurBroken = true;
+				return;
+			}
+			BlurW = SceneW; BlurH = SceneH;
+		}
+		// camera now -> world -> last frame's camera -> its clip space; sent transposed (the
+		// shader's float4x4 is column-major)
+		const D3DMATRIX M = MatMul(MatMul(InvView(View), PrevView), PrevProj);
+		float Mt[4][4];
+		for (int r = 0; r < 4; r++)
+			for (int c = 0; c < 4; c++)
+				Mt[r][c] = M.m[c][r];
+		const float full[4] = { 1.0f / SceneW, 1.0f / SceneH, (float)SceneW, (float)SceneH };
+		const float proj[4] = { P._11, P._22, P._33, P._43 };
+		Dev->SetFVF(D3DFVF_XYZ | D3DFVF_TEX1);
+		Dev->SetStreamSource(0, SsaoVB, 0, sizeof(SmaaVertex));
+		Dev->SetVertexShader(BlurVS);
+		Dev->SetVertexShaderConstantF(0, full, 1);
+		Dev->SetPixelShader(BlurPS);
+		Dev->SetPixelShaderConstantF(0, full, 1);
+		Dev->SetPixelShaderConstantF(1, proj, 1);
+		Dev->SetPixelShaderConstantF(2, BlurFx, 1);
+		Dev->SetPixelShaderConstantF(3, &Mt[0][0], 4);
+		SmaaSampler(Dev, 0, D3DTEXF_LINEAR);
+		SmaaSampler(Dev, 1, D3DTEXF_POINT);
+		Target(Dev, BlurOut);
+		Dev->SetTexture(0, SceneTex);
+		Dev->SetTexture(1, Depth);
+		Dev->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
+		std::swap(SceneTex, BlurOut);
+		static int Ran = 0;
+		if (Ran++ < 1)
+			Message("motionblur: running (%ux%u)", SceneW, SceneH);
+		Dev->SetVertexShader(nullptr);
+		Dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+		Dev->SetStreamSource(0, PostQuadVB, 0, sizeof(U2QuadVertex));
+		for (DWORD t = 0; t < 2; t++)
+			SmaaSampler(Dev, t, D3DTEXF_LINEAR);
+		Dev->SetTexture(0, nullptr);
+		Dev->SetTexture(1, nullptr);
+	}
+
 	// ---- SMAA 1x (smaa=1 by default, smaa=0 off) -------------------------------------------
 	// The reference SMAA.hlsl (Jimenez et al., MIT, github.com/iryoku/smaa) with our
 	// smaa_passes.hlsl, on the game's frame copy before the final pass: edges from luma, blending
@@ -10404,6 +10567,8 @@ public:
 				EyeFresh = true;
 			else if (sscanf_s(Line, " eyekey=%f", &EyeKey) == 1)
 				EyeKey = (std::max)(EyeKey, 0.01f);
+			else if (sscanf_s(Line, " motionblur=%f %f %f %f", &BlurFx[0], &BlurFx[1], &BlurFx[2], &BlurFx[3]) >= 1)
+				BlurFx[2] = (std::max)(BlurFx[2], 1.0f);
 			else if (sscanf_s(Line, " hurtfx=%f %f %f %f", &HurtFx[0], &HurtFx[1], &HurtFx[2], &HurtFx[3]) >= 1)
 				HurtFx[3] = (std::max)(HurtFx[3], 0.05f);
 			else if (sscanf_s(Line, " ssaocontact=%f %f %f %f", &SsaoContact[0], &SsaoContact[1], &SsaoContact[2], &SsaoContact[3]) >= 1)
@@ -10739,6 +10904,7 @@ public:
 		DropShader(SoftRule);
 		SoftBroken = false;
 		SssReleaseAll();
+		BlurRelease();
 		SssBroken = false;
 		GiBroken = false;
 		DepthBroken = false;
