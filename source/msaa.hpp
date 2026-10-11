@@ -11,7 +11,10 @@
  * the multisampled depth buffer is still bound: those binds get a plain depth buffer of the target's
  * size instead (U2Shaders::MatchDepth), cleared, and the game is handed its own one back when it asks.
  *
- * The scene's depth can't be read as a texture when it is multisampled, so gi=1 stays off with msaa.
+ * The scene's depth can't be read as a texture when it is multisampled, and the cards tried copy it
+ * nowhere (no RESZ, StretchRect refused), so each depth-writing draw into the stand-in is drawn a
+ * second time into a plain readable depth texture (MsaaDepthBegin in u2shaders.hpp) for gi, ssao,
+ * atmos and sss.
  */
 
 #pragma once

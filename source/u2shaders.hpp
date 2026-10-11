@@ -691,6 +691,15 @@ public:
 			return false;
 		D3DSURFACE_DESC Desc;
 		Target->GetDesc(&Desc);
+		// msaa=N: the stand-in is wider than the game's texture (MsaaPad): the scene is the game's part
+		RECT Part = { 0, 0, (LONG)Desc.Width, (LONG)Desc.Height };
+		if (MsaaBound >= 0 && Target == MsaaProxies[MsaaBound].Multi)
+		{
+			Desc.Width = MsaaProxies[MsaaBound].W;
+			Desc.Height = MsaaProxies[MsaaBound].H;
+			Part.right = (LONG)Desc.Width;
+			Part.bottom = (LONG)Desc.Height;
+		}
 		if (SceneTex != nullptr && (SceneW != Desc.Width || SceneH != Desc.Height || SceneFmt != Desc.Format))
 		{
 			SceneTex->Release();
@@ -707,7 +716,7 @@ public:
 		}
 		if (SceneTex != nullptr && (Force || SceneFrame != Frame) && SUCCEEDED(SceneTex->GetSurfaceLevel(0, &Copy)))
 		{
-			LastCopyHr = Dev->StretchRect(Target, nullptr, Copy, nullptr, D3DTEXF_NONE);
+			LastCopyHr = Dev->StretchRect(Target, &Part, Copy, nullptr, D3DTEXF_NONE);
 			if (FAILED(LastCopyHr))
 			{
 				// some wrappers won't copy from the current target object: try the back buffer itself
@@ -7491,6 +7500,8 @@ public:
 	// the device's Clear, before it happens: a depth clear in mid-frame (see DepthPair)
 	void OnClear(IDirect3DDevice9 *Dev, DWORD Count, DWORD Flags)
 	{
+		if (NeedDepth() && U2Msaa::Wanted() != 0)
+			MsaaDepthClear(Count, Flags);
 		if (!NeedDepth() || DepthBroken || Count != 0 || (Flags & D3DCLEAR_ZBUFFER) == 0 || (Flags & D3DCLEAR_TARGET) != 0)
 			return;
 		const int Draws = SegDraws;
@@ -7563,8 +7574,138 @@ public:
 		if (P) P->Release();
 	}
 
+	// msaa=N: the multisampled depth can't be read and this card copies it nowhere (see
+	// MsaaDepthProbe), so each draw that writes depth into the stand-in is drawn a second time
+	// into a plain readable depth texture of the game's size (colour writes off, a scratch
+	// target). Its clears follow the game's; a mid-frame clear keeps the part drawn so far, as
+	// DepthPair does.
+	IDirect3DTexture9 *MsaaDepthTex[2] = {};
+	IDirect3DSurface9 *MsaaDepthSurf[2] = {}, *MsaaDepthColour = nullptr;
+	UINT MsaaDepthW = 0, MsaaDepthH = 0;
+	int MsaaDepthNow = 0;
+	bool MsaaDepthBroken = false, MsaaDepthUsed = false, MsaaDepthPending = true;
+	IDirect3DSurface9 *MdRT0 = nullptr, *MdRT1 = nullptr, *MdDS = nullptr;   // saved by MsaaDepthBegin
+	D3DVIEWPORT9 MdVP = {};
+	DWORD MdCW = 0;
+
+	void MsaaDepthRelease()
+	{
+		for (int i = 0; i < 2; i++)
+		{
+			if (MsaaDepthTex[i]) MsaaDepthTex[i]->Release();
+			MsaaDepthTex[i] = nullptr;
+			MsaaDepthSurf[i] = nullptr;
+		}
+		if (MsaaDepthColour) { MsaaDepthColour->Release(); MsaaDepthColour = nullptr; }
+		MsaaDepthW = MsaaDepthH = 0;
+		MsaaDepthNow = 0;
+		MsaaDepthUsed = false;
+		MsaaDepthPending = true;
+	}
+
+	bool MsaaDepthMake(IDirect3DDevice9 *Dev, UINT W, UINT H)
+	{
+		if (MsaaDepthTex[0] != nullptr && MsaaDepthW == W && MsaaDepthH == H)
+			return true;
+		MsaaDepthRelease();
+		bool Ok = true;
+		for (int i = 0; i < 2 && Ok; i++)
+		{
+			Ok = SUCCEEDED(Dev->CreateTexture(W, H, 1, D3DUSAGE_DEPTHSTENCIL, (D3DFORMAT)MAKEFOURCC('I', 'N', 'T', 'Z'), D3DPOOL_DEFAULT, &MsaaDepthTex[i], nullptr))
+				&& MsaaDepthTex[i] != nullptr && SUCCEEDED(MsaaDepthTex[i]->GetSurfaceLevel(0, &MsaaDepthSurf[i])) && MsaaDepthSurf[i] != nullptr;
+			if (Ok)
+				MsaaDepthSurf[i]->Release();            // the texture keeps it alive
+		}
+		// the scratch colour target: NVIDIA's and AMD's "NULL" format takes no memory
+		if (Ok && FAILED(Dev->CreateRenderTarget(W, H, (D3DFORMAT)MAKEFOURCC('N', 'U', 'L', 'L'), D3DMULTISAMPLE_NONE, 0, FALSE, &MsaaDepthColour, nullptr)))
+			Ok = SUCCEEDED(Dev->CreateRenderTarget(W, H, D3DFMT_R5G6B5, D3DMULTISAMPLE_NONE, 0, FALSE, &MsaaDepthColour, nullptr));
+		if (!Ok || MsaaDepthColour == nullptr)
+		{
+			MsaaDepthRelease();
+			MsaaDepthBroken = true;
+			Message("msaa: no readable depth texture %ux%u: gi, ssao, atmos and sss stay off with msaa", W, H);
+			return false;
+		}
+		MsaaDepthW = W;
+		MsaaDepthH = H;
+		Message("msaa: the scene's depth is drawn a second time into a readable %ux%u one (gi, ssao, atmos, sss)", W, H);
+		return true;
+	}
+
+	// before the second draw: false = not needed (no stand-in bound, no depth written)
+	bool MsaaDepthBegin(IDirect3DDevice9 *Dev)
+	{
+		if (MsaaBound < 0 || MsaaDepthBroken || !NeedDepth() || DepthBroken || U2Msaa::Wanted() == 0)
+			return false;
+		DWORD Z = 0, ZW = 0;
+		Dev->GetRenderState(D3DRS_ZENABLE, &Z);
+		Dev->GetRenderState(D3DRS_ZWRITEENABLE, &ZW);
+		if (!Z || !ZW)
+			return false;
+		IDirect3DSurface9 *RT = nullptr;
+		if (FAILED(Dev->GetRenderTarget(0, &RT)) || RT == nullptr)
+			return false;
+		if (RT != MsaaProxies[MsaaBound].Multi || !MsaaDepthMake(Dev, MsaaProxies[MsaaBound].W, MsaaProxies[MsaaBound].H))
+		{
+			RT->Release();
+			return false;
+		}
+		MdRT0 = RT;
+		MdRT1 = nullptr;
+		MdDS = nullptr;
+		Dev->GetRenderTarget(1, &MdRT1);
+		Dev->GetDepthStencilSurface(&MdDS);
+		Dev->GetViewport(&MdVP);
+		Dev->GetRenderState(D3DRS_COLORWRITEENABLE, &MdCW);
+		if (MdRT1)
+			Dev->SetRenderTarget(1, nullptr);
+		Dev->SetRenderTarget(0, MsaaDepthColour);
+		Dev->SetDepthStencilSurface(MsaaDepthSurf[MsaaDepthNow]);
+		if (MsaaDepthPending)
+		{
+			Dev->Clear(0, nullptr, D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL, 0, 1.0f, 0);   // the whole target (the viewport is still its own)
+			MsaaDepthPending = false;
+		}
+		Dev->SetViewport(&MdVP);
+		Dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0);
+		MsaaDepthUsed = true;
+		return true;
+	}
+
+	void MsaaDepthEnd(IDirect3DDevice9 *Dev)
+	{
+		Dev->SetRenderState(D3DRS_COLORWRITEENABLE, MdCW);
+		Dev->SetRenderTarget(0, MdRT0);
+		if (MdRT1)
+			Dev->SetRenderTarget(1, MdRT1);
+		Dev->SetDepthStencilSurface(MdDS);
+		Dev->SetViewport(&MdVP);
+		if (MdRT0) { MdRT0->Release(); MdRT0 = nullptr; }
+		if (MdRT1) { MdRT1->Release(); MdRT1 = nullptr; }
+		if (MdDS) { MdDS->Release(); MdDS = nullptr; }
+	}
+
+	// the game clears depth while the stand-in is bound: ours is cleared at its next draw; in
+	// mid-frame (colour kept) the part drawn so far is kept if it is the biggest (see OnClear)
+	void MsaaDepthClear(DWORD Count, DWORD Flags)
+	{
+		if (MsaaBound < 0 || Count != 0 || (Flags & D3DCLEAR_ZBUFFER) == 0 || MsaaDepthTex[0] == nullptr)
+			return;
+		if ((Flags & D3DCLEAR_TARGET) == 0 && MsaaDepthUsed && SegDraws > 0 && SegDraws >= KeptDraws)
+		{
+			KeptDepth = MsaaDepthTex[MsaaDepthNow];
+			KeptDraws = SegDraws;
+			KeptProj = SceneProj;
+			KeptView = SceneView;
+			MsaaDepthNow ^= 1;
+		}
+		MsaaDepthPending = true;
+	}
+
 	IDirect3DTexture9 *DepthTexOf(IDirect3DSurface9 *Ours)
 	{
+		if (U2Msaa::Wanted() != 0)
+			return MsaaDepthUsed ? MsaaDepthTex[MsaaDepthNow] : nullptr;
 		for (auto &It : DepthSwap)
 		{
 			if (It.second.Surf == Ours)
@@ -7664,6 +7805,7 @@ public:
 		for (MatchPair &M : DepthMatches)
 			if (M.Surf) M.Surf->Release();
 		DepthMatches.clear();
+		MsaaDepthRelease();
 		for (MsaaProxy &P : MsaaProxies)
 			if (P.Multi) P.Multi->Release();
 		MsaaProxies.clear();
@@ -8048,13 +8190,18 @@ public:
 		if (Depth == nullptr || !SceneProjOk)
 		{
 			if (Told++ < 3)
-				Message("ssao: skipped (%s)", Depth == nullptr ? "the scene's depth isn't one of the readable ones yet" : "no perspective projection seen");
+				Message("ssao: skipped (%s) [msaa depth used %d tex %p frame %u]", Depth == nullptr ? "the scene's depth isn't one of the readable ones yet" : "no perspective projection seen",
+					(int)MsaaDepthUsed, (void *)MsaaDepthTex[0], (unsigned)Frame);
 			return;
 		}
 		D3DSURFACE_DESC DD = {};
 		Depth->GetLevelDesc(0, &DD);
 		if (DD.Width != SceneW || DD.Height != SceneH || !SsaoBuild(Dev))
+		{
+			if (Told++ < 3)
+				Message("ssao: skipped (depth %ux%u, scene %ux%u)", DD.Width, DD.Height, SceneW, SceneH);
 			return;
+		}
 		if (SsaoVB == nullptr)
 		{
 			// the clip-space quad (as gi's)
@@ -9176,6 +9323,7 @@ public:
 		for (MatchPair &M : DepthMatches)
 			if (M.Surf) M.Surf->Release();
 		DepthMatches.clear();
+		MsaaDepthRelease();
 		for (MsaaProxy &P : MsaaProxies)
 			if (P.Multi) P.Multi->Release();
 		MsaaProxies.clear();
@@ -10220,6 +10368,8 @@ public:
 		GiSlotDirty = true;
 		SegDraws = KeptDraws = 0;
 		KeptDepth = nullptr;
+		MsaaDepthUsed = false;
+		MsaaDepthPending = true;
 		if (PostTrace > 0)
 		{
 			char end[96];

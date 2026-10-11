@@ -1541,9 +1541,19 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawPrimitive(D3DPRIMITIVETYPE Primit
 			PrimitiveType == D3DPT_TRIANGLELIST ? PrimitiveCount * 3 : PrimitiveCount + 2);
 	U2PerfScope PerfAfter(U2PerfC().Draw, PerfScale);   // (until the return: the layer's extra passes on this geometry)
 	U2After(Shaded);
+	if (U2.MsaaDepthBegin(ProxyInterface))       // msaa=N: the same draw into a readable depth (gi, ssao, atmos, sss)
+	{
+		ProxyInterface->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
+		U2.MsaaDepthEnd(ProxyInterface);
+	}
 	if (U2Stage0 != nullptr && U2.ZWriteBegin(ProxyInterface, U2Stage0->U2Hash))   // zwrite=: depth only, the soft edges stay
 	{
 		ProxyInterface->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
+		if (U2.MsaaDepthBegin(ProxyInterface))   // (and its depth-only pass)
+		{
+			ProxyInterface->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
+			U2.MsaaDepthEnd(ProxyInterface);
+		}
 		U2.ZWriteEnd(ProxyInterface);
 	}
 	if (U2GlossBegin())                             // gloss=: the same geometry again, added on top
@@ -1630,9 +1640,19 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawIndexedPrimitive(D3DPRIMITIVETYPE
 	U2.LastDrawHR = ProxyInterface->DrawIndexedPrimitive(PrimitiveType, CurrentBaseVertexIndex, MinIndex, NumVertices, StartIndex, PrimitiveCount);
 	U2PerfScope PerfAfter(U2PerfC().Draw, PerfScale);   // (until the return: the layer's extra passes on this geometry)
 	U2After(Shaded);
+	if (U2.MsaaDepthBegin(ProxyInterface))       // msaa=N: the same draw into a readable depth (gi, ssao, atmos, sss)
+	{
+		ProxyInterface->DrawIndexedPrimitive(PrimitiveType, CurrentBaseVertexIndex, MinIndex, NumVertices, StartIndex, PrimitiveCount);
+		U2.MsaaDepthEnd(ProxyInterface);
+	}
 	if (U2Stage0 != nullptr && U2.ZWriteBegin(ProxyInterface, U2Stage0->U2Hash))   // zwrite=: depth only, the soft edges stay
 	{
 		ProxyInterface->DrawIndexedPrimitive(PrimitiveType, CurrentBaseVertexIndex, MinIndex, NumVertices, StartIndex, PrimitiveCount);
+		if (U2.MsaaDepthBegin(ProxyInterface))   // (and its depth-only pass)
+		{
+			ProxyInterface->DrawIndexedPrimitive(PrimitiveType, CurrentBaseVertexIndex, MinIndex, NumVertices, StartIndex, PrimitiveCount);
+			U2.MsaaDepthEnd(ProxyInterface);
+		}
 		U2.ZWriteEnd(ProxyInterface);
 	}
 	if (U2GlossBegin())                             // gloss=: the same geometry again, added on top
@@ -1694,9 +1714,19 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawPrimitiveUP(D3DPRIMITIVETYPE Prim
 	U2ProbeVerts(pVertexStreamZeroData, VertexStreamZeroStride, 0, PrimitiveType == D3DPT_TRIANGLELIST ? PrimitiveCount * 3 : PrimitiveCount + 2);
 	U2PerfScope PerfAfter(U2PerfC().Draw, PerfScale);   // (until the return: the layer's extra passes on this geometry)
 	U2After(Shaded);
+	if (U2.MsaaDepthBegin(ProxyInterface))       // msaa=N: the same draw into a readable depth (gi, ssao, atmos, sss)
+	{
+		ProxyInterface->DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride);
+		U2.MsaaDepthEnd(ProxyInterface);
+	}
 	if (U2Stage0 != nullptr && U2.ZWriteBegin(ProxyInterface, U2Stage0->U2Hash))   // zwrite=: depth only, the soft edges stay
 	{
 		ProxyInterface->DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride);
+		if (U2.MsaaDepthBegin(ProxyInterface))   // (and its depth-only pass)
+		{
+			ProxyInterface->DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride);
+			U2.MsaaDepthEnd(ProxyInterface);
+		}
 		U2.ZWriteEnd(ProxyInterface);
 	}
 	if (U2GlossBegin())                             // gloss=: the same geometry again, added on top
@@ -1743,9 +1773,19 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::DrawIndexedPrimitiveUP(D3DPRIMITIVETY
 	U2ProbeVerts(pVertexStreamZeroData, VertexStreamZeroStride, MinVertexIndex, NumVertexIndices);
 	U2PerfScope PerfAfter(U2PerfC().Draw, PerfScale);   // (until the return: the layer's extra passes on this geometry)
 	U2After(Shaded);
+	if (U2.MsaaDepthBegin(ProxyInterface))       // msaa=N: the same draw into a readable depth (gi, ssao, atmos, sss)
+	{
+		ProxyInterface->DrawIndexedPrimitiveUP(PrimitiveType, MinVertexIndex, NumVertexIndices, PrimitiveCount, pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride);
+		U2.MsaaDepthEnd(ProxyInterface);
+	}
 	if (U2Stage0 != nullptr && U2.ZWriteBegin(ProxyInterface, U2Stage0->U2Hash))   // zwrite=: depth only, the soft edges stay
 	{
 		ProxyInterface->DrawIndexedPrimitiveUP(PrimitiveType, MinVertexIndex, NumVertexIndices, PrimitiveCount, pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride);
+		if (U2.MsaaDepthBegin(ProxyInterface))   // (and its depth-only pass)
+		{
+			ProxyInterface->DrawIndexedPrimitiveUP(PrimitiveType, MinVertexIndex, NumVertexIndices, PrimitiveCount, pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride);
+			U2.MsaaDepthEnd(ProxyInterface);
+		}
 		U2.ZWriteEnd(ProxyInterface);
 	}
 	if (U2GlossBegin())                             // gloss=: the same geometry again, added on top
