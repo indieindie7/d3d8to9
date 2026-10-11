@@ -6927,6 +6927,27 @@ public:
 	// (eyekey / average) ^ strength, held to min..max. post_final multiplies the frame by it
 	// (s3, c6.x = 1), so a dark room opens up after a moment and a bright door is
 	// toned down, inside a small range: the frame is already tonemapped by the game.
+	// hurtfx=aberration grain red fade (on unless all 0): the mod's script sends "hurt amount" (0..1)
+	// through U2BloodCommand when the player is hit; it fades out over 1/fade seconds and, while it
+	// lasts, post_final adds that much chromatic aberration, grain and red toward the edges (c7)
+	float HurtFx[4] = { 0.004f, 0.05f, 0.35f, 1.2f };
+	float Hurt = 0;
+	DWORD HurtTick = 0;
+	void HurtHit(float Amount)
+	{
+		Hurt = (std::min)(1.0f, (std::max)(Hurt, Amount));     // the strongest hit, not a sum (one hit can reach several rules)
+		static int Said = 0;
+		if (Said++ < 3)
+			Message("hurtfx: hit %.2f (aberration %.4f, grain %.3f, red %.2f, fade %.2f/s)", Amount, HurtFx[0], HurtFx[1], HurtFx[2], HurtFx[3]);
+	}
+	float HurtNow()
+	{
+		const DWORD Now = GetTickCount();
+		const float Dt = HurtTick ? (std::min)((Now - HurtTick) / 1000.0f, 0.25f) : 0.0f;
+		HurtTick = Now;
+		Hurt = (std::max)(0.0f, Hurt - Dt * HurtFx[3]);
+		return Hurt;
+	}
 	float EyeFx[4] = { 0.0f, 0.8f, 1.6f, 1.5f };
 	float EyeKey = 0.18f;
 	bool EyeBroken = false, EyeFresh = true;
@@ -7135,8 +7156,10 @@ public:
 			IDirect3DTexture9 *AAFrame = RunSmaa(Dev);
 			IDirect3DTexture9 *Eye = RunEye(Dev);
 
-			float c[7][4] = {};
+			float c[8][4] = {};
 			c[6][0] = Eye != nullptr ? 1.0f : 0.0f;
+			const float HurtV = HurtNow();
+			c[7][0] = HurtV * HurtFx[0]; c[7][1] = HurtV * HurtFx[1]; c[7][2] = HurtV * HurtFx[2];
 			c[0][0] = 1.0f / SceneW; c[0][1] = 1.0f / SceneH; c[0][2] = PostSplit;
 			c[0][3] = (GetTickCount() % 100000) / 1000.0f;     // seconds, wrapping every 100 s (grain)
 			memcpy(c[4], PostFx, sizeof(PostFx));
@@ -7205,7 +7228,7 @@ public:
 				Dev->SetTexture(3, Eye);
 			}
 			Dev->SetPixelShader(Final);
-			Dev->SetPixelShaderConstantF(0, c[0], 7);
+			Dev->SetPixelShaderConstantF(0, c[0], 8);
 			if (Debug)
 				PostLog(Dev, "before the final pass (stage 0 the copy, stage 1 the bloom)");
 			Quad(Dev, SceneW, SceneH);
@@ -10381,6 +10404,8 @@ public:
 				EyeFresh = true;
 			else if (sscanf_s(Line, " eyekey=%f", &EyeKey) == 1)
 				EyeKey = (std::max)(EyeKey, 0.01f);
+			else if (sscanf_s(Line, " hurtfx=%f %f %f %f", &HurtFx[0], &HurtFx[1], &HurtFx[2], &HurtFx[3]) >= 1)
+				HurtFx[3] = (std::max)(HurtFx[3], 0.05f);
 			else if (sscanf_s(Line, " ssaocontact=%f %f %f %f", &SsaoContact[0], &SsaoContact[1], &SsaoContact[2], &SsaoContact[3]) >= 1)
 				;
 			else if (sscanf_s(Line, " ssaonormals=%u", &V) == 1)

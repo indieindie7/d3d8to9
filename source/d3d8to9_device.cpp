@@ -28,6 +28,9 @@ extern "C" __declspec(dllexport) int __cdecl U2BloodCommand(const char *Cmd)
 {
 	char Word[16] = "";
 	sscanf_s(Cmd, "%15s", Word, (unsigned)sizeof(Word));
+	float Amount = 0;
+	if (!strcmp(Word, "hurt"))      // the player was hit: post_final's hurt lens (hurtfx=)
+		return sscanf_s(Cmd, "%*s %f", &Amount) == 1 ? (U2.HurtHit(Amount), 1) : 0;
 	if (U2Streaks::Handles(Word))
 		return U2Streaks::Command(Cmd);
 	if (U2Strings::Handles(Word))
