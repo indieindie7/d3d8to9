@@ -7744,7 +7744,7 @@ public:
 	// lights are in world space)
 	void GiGatherLights(IDirect3DDevice9 *Dev)
 	{
-		if (!Gi && !Atmos)                              // atmos=1 finds the sun among them
+		if (!Gi && !Atmos && !(Ssao && SsaoContact[0] > 0))  // atmos / contact shadows find the sun among them
 			return;
 		GiSlotDirty = false;
 		DWORD Lit = 0;
@@ -8099,8 +8099,14 @@ public:
 	// (the first-person weapon is left alone). ssaofx=strength radius intensity debug
 	// (default 0.8 40 1 0; radius in world units, debug 1 shows the AO alone); ssaores=1|2:
 	// the AO at full or half size (default half).
+	// Contact shadows ride along in the AO pass: a short march from each point toward the sun
+	// (AtmosFindSun: the game's brightest directional light, or atmossun=) through the depth;
+	// anything in front within the thickness shadows it (small things the shadow maps miss:
+	// feet, rubble, a hand on a wall). ssaocontact=strength length thickness topfallback
+	// (default 0.5 40 20 0; world units; topfallback 1 = with no sun, light from straight up).
 	bool Ssao = false, SsaoBroken = false;
 	float SsaoFx[4] = { 0.8f, 40.0f, 1.0f, 0.0f };
+	float SsaoContact[4] = { 0.5f, 40.0f, 20.0f, 0.0f };
 	UINT SsaoRes = 2, SsaoW = 0, SsaoH = 0, SsaoDiv = 0;
 	IDirect3DVertexShader9 *SsaoVS = nullptr;
 	IDirect3DPixelShader9 *SsaoPS[4] = {};
@@ -8255,6 +8261,27 @@ public:
 		Dev->SetPixelShaderConstantF(1, proj, 1);
 		Dev->SetPixelShaderConstantF(3, full, 1);
 		Dev->SetPixelShaderConstantF(4, SsaoFx, 1);
+		// c5 the sun toward, camera space (w = 1 if there is one), c6 ssaocontact=
+		float SunC[4] = {}, SunW[3] = {}, SunCol[3] = {}, SunBright = 0;
+		bool HaveSun = SsaoContact[0] > 0 && AtmosFindSun(SunW, SunCol, &SunBright);
+		if (!HaveSun && SsaoContact[0] > 0 && SsaoContact[3] > 0.5f)
+		{
+			SunW[0] = 0; SunW[1] = 0; SunW[2] = 1;
+			SunBright = 1;
+			HaveSun = true;
+		}
+		if (HaveSun)
+		{
+			const D3DMATRIX &V = SceneView;
+			SunC[0] = SunW[0] * V._11 + SunW[1] * V._21 + SunW[2] * V._31;
+			SunC[1] = SunW[0] * V._12 + SunW[1] * V._22 + SunW[2] * V._32;
+			SunC[2] = SunW[0] * V._13 + SunW[1] * V._23 + SunW[2] * V._33;
+			SunC[3] = 1;
+		}
+		// a dim directional light is the fill of an indoor map, not a sun: its shadows fade with it
+		const float Contact[4] = { HaveSun ? SsaoContact[0] * (std::min)(1.0f, SunBright / 0.5f) : 0.0f, SsaoContact[1], SsaoContact[2], 0 };
+		Dev->SetPixelShaderConstantF(5, SunC, 1);
+		Dev->SetPixelShaderConstantF(6, Contact, 1);
 		for (DWORD t = 0; t < 4; t++)
 			SmaaSampler(Dev, t, D3DTEXF_POINT);
 		Dev->SetTexture(2, nullptr);
@@ -8307,8 +8334,8 @@ public:
 		std::swap(SceneTex, SsaoOut);
 		static int Ran = 0;
 		if (Ran++ < 1)
-			Message("ssao: running (%ux%u, AO %ux%u, strength %.2f, radius %.0f, intensity %.2f)",
-				SceneW, SceneH, W, H, SsaoFx[0], SsaoFx[1], SsaoFx[2]);
+			Message("ssao: running (%ux%u, AO %ux%u, strength %.2f, radius %.0f, intensity %.2f; contact shadows %.2f, %s)",
+				SceneW, SceneH, W, H, SsaoFx[0], SsaoFx[1], SsaoFx[2], Contact[0], HaveSun ? "a sun found" : "no sun, off");
 
 		// back to the post chain's setup
 		Dev->SetVertexShader(nullptr);
@@ -8421,8 +8448,9 @@ public:
 	}
 
 	// the sun in world space (unit vector toward it) and its colour; false = none
-	bool AtmosFindSun(float Dir[3], float Col[3])
+	bool AtmosFindSun(float Dir[3], float Col[3], float *Bright = nullptr)
 	{
+		if (Bright) *Bright = 1.0f;
 		if (AtmosSun[0] != 0 || AtmosSun[1] != 0)
 		{
 			const float Az = AtmosSun[0] * 0.0174533f, El = AtmosSun[1] * 0.0174533f;
@@ -8448,6 +8476,7 @@ public:
 		// the colour, brightest channel at 1 (how bright the shafts are is atmosshafts' job)
 		const float m = (std::max)((std::max)(Best->Diffuse.r, Best->Diffuse.g), (std::max)(Best->Diffuse.b, 0.001f));
 		Col[0] = Best->Diffuse.r / m; Col[1] = Best->Diffuse.g / m; Col[2] = Best->Diffuse.b / m;
+		if (Bright) *Bright = BestI / 3;
 		if (!AtmosToldSun)
 		{
 			AtmosToldSun = true;
@@ -10193,6 +10222,8 @@ public:
 			}
 			else if (sscanf_s(Line, " ssaofx=%f %f %f %f", &SsaoFx[0], &SsaoFx[1], &SsaoFx[2], &SsaoFx[3]) >= 1)
 				SsaoFx[1] = (std::max)(SsaoFx[1], 4.0f);
+			else if (sscanf_s(Line, " ssaocontact=%f %f %f %f", &SsaoContact[0], &SsaoContact[1], &SsaoContact[2], &SsaoContact[3]) >= 1)
+				;
 			else if (sscanf_s(Line, " ssaonormals=%u", &V) == 1)
 				SsaoNormals = V != 0;
 			else if (sscanf_s(Line, " ssaores=%u", &V) == 1)
