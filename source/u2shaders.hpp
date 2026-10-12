@@ -9387,7 +9387,16 @@ public:
 		Dev->SetPixelShaderConstantF(1, proj, 1);
 		Dev->SetPixelShaderConstantF(2, fx, 1);
 		Dev->SetPixelShaderConstantF(3, up, 1);
-		Dev->SetPixelShaderConstantF(4, Holes, n * 2);
+		// craters.hlsl: HoleC[16] at c4 (centre, r), HoleN[16] at c20 (normal, lift); the unused
+		// slots stay zero (the shader reads all 16, Fx.z says how many count)
+		float C[U2Craters::Draw * 4] = {}, N[U2Craters::Draw * 4] = {};
+		for (int i = 0; i < n; i++)
+		{
+			memcpy(C + i * 4, Holes + i * 8, 4 * sizeof(float));
+			memcpy(N + i * 4, Holes + i * 8 + 4, 4 * sizeof(float));
+		}
+		Dev->SetPixelShaderConstantF(4, C, U2Craters::Draw);
+		Dev->SetPixelShaderConstantF(20, N, U2Craters::Draw);
 		SmaaSampler(Dev, 0, D3DTEXF_LINEAR);
 		SmaaSampler(Dev, 1, D3DTEXF_POINT);
 		Target(Dev, CraterOut);
