@@ -157,7 +157,7 @@ public:
 	IDirect3DBaseTexture9 *OldTex1 = nullptr;
 	DWORD OldTCI[3] = {}, OldTTF[3] = {}, OldBlend = 0, OldSamp1[5] = {};
 	D3DMATRIX OldTexMat[3] = {};
-	float OldConst[8][4] = {};
+	float OldConst[9][4] = {};   // c0-c7; c8 only for surface= (its light)
 
 	void Message(const char *Format, ...)
 	{
@@ -291,6 +291,8 @@ public:
 		else if (sscanf_s(Line, " pslog=%u", &Hash) == 1 && (PsLogCode = Hash >= 2, true))
 			PsLog = Hash != 0;
 		else if (sscanf_s(Line, " shadowtint=%f %f %f", &ShadowTint[0], &ShadowTint[1], &ShadowTint[2]) == 3)
+			;
+		else if (sscanf_s(Line, " surfacelight=%f %f %f %f", &SurfaceLight[0], &SurfaceLight[1], &SurfaceLight[2], &SurfaceLight[3]) == 4)
 			;
 		else if (sscanf_s(Line, " charprobe=%u", &Hash) == 1)
 			CharProbe = Hash != 0;
@@ -1357,6 +1359,10 @@ public:
 	U2Rule MapRule, ProjRule;
 	float PcssParams[4] = { 0.05f, 0.004f, 0.0006f, 0.06f };
 	float ShadowTint[4] = { 1, 1, 1, 1 };   // w = 1 tells pcss_proj.hlsl the tint is set
+	// surfacelight=X Y Z S: the world direction towards the light that surface= shaders shade
+	// their parallax against (Z up; the level is lightmapped, so there is no real sun to ask),
+	// and how dark the self-shadow gets (0 = none). Goes to c8 in view space, w = S.
+	float SurfaceLight[4] = { 0.3f, 0.2f, 1.0f, 0.5f };
 	float PcssDebug = 0;          // pcssdebug=1: colour the shadows by the measured gap
 	int Mode = 0;                 // what End() undoes: 1 surface shader, 2 shadow map, 3 projector, 5 solid surface, 9 soft particle
 	DWORD OldCWE = 0;
@@ -5878,7 +5884,7 @@ public:
 		}
 
 		Dev->GetPixelShader(&OldPS);
-		Dev->GetPixelShaderConstantF(0, OldConst[0], 8);
+		Dev->GetPixelShaderConstantF(0, OldConst[0], 9);
 		static const D3DMATRIX Identity = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
 		Dev->GetTextureStageState(2, D3DTSS_TEXCOORDINDEX, &OldTCI[2]);
 		Dev->GetTextureStageState(2, D3DTSS_TEXTURETRANSFORMFLAGS, &OldTTF[2]);
@@ -5888,10 +5894,25 @@ public:
 		Dev->SetTransform(D3DTS_TEXTURE2, &Identity);
 
 		float Const[4][4] = {};
+		float Light[4] = {};
 		Const[0][0] = (GetTickCount() % 3600000) / 1000.0f;
 		Const[0][1] = 1;
 		Const[0][2] = SceneW ? 1.0f / SceneW : 0;
 		Const[0][3] = SceneH ? 1.0f / SceneH : 0;
+		{
+			D3DMATRIX V;
+			Dev->GetTransform(D3DTS_VIEW, &V);
+			float l = 0;
+			for (int c = 0; c < 3; c++)
+			{
+				Light[c] = SurfaceLight[0] * V.m[0][c] + SurfaceLight[1] * V.m[1][c] + SurfaceLight[2] * V.m[2][c];
+				l += Light[c] * Light[c];
+			}
+			l = sqrtf(l);
+			for (int c = 0; c < 3; c++)
+				Light[c] = l > 0 ? Light[c] / l : 0;
+			Light[3] = l > 0 ? SurfaceLight[3] : 0;
+		}
 		Const[2][0] = Vert;
 		Const[2][1] = Second;
 		Const[2][2] = Factor;
@@ -5904,6 +5925,7 @@ public:
 		}
 		memcpy(Const[3], R.Levels, sizeof(R.Levels));
 		Dev->SetPixelShaderConstantF(0, Const[0], 4);
+		Dev->SetPixelShaderConstantF(8, Light, 1);   // c8: the light (c4-c7 are the detail map's)
 		DetailBound = false;
 		if (!R.MapFile.empty())
 		{
@@ -6234,7 +6256,7 @@ public:
 				DetailBound = false;
 			}
 			Dev->SetPixelShader(OldPS);
-			Dev->SetPixelShaderConstantF(0, OldConst[0], 8);
+			Dev->SetPixelShaderConstantF(0, OldConst[0], 9);
 			Dev->SetTextureStageState(2, D3DTSS_TEXCOORDINDEX, OldTCI[2]);
 			Dev->SetTextureStageState(2, D3DTSS_TEXTURETRANSFORMFLAGS, OldTTF[2]);
 			Dev->SetTransform(D3DTS_TEXTURE2, &OldTexMat[2]);

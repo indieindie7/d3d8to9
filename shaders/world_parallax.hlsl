@@ -14,6 +14,12 @@
 // (a fully bumpy surface swims). FLAT_ABOVE / DEEP_BELOW are used when it could not measure
 // (an unusual texture format), or always with AUTO_LEVELS 0.
 //
+// Self-shadow: from where the view ray lands, a second short march towards the light (the
+// fork's surfacelight=, c8: a fixed world direction, since the level's light is baked) finds
+// whether a raised part of the texture stands between that spot and the light, so stones
+// shade their own gaps and the shading turns with the light, not with the camera. Soft: how
+// far under the height map the light ray passes sets how dark. SHADOW_STEPS 0 turns it off.
+//
 // For a different texture, copy this file, adjust the settings and point that texture's
 // rule at the copy. Needs ddx/ddy: ps_2_a.
 
@@ -22,6 +28,7 @@ sampler2D Second : register(s1);   // stage 1's texture (usually the lightmap)
 float4    Info    : register(c0);  // time, 1, 1/width, 1/height
 float4    Combine : register(c2);  // x: vertex colour factor, y: stage 1 factor (0 = not used)
 float4    Levels  : register(c3);  // the texture's surface brightness, deepest brightness, 0, 1 = measured
+float4    Light   : register(c8);  // xyz: towards the light, camera space; w: shadow strength (0 = off)
 
 #define DEPTH 0.04                 // how deep the deepest part looks, as a fraction of the
                                    // texture's size on the wall (one repeat): 0.04 of a 512-unit
@@ -34,6 +41,8 @@ float4    Levels  : register(c3);  // the texture's surface brightness, deepest 
 #define CAVITY 0.3                 // how much darker the deepest parts are (0-1)
 #define FADE_START 1500.0          // distance (world units) where the effect starts to fade
 #define FADE_END 4000.0            // and where it is gone (far away it only shimmers)
+#define SHADOW_STEPS 6             // steps from the hit towards the light (0 = no self-shadow)
+#define SHADOW_SOFT 4.0            // how fast the shadow gets dark with depth under the height map
 
 float DepthOf(float2 uv, float2 levels)
 {
@@ -81,9 +90,32 @@ float4 main(float2 uv : TEXCOORD0, float2 t1 : TEXCOORD1, float3 pos : TEXCOORD2
 		atPrev = at;
 	}
 
+	// self-shadow: walk from the hit up towards the light; wherever the height map is above
+	// the light ray, something raised blocks it. A surface facing away from the light gets
+	// none (the lightmap already has it dark).
+	float shade = 1;
+	float strength = abs(Light.w);  // negative w = debug tint, same strength
+#if SHADOW_STEPS > 0
+	float3 l = Light.xyz;
+	float ln = dot(l, n);
+	if (strength > 0 && ln > 0.05 && hitDepth > 0.01)
+	{
+		float2 lightPer = float2(dot(l, gu), dot(l, gv)) / max(ln, 0.25) * (DEPTH * tile * fade);
+		float blocked = 0;
+		for (int j = 1; j <= SHADOW_STEPS; j++)
+		{
+			float k = (float)j / SHADOW_STEPS;
+			float rayDepth = hitDepth * (1 - k);
+			float under = rayDepth - DepthOf(hit + lightPer * hitDepth * k, levels);
+			blocked = max(blocked, under * (1 - k * 0.5));
+		}
+		shade = 1 - strength * fade * saturate(blocked * SHADOW_SOFT);
+	}
+#endif
+
 	// what the texture stages did, at the shifted place (each stage clamps, as they do)
 	float4 t = tex2D(Tex, hit);
-	float3 c = t.rgb * (1 - CAVITY * hitDepth * fade);
+	float3 c = t.rgb * (1 - CAVITY * hitDepth * fade) * shade;
 	float a = t.a;
 	if (Combine.x > 0)
 	{
@@ -92,5 +124,13 @@ float4 main(float2 uv : TEXCOORD0, float2 t1 : TEXCOORD1, float3 pos : TEXCOORD2
 	}
 	if (Combine.y > 0)
 		c = saturate(c * tex2D(Second, t1).rgb * Combine.y);
+	// debug (surfacelight w < 0): the surface turns magenta so it can be found on screen, the
+	// self-shadow shows green, and a surface facing away from the light shows blue
+	if (Light.w < 0)
+	{
+		float lum = dot(c, float3(0.3, 0.59, 0.11)) + 0.15;
+		c = (ln > 0.05 ? float3(1, 0.2, 1) : float3(0.2, 0.4, 1)) * lum;
+		c = lerp(c, float3(0, 1, 0), saturate((1 - shade) * 3));
+	}
 	return float4(c, a);
 }
