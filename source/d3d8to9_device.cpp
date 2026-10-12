@@ -37,6 +37,8 @@ extern "C" __declspec(dllexport) int __cdecl U2BloodCommand(const char *Cmd)
 		return U2Strings::Command(Cmd);
 	if (U2Lens::Handles(Word))
 		return U2Lens::Command(Cmd);
+	if (U2Craters::Handles(Word))   // SDF craters (craters.hpp)
+		return U2Craters::Command(Cmd);
 	return U2Runs::Handles(Word) ? U2Runs::Command(Cmd) : U2Blood::Command(Cmd);
 }
 // a shotp from outside (AdventNative's "Capture"): the next presented frame saved as System\ShotP#####.bmp;

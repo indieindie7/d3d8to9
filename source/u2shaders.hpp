@@ -72,6 +72,7 @@ extern "C" __declspec(dllexport) int __cdecl U2BloodCommand(const char *Cmd);   
 #include "streaks.hpp"
 #include "strings.hpp"
 #include "lens.hpp"
+#include "craters.hpp"
 #include <d3dcompiler.h>
 #include "fakefull.hpp"
 #include "crash.hpp"
@@ -6701,7 +6702,7 @@ public:
 			SceneProj = P;                    // gi.hlsl / ssao.hlsl rebuild positions from depth with it
 			Dev->GetTransform(D3DTS_VIEW, &SceneView);
 			SceneProjOk = true;
-			if (BlurFx[0] > 0 || SsrFx[0] > 0 || TaaFx[0] > 0)
+			if (BlurFx[0] > 0 || SsrFx[0] > 0 || TaaFx[0] > 0 || CraterFx[0] > 0)
 			{
 				// motion blur wants the world's own camera: the last perspective draw of a frame
 				// can be something with a fixed view, so take the view of draws with no world matrix
@@ -7168,6 +7169,7 @@ public:
 			RunGi(Dev, Saved.DS);
 			RunSsao(Dev, Saved.DS);
 			RunSss(Dev, Saved.DS);
+			RunCraters(Dev, Saved.DS);
 			RunAtmos(Dev, Saved.DS);
 			RunSsr(Dev, Saved.DS);
 			RunTaa(Dev, Saved.DS);
@@ -9283,6 +9285,128 @@ public:
 		Message("ssr: ready (strength %.2f, longest %.0f, thickness %.0f)", SsrFx[0], SsrFx[1], SsrFx[2]);
 		return true;
 	}
+	// ---- SDF craters (craters=strength debug far soot; strength 0 = off) ------------------------
+	// craters.hlsl on the frame copy, before the fog: the holes the mod sent (craters.hpp) are cut
+	// into the surfaces they were put on, the view ray marched through them. Uses the motion blur's view.
+	float CraterFx[4] = { 0.0f, 0.0f, 6000.0f, 0.5f };
+	bool CraterBroken = false;
+	IDirect3DVertexShader9 *CraterVS = nullptr;
+	IDirect3DPixelShader9 *CraterPS = nullptr;
+	IDirect3DTexture9 *CraterOut = nullptr;
+	UINT CraterW = 0, CraterH = 0;
+
+	void CraterRelease()
+	{
+		if (CraterOut) { CraterOut->Release(); CraterOut = nullptr; }
+		if (CraterVS) { CraterVS->Release(); CraterVS = nullptr; }
+		if (CraterPS) { CraterPS->Release(); CraterPS = nullptr; }
+		CraterW = CraterH = 0;
+	}
+	bool CraterBuild(IDirect3DDevice9 *Dev)
+	{
+		if (CraterBroken)
+			return false;
+		if (CraterPS != nullptr)
+			return true;
+		const std::string Src = ReadShaderFile("craters.hlsl");
+		if (Src.empty())
+		{
+			Message("craters: craters.hlsl missing in U2Shaders, off");
+			CraterBroken = true;
+			return false;
+		}
+		static const char *Names[2] = { "CratersVS", "CratersPS" };
+		for (int i = 0; i < 2; i++)
+		{
+			ID3DBlob *Code = nullptr, *Errors = nullptr;
+			const HRESULT hr = D3DCompile(Src.data(), Src.size(), "craters.hlsl", nullptr, nullptr, Names[i], i == 0 ? "vs_3_0" : "ps_3_0",
+				D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &Code, &Errors);
+			if (FAILED(hr) || Code == nullptr)
+			{
+				Message("craters: %s failed: %s", Names[i], Errors ? (const char *)Errors->GetBufferPointer() : "?");
+				if (Errors) Errors->Release();
+				CraterBroken = true;
+				return false;
+			}
+			if (Errors) Errors->Release();
+			const HRESULT cr = i == 0 ? Dev->CreateVertexShader((const DWORD *)Code->GetBufferPointer(), &CraterVS)
+				: Dev->CreatePixelShader((const DWORD *)Code->GetBufferPointer(), &CraterPS);
+			Code->Release();
+			if (FAILED(cr))
+			{
+				Message("craters: the card refused %s (%08x)", Names[i], (unsigned)cr);
+				CraterBroken = true;
+				return false;
+			}
+		}
+		Message("craters: ready (strength %.2f, far %.0f, soot %.2f)", CraterFx[0], CraterFx[2], CraterFx[3]);
+		return true;
+	}
+	void RunCraters(IDirect3DDevice9 *Dev, IDirect3DSurface9 *BoundDepth)
+	{
+		if (CraterFx[0] <= 0 || CraterBroken || U2Craters::Count == 0 || SceneTex == nullptr || !SceneProjOk || !BlurViewOk)
+			return;
+		float Holes[U2Craters::Draw * 8] = {};
+		const int n = U2Craters::Select(BlurView, Holes, CraterFx[2]);
+		static int LastAdded = 0;
+		if (U2Craters::Added != LastAdded)
+		{
+			LastAdded = U2Craters::Added;
+			Message("craters: %d holes kept, %d in view", U2Craters::Count, n);
+		}
+		if (n == 0)
+			return;
+		IDirect3DTexture9 *Depth = DepthTexOf(BoundDepth);
+		if (Depth != nullptr && KeptDepth != nullptr && KeptDepth != Depth && KeptDraws > SegDraws)
+			Depth = KeptDepth;
+		if (Depth == nullptr || !CraterBuild(Dev) || SsaoVB == nullptr)
+			return;
+		if (CraterOut == nullptr || CraterW != SceneW || CraterH != SceneH)
+		{
+			if (CraterOut) { CraterOut->Release(); CraterOut = nullptr; }
+			if (FAILED(Dev->CreateTexture(SceneW, SceneH, 1, D3DUSAGE_RENDERTARGET, SceneFmt, D3DPOOL_DEFAULT, &CraterOut, nullptr)))
+			{
+				Message("craters: target couldn't be made (%ux%u), off", SceneW, SceneH);
+				CraterOut = nullptr;
+				CraterBroken = true;
+				return;
+			}
+			CraterW = SceneW; CraterH = SceneH;
+		}
+		const D3DMATRIX &P = SceneProj;
+		const float full[4] = { 1.0f / SceneW, 1.0f / SceneH, (float)SceneW, (float)SceneH };
+		const float proj[4] = { P._11, P._22, P._33, P._43 };
+		const float fx[4] = { CraterFx[0], CraterFx[1], (float)n, CraterFx[3] };
+		const float up[4] = { BlurView.m[2][0], BlurView.m[2][1], BlurView.m[2][2], 0 };
+		Dev->SetFVF(D3DFVF_XYZ | D3DFVF_TEX1);
+		Dev->SetStreamSource(0, SsaoVB, 0, sizeof(SmaaVertex));
+		Dev->SetVertexShader(CraterVS);
+		Dev->SetVertexShaderConstantF(0, full, 1);
+		Dev->SetPixelShader(CraterPS);
+		Dev->SetPixelShaderConstantF(0, full, 1);
+		Dev->SetPixelShaderConstantF(1, proj, 1);
+		Dev->SetPixelShaderConstantF(2, fx, 1);
+		Dev->SetPixelShaderConstantF(3, up, 1);
+		Dev->SetPixelShaderConstantF(4, Holes, n * 2);
+		SmaaSampler(Dev, 0, D3DTEXF_LINEAR);
+		SmaaSampler(Dev, 1, D3DTEXF_POINT);
+		Target(Dev, CraterOut);
+		Dev->SetTexture(0, SceneTex);
+		Dev->SetTexture(1, Depth);
+		Dev->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
+		std::swap(SceneTex, CraterOut);
+		static int Ran = 0;
+		if (Ran++ < 1)
+			Message("craters: running (%ux%u)", SceneW, SceneH);
+		Dev->SetVertexShader(nullptr);
+		Dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+		Dev->SetStreamSource(0, PostQuadVB, 0, sizeof(U2QuadVertex));
+		for (DWORD t = 0; t < 2; t++)
+			SmaaSampler(Dev, t, D3DTEXF_LINEAR);
+		Dev->SetTexture(0, nullptr);
+		Dev->SetTexture(1, nullptr);
+	}
+
 	void RunSsr(IDirect3DDevice9 *Dev, IDirect3DSurface9 *BoundDepth)
 	{
 		if (SsrFx[0] <= 0 || SsrBroken || SceneTex == nullptr || !SceneProjOk || !BlurViewOk)
@@ -10862,6 +10986,8 @@ public:
 				EyeKey = (std::max)(EyeKey, 0.01f);
 			else if (sscanf_s(Line, " motionblur=%f %f %f %f", &BlurFx[0], &BlurFx[1], &BlurFx[2], &BlurFx[3]) >= 1)
 				BlurFx[2] = (std::max)(BlurFx[2], 1.0f);
+			else if (sscanf_s(Line, " craters=%f %f %f %f", &CraterFx[0], &CraterFx[1], &CraterFx[2], &CraterFx[3]) >= 1)
+				CraterFx[2] = (std::max)(CraterFx[2], 100.0f);
 			else if (sscanf_s(Line, " ssr=%f %f %f %f", &SsrFx[0], &SsrFx[1], &SsrFx[2], &SsrFx[3]) >= 1)
 				SsrFx[1] = (std::max)(SsrFx[1], 10.0f);
 			else if (sscanf_s(Line, " taa=%f %f %f %f", &TaaFx[0], &TaaFx[1], &TaaFx[2], &TaaFx[3]) >= 1)
@@ -11203,6 +11329,7 @@ public:
 		SssReleaseAll();
 		BlurRelease();
 		SsrRelease();
+		CraterRelease();
 		TaaRelease();
 		SssBroken = false;
 		GiBroken = false;
